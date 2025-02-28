@@ -36,7 +36,7 @@
 
 ### ⏳ 历史完成
 - **我们的重置人生**  
-  `📅 阅读年份` ![年份](https://img.shields.io/badge/-2024-blue)  
-  `⭐ 评分` ![4.5](https://img.shields.io/badge/-★★★★☆-blue)
+  `📅 阅读年份` 2024 
+  `⭐ 评分` ★★★★☆
 
 
