@@ -36,3 +36,10 @@
 - **我们的重置人生** ![年份](https://img.shields.io/badge/阅读年份-2024-9cf)
 - **不起眼女主角培育法** ![年份](https://img.shields.io/badge/阅读年份-2024-9cf)
 
+---
+
+## 📅 年度统计
+
+![年度统计](https://img.shields.io/badge/2023年已读-32卷-9cf?style=for-the-badge)
+![总阅读量](https://img.shields.io/badge/累计阅读-287卷-important)
+
