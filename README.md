@@ -24,3 +24,7 @@
 - [x] **无职转生**
 
 ---
+
+## 📖 进行中作品
+![盾之勇者进度](https://img.shields.io/badge/进度-36%25-ff69b4?style=flat&label=盾之勇者成名录&labelColor=555)
+- [x] **盾之勇者成名录**（卷1-8）
