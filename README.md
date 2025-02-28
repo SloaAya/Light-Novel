@@ -35,6 +35,8 @@
 | 败北女角太多了！ | 1-7卷 | 2025.01 | ![100%](https://img.shields.io/badge/🎉_完成-2025.01-blue) |
 
 ### ⏳ 历史完成
-- **我们的重置人生** ![年份](https://img.shields.io/badge/阅读年份-2024-9cf)
+- **我们的重置人生**  
+  `📅 阅读年份` ![年份](https://img.shields.io/badge/-2024-blue)  
+  `⭐ 评分` ![4.5](https://img.shields.io/badge/-★★★★☆-blue)
 
 
