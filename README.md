@@ -27,7 +27,7 @@
 
 ## 📖 进行中作品
 ![盾之勇者进度](https://img.shields.io/badge/进度-36%25-ff69b4?style=flat&label=盾之勇者成名录&labelColor=555)
-![我们的重置人生](https://img.shields.io/badge/进度-36%25-brightgreen?style=flat&label=我们的重置人生&labelColor=555)
+![我们的重置人生](https://img.shields.io/badge/进度-100%25-brightgreen?style=flat&label=我们的重置人生&labelColor=555)
 - [x] **盾之勇者成名录**（卷1-8）
 - [x] **我们的重置人生**（卷1-12）
 
