@@ -30,16 +30,10 @@
 ### 📌 2025年完成
 | 作品 | 卷数 | 完成日期 | 徽章 |
 |------|------|----------|------|
-| 平凡职业成就世界最强 | 13卷 | 2023.05 | ![100%](https://img.shields.io/badge/🎉_完结-2023.05-blue) |
+| 平凡职业成就世界最强 | 13卷 | 2025.02 | ![100%](https://img.shields.io/badge/🎉_完结-2025.05-blue) |
 
 ### ⏳ 历史完成
 - **我们的重置人生** ![年份](https://img.shields.io/badge/阅读年份-2024-9cf)
 - **不起眼女主角培育法** ![年份](https://img.shields.io/badge/阅读年份-2024-9cf)
 
----
-
-## 📅 年度统计
-
-![年度统计](https://img.shields.io/badge/2023年已读-32卷-9cf?style=for-the-badge)
-![总阅读量](https://img.shields.io/badge/累计阅读-287卷-important)
 
