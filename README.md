@@ -31,12 +31,17 @@
 ### 📌 2025年完成
 | 作品 | 卷数 | 完成日期 | 徽章 |
 |------|------|----------|------|
-| 我当备胎女友也没关系。 | 1-7卷 |2025.01| ![100%](https://img.shields.io/badge/🎉_完成-2025.01-blue) |
-| 败北女角太多了！ | 1-7卷 | 2025.01 | ![100%](https://img.shields.io/badge/🎉_完成-2025.01-blue) |
+| 我当备胎女友也没关系。 | 1-7卷 |2025.01| ![100%](https://img.shields.io/badge/🎉_完读-2025.01-blue) |
+| 败北女角太多了！ | 1-7卷 | 2025.01 | ![100%](https://img.shields.io/badge/🎉_完读-2025.01-blue) |
 
 ### ⏳ 历史完成
-- **我们的重置人生**  
-  `📅 阅读年份` 2024   
-  `⭐ 评分` ★★★★☆
+<details>
+<summary>📌 我们的重置人生 (点击展开)</summary>
 
+```markdown
+🔖 **阅读档案**  
+📍 状态：![已完结](https://img.shields.io/badge/✅_已完结-brightgreen)  
+📅 时间：![年份](https://img.shields.io/badge/2024-8A2BE2)  
+📏 卷数：![12卷](https://img.shields.io/badge/全12卷-9CF)  
+💬 简评：异世界职场重生题材佳作
 
