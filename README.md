@@ -36,6 +36,5 @@
 
 ### ⏳ 历史完成
 - **我们的重置人生** ![年份](https://img.shields.io/badge/阅读年份-2024-9cf)
-- **不起眼女主角培育法** ![年份](https://img.shields.io/badge/阅读年份-2024-9cf)
 
 
