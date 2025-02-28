@@ -25,9 +25,15 @@
 
 ---
 
-## 📖 进行中作品
-![盾之勇者进度](https://img.shields.io/badge/进度-36%25-ff69b4?style=flat&label=盾之勇者成名录&labelColor=555)
-![我们的重置人生](https://img.shields.io/badge/进度-100%25-brightgreen?style=flat&label=我们的重置人生&labelColor=555)
-- [x] **盾之勇者成名录**（卷1-8）
-- [x] **我们的重置人生**（卷1-12）
+## 🗓️ 阅读时间轴
+
+### 📌 2023年完成
+| 作品 | 卷数 | 完成日期 | 徽章 |
+|------|------|----------|------|
+| 我们的重置人生 | 12卷 | 2023.08 | ![100%](https://img.shields.io/badge/🎉_完结-2023.08-blue) |
+| 平凡职业成就世界最强 | 13卷 | 2023.05 | ![100%](https://img.shields.io/badge/🎉_完结-2023.05-blue) |
+
+### ⏳ 历史完成
+- **GAMERS电玩咖** ![年份](https://img.shields.io/badge/完结年份-2022-9cf)
+- **不起眼女主角培育法** ![年份](https://img.shields.io/badge/完结年份-2021-9cf)
 
