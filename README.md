@@ -35,13 +35,15 @@
 | 败北女角太多了！ | 1-7卷 | 2025.01 | ![100%](https://img.shields.io/badge/🎉_完读-2025.01-blue) |
 
 ### ⏳ 历史完成
+
 <details>
 <summary>📌 我们的重置人生 (点击展开)</summary>
 
 ```markdown
 🔖 **阅读档案**  
-📍 状态：![已完结](https://img.shields.io/badge/✅_已完结-brightgreen)  
-📅 时间：![年份](https://img.shields.io/badge/2024-8A2BE2)  
-📏 卷数：![12卷](https://img.shields.io/badge/全12卷-9CF)  
-💬 简评：异世界职场重生题材佳作
 
+| 类别 | 详情 | 
+|------|------|
+| 📌 状态 | [![已完结](https://img.shields.io/badge/状态-已完结-brightgreen)]() |
+| 📅 时间 | [![年份](https://img.shields.io/badge/完结年份-2024-8A2BE2)]() |
+| 📏 卷数 | [![全卷达成](https://img.shields.io/badge/全12卷-9CF?logo=book&logoColor=white)]() |
