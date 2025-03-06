@@ -32,7 +32,7 @@
 - [x] **不正经的魔术讲师与禁忌教典**
 - [x] **我和女友的妹妹接吻了。** 
 - [x] **妹妹人生**
-- [ ] **有谁规定了现实中不能有恋爱喜剧的？**
+- [x] **有谁规定了现实中不能有恋爱喜剧的？**
 
 ---
 
@@ -49,4 +49,11 @@
   ![状态](https://img.shields.io/badge/✅_已完结-brightgreen) 
   ![年份](https://img.shields.io/badge/📅_2024-8A2BE2) 
   ![卷数](https://img.shields.io/badge/📚_12卷-9CF)
+
+---
+
+## 功能  
+通过Rclone+GitHub Action自动上传至网盘，实现全平台缓存+自动下载
+
+
 
