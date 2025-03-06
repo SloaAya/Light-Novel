@@ -53,7 +53,8 @@
 ---
 
 ## 功能  
-通过Rclone+GitHub Action自动上传至网盘，实现全平台缓存+自动下载
+通过Rclone+GitHub Action自动上传至网盘  
+通过静读天下实现全平台缓存+自动下载
 
 
 
