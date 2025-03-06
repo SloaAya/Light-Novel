@@ -21,7 +21,7 @@ jobs:
           echo "type = dropbox" >> ~/.config/rclone/rclone.conf
           echo "token = {\"access_token\":\"${{ secrets.DROPBOX_ACCESS_TOKEN }}\",\"token_type\":\"bearer\",\"expiry\":\"0001-01-01T00:00:00Z\"}" >> ~/.config/rclone/rclone.conf
 
-      - name: Sync 轻小说
+      - name: Sync lightnovel
         run: |
           rclone sync ./ dropbox:/微凉半度/ \
             --progress \
