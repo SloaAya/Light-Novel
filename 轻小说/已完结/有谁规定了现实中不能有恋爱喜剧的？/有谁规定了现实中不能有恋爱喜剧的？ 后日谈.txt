@@ -1,0 +1,18 @@
+<?xml version='1.0' encoding='utf-8'?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uuid_id" version="2.0">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+        <dc:identifier opf:scheme="calibre" id="calibre_id">1194</dc:identifier>
+        <dc:identifier opf:scheme="uuid" id="uuid_id">817dee0e-dda1-44e2-a5b1-d6a9076ea467</dc:identifier>
+        <dc:title>有谁规定了现实中不能有恋爱喜剧的？ 后日谈</dc:title>
+        <dc:creator opf:file-as="初鹿野創" opf:role="aut">初鹿野創</dc:creator>
+        <dc:contributor opf:file-as="calibre" opf:role="bkp">calibre (7.26.0) [https://calibre-ebook.com]</dc:contributor>
+        <dc:date>0101-01-01T00:00:00+00:00</dc:date>
+        <dc:language>zh</dc:language>
+        <dc:subject>轻小说</dc:subject>
+        <meta name="calibre:series" content="有谁规定了现实中不能有恋爱喜剧的？"/>
+        <meta name="calibre:series_index" content="7"/>
+        <meta name="calibre:timestamp" content="2025-03-06T13:39:55.172230+00:00"/>
+        <meta name="calibre:title_sort" content="有谁规定了现实中不能有恋爱喜剧的？ 后日谈"/>
+    </metadata>
+    <guide/>
+</package>
