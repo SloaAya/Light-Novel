@@ -35,7 +35,7 @@ jobs:
         run: |
         
          git config --global user.email "1587198980@qq.com"
-         git config --global user.name "valetzx"
+         git config --global user.name "Light-Novel"
          git add .
          git commit -am "GitHub Actions Auto Rclone at $(date +'%Y-%m-%d %H:%M:%S')"
          git push --force # --force 
