@@ -1,41 +1,35 @@
-name: LightNovel
+name: 轻小说同步（修复检出问题）
 
 on:
   push:
     branches: [ main ]
-    paths:              # 关键配置：仅当指定路径的文件变更时触发
-      - '轻小说/**'      # 匹配轻小说文件夹及其所有子内容
+    paths:
+      - '轻小说/**'
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出代码
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整提交历史，用于准确检测文件变更
+          token: ${{ secrets.GITHUB_TOKEN }}  # 显式传递令牌
+          submodules: recursive               # 处理子模块
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: 验证变更文件
-        id: check-changes
-        run: |
-          # 检查本次提交是否包含轻小说文件夹的变更
-          git diff --name-only HEAD^ HEAD | grep -q "^轻小说/"
-          echo "has_changes=$?" >> $GITHUB_OUTPUT
-
-      - name: 安装 rclone
-        if: steps.check-changes.outputs.has_changes == '0'  # 仅在检测到变更时运行后续步骤
+      # 后续步骤（安装rclone、配置、同步）保持不变
+      - name: Install rclone
         run: curl https://rclone.org/install.sh | sudo bash
 
-      - name: 配置 rclone
-        if: steps.check-changes.outputs.has_changes == '0'
+      - name: Configure rclone
         run: |
           mkdir -p ~/.config/rclone
           echo "[dropbox]" > ~/.config/rclone/rclone.conf
           echo "type = dropbox" >> ~/.config/rclone/rclone.conf
           echo "token = {\"access_token\":\"${{ secrets.DROPBOX_ACCESS_TOKEN }}\",\"token_type\":\"bearer\",\"expiry\":\"0001-01-01T00:00:00Z\"}" >> ~/.config/rclone/rclone.conf
 
-      - name: sync-to-dropbox
-        if: steps.check-changes.outputs.has_changes == '0'
+      - name: 增量同步到 Dropbox
         run: |
           rclone copy ./ "dropbox:/微凉半度/" \
             --progress \
