@@ -1,4 +1,4 @@
-name: Sync to Dropbox
+name: Sync dropbox
 
 on:
   push:
@@ -21,9 +21,10 @@ jobs:
           echo "type = dropbox" >> ~/.config/rclone/rclone.conf
           echo "token = {\"access_token\":\"${{ secrets.DROPBOX_ACCESS_TOKEN }}\",\"token_type\":\"bearer\",\"expiry\":\"0001-01-01T00:00:00Z\"}" >> ~/.config/rclone/rclone.conf
 
-      - name: Sync lightnovel
+      - name: 仅上传新文件
         run: |
-          rclone sync ./ dropbox:/微凉半度/ \
+          rclone copy ./ dropbox:/微凉半度/ \
             --progress \
-            --include "轻小说/**" \
-            --exclude "*" 
+            --ignore-existing \       # 核心参数：跳过已存在的文件
+            --include "轻小说/**" \    # 仅处理轻小说文件夹
+            --exclude "*"             # 排除其他所有内容
