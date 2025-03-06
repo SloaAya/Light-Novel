@@ -1,4 +1,4 @@
-name: Sync dropbox
+name: Sync LightNovel
 
 on:
   push:
@@ -23,8 +23,8 @@ jobs:
 
       - name: 仅上传新文件
         run: |
-          rclone copy ./ dropbox:/微凉半度/ \
+          rclone copy ./ "dropbox:/微凉半度/" \
             --progress \
-            --ignore-existing \       # 核心参数：跳过已存在的文件
-            --include "轻小说/**" \    # 仅处理轻小说文件夹
-            --exclude "*"             # 排除其他所有内容
+            --ignore-existing \
+            --include "轻小说/**" \
+            --exclude "*"
