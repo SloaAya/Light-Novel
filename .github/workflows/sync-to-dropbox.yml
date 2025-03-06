@@ -26,5 +26,5 @@ jobs:
           rclone copy ./ "dropbox:/微凉半度/" \
             --progress \
             --ignore-existing \
-            --include "轻小说/**" \
-            --exclude "*"
+            --filter "+ 轻小说/**" \
+            --filter "- *"
