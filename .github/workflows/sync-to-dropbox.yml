@@ -1,4 +1,4 @@
-name: 轻小说同步（修复检出问题）
+name: SyncLightNovel
 
 on:
   push:
@@ -13,12 +13,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # 显式传递令牌
-          submodules: recursive               # 处理子模块
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive  
           fetch-depth: 0
           persist-credentials: true
 
-      # 后续步骤（安装rclone、配置、同步）保持不变
       - name: Install rclone
         run: curl https://rclone.org/install.sh | sudo bash
 
@@ -29,7 +28,7 @@ jobs:
           echo "type = dropbox" >> ~/.config/rclone/rclone.conf
           echo "token = {\"access_token\":\"${{ secrets.DROPBOX_ACCESS_TOKEN }}\",\"token_type\":\"bearer\",\"expiry\":\"0001-01-01T00:00:00Z\"}" >> ~/.config/rclone/rclone.conf
 
-      - name: 增量同步到 Dropbox
+      - name: 同步到 Dropbox
         run: |
           rclone copy ./ "dropbox:/微凉半度/" \
             --progress \
