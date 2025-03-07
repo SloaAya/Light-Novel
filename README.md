@@ -63,7 +63,8 @@
 
 ## 功能  
 通过Git LFS实现大文件上传至GitHub仓库  
-通过Rclone+GitHub Action自动上传至网盘  
+~通过Rclone+GitHub Action自动上传至网盘（因token链接只有四个小时有效期故取消该功能）~  
+通过OneDrive+WebDAV实现全平台互通  
 通过静读天下实现全平台缓存+自动下载
 
 
