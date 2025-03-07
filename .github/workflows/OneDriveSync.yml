@@ -1,15 +1,15 @@
 name: OneDrive Sync
 
-on: workflow_dispatch
+on: workflow_dispatch  # 仅手动触发
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write  # 必须写入权限
 
     steps:
-    - name: Checkout
+    - name: Checkout code
       uses: actions/checkout@v4
       with:
         fetch-depth: 0  # 获取完整提交历史
@@ -17,17 +17,16 @@ jobs:
     - name: Install Rclone
       run: sudo curl https://rclone.org/install.sh | sudo bash
 
-    - name: Configure Rclone
+    - name: Configure Rclone (关键修复)
       env:
         RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
       run: |
         mkdir -p ~/.config/rclone
-        echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-        echo "=== 配置文件内容验证 ==="
-        cat ~/.config/rclone/rclone.conf
+        echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf  # 直接写入完整配置
+        echo "✅ Rclone 配置文件已生成"  # 调试提示
 
     - name: Validate Connection
-      run: rclone lsd onedrive:
+      run: rclone lsd onedrive:  # 连接验证
 
     - name: Sync Files
       run: |
@@ -38,7 +37,8 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        git config --global --add safe.directory /github/workspace
+        git config --global user.name "Auto Sync Bot"
+        git config --global user.email "auto-sync@users.noreply.github.com"
         git add .
-        git diff-index --quiet HEAD || git commit -m "[AutoSync] $(date +'%Y-%m-%d %H:%M')"
+        git diff-index --quiet HEAD || git commit -m "🚀 Auto Sync from OneDrive"
         git push
