@@ -33,7 +33,7 @@ jobs:
 
     - name: Sync from OneDrive
       run: |
-        rclone sync onedrive:/YourFolderPath ./local_folder -v
+        rclone sync onedrive:/LightNovel
 
     - name: Commit changes
       run: |
