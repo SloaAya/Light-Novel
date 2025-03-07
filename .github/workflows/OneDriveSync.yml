@@ -13,7 +13,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 0  # 获取完整提交历史
 
     - name: Install Rclone
       run: sudo curl https://rclone.org/install.sh | sudo bash
@@ -28,7 +28,6 @@ jobs:
         echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
         sed -i "s/your_client_id_here/$CLIENT_ID/g" ~/.config/rclone/rclone.conf
         sed -i "s/your_client_secret_here/$CLIENT_SECRET/g" ~/.config/rclone/rclone.conf
-        cat ~/.config/rclone/rclone.conf
 
     - name: Validate Connection
       run: rclone lsd onedrive:
@@ -47,5 +46,9 @@ jobs:
         git config --global user.email "actions@github.com"
         git config --global --add safe.directory /github/workspace
         git add .
-        git commit -m "[Auto] Sync $(date +'%Y-%m-%d')" || echo "No changes"
-        git push origin HEAD:${GITHUB_REF#refs/heads/}
+        if git diff-index --quiet HEAD; then
+          echo "No changes to commit"
+        else
+          git commit -m "[AutoSync] Update $(date +'%Y-%m-%d %H:%M:%S')"
+          git push origin HEAD:${GITHUB_REF#refs/heads/} --force
+        fi
