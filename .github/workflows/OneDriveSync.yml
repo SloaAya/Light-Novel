@@ -9,28 +9,28 @@ jobs:
       contents: write
 
     steps:
-    - name: Checkout repository
+    - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
 
     - name: Install Rclone
-      run: sudo curl -sS https://rclone.org/install.sh | sudo bash
+      run: sudo curl https://rclone.org/install.sh | sudo bash
 
     - name: Configure Rclone
       env:
         RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
       run: |
-        mkdir -p $HOME/.config/rclone
-        echo "$RCLONE_CONFIG" > $HOME/.config/rclone/rclone.conf
-        echo "Config validation:"
-        rclone config show onedrive
+        mkdir -p ~/.config/rclone
+        echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
+        echo "=== 配置文件内容 ==="
+        cat ~/.config/rclone/rclone.conf
 
-    - name: Create sync directory
-      run: mkdir -p ./LightNovel
+    - name: Validate Config
+      run: rclone config show onedrive
 
-    - name: Perform sync
-      run: rclone sync onedrive:/LightNovel ./LightNovel -v
+    - name: Sync Files
+      run: |
+        mkdir -p ./LightNovel
+        rclone sync onedrive:/LightNovel ./LightNovel -v --log-level DEBUG
 
     - name: Commit changes
       env:
@@ -39,5 +39,5 @@ jobs:
         git config --global user.name "Sync Bot"
         git config --global user.email "sync@bot"
         git add .
-        git diff-index --quiet HEAD || git commit -m "Sync from OneDrive"
-        git push origin HEAD:${{ github.ref_name }}
+        git diff-index --quiet HEAD || git commit -m "Auto Sync"
+        git push
