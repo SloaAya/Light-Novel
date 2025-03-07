@@ -1,54 +1,38 @@
 name: OneDrive Sync
 
-on:
-  workflow_dispatch:
+on: workflow_dispatch  # 仅手动触发
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write  # 必需写入权限
 
     steps:
-    - name: Checkout code
+    - name: Checkout
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # 获取完整提交历史
 
-    - name: Install Rclone
+    - name: Setup Rclone
       run: sudo curl https://rclone.org/install.sh | sudo bash
 
     - name: Configure Rclone
       env:
         RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
-        CLIENT_ID: ${{ secrets.CLIENT_ID }}
-        CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
       run: |
         mkdir -p ~/.config/rclone
         echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-        sed -i "s/your_client_id_here/$CLIENT_ID/g" ~/.config/rclone/rclone.conf
-        sed -i "s/your_client_secret_here/$CLIENT_SECRET/g" ~/.config/rclone/rclone.conf
 
-    - name: Validate Connection
-      run: rclone lsd onedrive:
+    - name: Sync Files
+      run: |
+        mkdir -p ./LightNovel
+        rclone sync onedrive:/LightNovel ./LightNovel -v
 
-    - name: Prepare Directory
-      run: mkdir -p ./LightNovel
-
-    - name: Sync from OneDrive
-      run: rclone sync onedrive:/LightNovel ./LightNovel -v
-
-    - name: Commit changes
+    - name: Commit Changes
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git config --global --add safe.directory /github/workspace
+        git config --global user.name "Auto Sync"
+        git config --global user.email "auto@sync"
         git add .
-        if git diff-index --quiet HEAD; then
-          echo "No changes to commit"
-        else
-          git commit -m "[AutoSync] Update $(date +'%Y-%m-%d %H:%M:%S')"
-          git push origin HEAD:${GITHUB_REF#refs/heads/} --force
-        fi
+        git diff-index --quiet HEAD || git commit -m "Sync from OneDrive"
+        git push
