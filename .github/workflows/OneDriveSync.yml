@@ -1,15 +1,19 @@
+name: OneDrive Sync
+
+on:
+  workflow_dispatch:
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # 添加权限配置
     permissions:
-      contents: write  # 授予仓库内容写入权限
+      contents: write
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # 获取完整提交历史
+        fetch-depth: 0
 
     - name: Install Rclone
       run: sudo curl https://rclone.org/install.sh | sudo bash
@@ -24,6 +28,10 @@ jobs:
         echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
         sed -i "s/your_client_id_here/$CLIENT_ID/g" ~/.config/rclone/rclone.conf
         sed -i "s/your_client_secret_here/$CLIENT_SECRET/g" ~/.config/rclone/rclone.conf
+        cat ~/.config/rclone/rclone.conf
+
+    - name: Validate Connection
+      run: rclone lsd onedrive:
 
     - name: Prepare Directory
       run: mkdir -p ./LightNovel
@@ -32,20 +40,12 @@ jobs:
       run: rclone sync onedrive:/LightNovel ./LightNovel -v
 
     - name: Commit changes
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # 配置 Git 身份
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
-        
-        # 添加所有变更
+        git config --global --add safe.directory /github/workspace
         git add .
-        
-        # 智能提交（仅在存在变更时提交）
-        if git diff-index --quiet HEAD; then
-          echo "No changes to commit"
-        else
-          git commit -m "[Auto] Sync files from OneDrive $(date +'%Y-%m-%d %H:%M:%S')"
-          
-          # 强制推送更新（避免历史冲突）
-          git push origin HEAD:${GITHUB_REF#refs/heads/} --force
-        fi
+        git commit -m "[Auto] Sync $(date +'%Y-%m-%d')" || echo "No changes"
+        git push origin HEAD:${GITHUB_REF#refs/heads/}
