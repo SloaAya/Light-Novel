@@ -1,37 +1,34 @@
-name: SyncLightNovel
+name: Sync with OneDrive
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - '轻小说/**'
+  schedule:
+    - cron: '0 2 * * *'  # 每天UTC时间2点运行
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          submodules: recursive  
-          fetch-depth: 0
-          persist-credentials: true
 
       - name: Install rclone
-        run: curl https://rclone.org/install.sh | sudo bash
+        run: sudo curl https://rclone.org/install.sh | sudo bash
 
       - name: Configure rclone
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "[dropbox]" > ~/.config/rclone/rclone.conf
-          echo "type = dropbox" >> ~/.config/rclone/rclone.conf
-          echo "token = {\"access_token\":\"${{ secrets.DROPBOX_ACCESS_TOKEN }}\",\"token_type\":\"bearer\",\"expiry\":\"0001-01-01T00:00:00Z\"}" >> ~/.config/rclone/rclone.conf
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: 同步到 Dropbox
+      - name: Sync from OneDrive
+        run: rclone sync onedrive:/RemoteFolder/ $GITHUB_WORKSPACE/ --progress
+
+      - name: Push Changes
         run: |
-          rclone copy ./ "dropbox:/微凉半度/" \
-            --progress \
-            --ignore-existing \
-            --filter "+ 轻小说/**" \
-            --filter "- *"
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add .
+          git commit -m "Sync with OneDrive" || echo "No changes"
+          git push
