@@ -1,23 +1,12 @@
-name: Sync with OneDrive
-
-on:
-  schedule:
-    - cron: '0 */6 * * *'  # 每6小时同步一次
-  workflow_dispatch:  # 允许手动触发
-
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        persist-credentials: false
 
-    - name: Setup Rclone
-      run: |
-        sudo curl https://rclone.org/install.sh | sudo bash
+    - name: Install Rclone
+      run: sudo curl https://rclone.org/install.sh | sudo bash
 
     - name: Configure Rclone
       env:
@@ -27,18 +16,12 @@ jobs:
       run: |
         mkdir -p ~/.config/rclone
         echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-        # 动态替换敏感信息
         sed -i "s/your_client_id_here/$CLIENT_ID/g" ~/.config/rclone/rclone.conf
         sed -i "s/your_client_secret_here/$CLIENT_SECRET/g" ~/.config/rclone/rclone.conf
+        cat ~/.config/rclone/rclone.conf  # 调试输出
+
+    - name: Verify Configuration
+      run: rclone config show onedrive  # 确认配置段能被识别
 
     - name: Sync from OneDrive
-      run: |
-        rclone sync onedrive:/LightNovel ./local_folder -v
-
-    - name: Commit changes
-      run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git add .
-        git commit -m "Auto-sync from OneDrive" || echo "No changes to commit"
-        git push
+      run: rclone sync onedrive:/YourFolderPath ./local_folder -v
