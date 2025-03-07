@@ -1,23 +1,12 @@
-name: Sync with OneDrive
-
-on:
-  schedule:
-    - cron: '0 */6 * * *'  # 每6小时同步一次
-  workflow_dispatch:  # 允许手动触发
-
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        persist-credentials: false
 
-    - name: Setup Rclone
-      run: |
-        sudo curl https://rclone.org/install.sh | sudo bash
+    - name: Install Rclone
+      run: sudo curl https://rclone.org/install.sh | sudo bash
 
     - name: Configure Rclone
       env:
@@ -27,13 +16,14 @@ jobs:
       run: |
         mkdir -p ~/.config/rclone
         echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-        # 动态替换敏感信息
         sed -i "s/your_client_id_here/$CLIENT_ID/g" ~/.config/rclone/rclone.conf
         sed -i "s/your_client_secret_here/$CLIENT_SECRET/g" ~/.config/rclone/rclone.conf
 
+    - name: Prepare Directory
+      run: mkdir -p ./LightNovel  # 关键修复点
+
     - name: Sync from OneDrive
-      run: |
-        rclone sync onedrive:/LightNovel
+      run: rclone sync onedrive:/LightNovel ./LightNovel -v  # 必须有两个路径参数
 
     - name: Commit changes
       run: |
