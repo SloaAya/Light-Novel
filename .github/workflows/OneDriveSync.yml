@@ -1,43 +1,42 @@
-name: OneDrive Sync
-
-on: workflow_dispatch
+name: Auto Upload via Rclone
+on:
+  push:
+    branches: [ main ]  # 触发分支，按需修改
 
 jobs:
-  sync:
+  upload:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install Rclone
-      run: sudo curl https://rclone.org/install.sh | sudo bash
+    - name: Install rclone
+      run: |
+        curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
+        unzip rclone-current-linux-amd64.zip
+        cd rclone-*-linux-amd64
+        sudo cp rclone /usr/bin/
+        sudo chmod 755 /usr/bin/rclone
 
-    - name: Configure Rclone
+    - name: Configure rclone
       env:
-        RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+        WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+        WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
       run: |
         mkdir -p ~/.config/rclone
-        echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-        echo "=== 配置文件内容 ==="
-        cat ~/.config/rclone/rclone.conf
+        cat <<EOF > ~/.config/rclone/rclone.conf
+        [${{ secrets.RCLONE_REMOTE_NAME }}]
+        type = webdav
+        url = https://webdav-1846637853.pd1.123pan.cn/webdav # 修改为你的WebDAV地址
+        vendor = other
+        user = $WEBDAV_USER
+        pass = $WEBDAV_PASS
+        EOF
 
-    - name: Validate Config
-      run: rclone config show onedrive
-
-    - name: Sync Files
+    - name: Upload files
       run: |
-        mkdir -p ./LightNovel
-        rclone sync onedrive:/LightNovel ./LightNovel -v --log-level DEBUG
+        # 压缩仓库内容（可选）
+        zip -r repo.zip . -x *.git* *.github*
 
-    - name: Commit changes
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        git config --global user.name "Sync Bot"
-        git config --global user.email "sync@bot"
-        git add .
-        git diff-index --quiet HEAD || git commit -m "Auto Sync"
-        git push
+        # 使用 rclone 同步到 WebDAV
+        rclone copy repo.zip ${{ secrets.RCLONE_REMOTE_NAME }}:/LightNovel/ -P
