@@ -1,0 +1,42 @@
+name: Auto Upload via Rclone
+on:
+  push:
+    branches: [ main ]  # 触发分支，按需修改
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install rclone
+      run: |
+        curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
+        unzip rclone-current-linux-amd64.zip
+        cd rclone-*-linux-amd64
+        sudo cp rclone /usr/bin/
+        sudo chmod 755 /usr/bin/rclone
+
+    - name: Configure rclone
+      env:
+        WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+        WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
+      run: |
+        mkdir -p ~/.config/rclone
+        cat <<EOF > ~/.config/rclone/rclone.conf
+        [${{ secrets.RCLONE_REMOTE_NAME }}]
+        type = webdav
+        url = https://webdav-1846637853.pd1.123pan.cn/webdav # 修改为你的WebDAV地址
+        vendor = other
+        user = $WEBDAV_USER
+        pass = $WEBDAV_PASS
+        EOF
+
+    - name: Upload files
+      run: |
+        # 压缩仓库内容（可选）
+        zip -r repo.zip . -x *.git* *.github*
+
+        # 使用 rclone 同步到 WebDAV
+        rclone copy repo.zip ${{ secrets.RCLONE_REMOTE_NAME }}:/LightNovel/ -P
