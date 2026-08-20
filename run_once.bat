@@ -1,14 +1,20 @@
 @echo off
-REM ============================================================
-REM  单次同步：复制书籍 + 提交并推送到 GitHub，然后退出。
-REM  用法：双击本文件运行（会显示命令行窗口与日志）。
-REM ============================================================
-cd /d D:\Light-Novel
-if exist "%~dp0sync_lightnovel.py" (
-    python "%~dp0sync_lightnovel.py" --once
-) else (
-    python sync_lightnovel.py --once
+chcp 65001 >nul
+cd /d "%~dp0"
+setlocal
+
+REM ---- Find a Python interpreter ----
+set "PY="
+where python >nul 2>nul && set "PY=python"
+if not defined PY ( where py >nul 2>nul && set "PY=py" )
+if not defined PY (
+    echo [ERROR] Python not found. Please install Python and add it to PATH.
+    pause
+    exit /b 1
 )
+
+echo [Sync] Copying book, committing and pushing once...
+%PY% "%~dp0sync_lightnovel.py" --once
 echo.
-echo 按任意键退出...
-pause >nul
+echo [Done] Exit code: %errorlevel%
+pause
