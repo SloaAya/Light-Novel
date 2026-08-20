@@ -77,8 +77,13 @@ log = logging.getLogger("sync")
 
 
 # ---------------------------- Git 封装 ----------------------------
-def run_git(args, cwd=TARGET_DIR, check=True):
-    """执行一条 git 命令，返回 (returncode, stdout, stderr)。"""
+def run_git(args, cwd=TARGET_DIR, check=True, timeout=None):
+    """执行一条 git 命令，返回 (returncode, stdout, stderr)。
+    - 设置 GIT_TERMINAL_PROMPT=0：无桌面/无 TTY 环境下不会卡在密码提示。
+    - 支持 timeout：避免 push/pull 因等待凭据而无期限挂起。
+    """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         proc = subprocess.run(
             [GIT_BIN, *args],
@@ -87,7 +92,12 @@ def run_git(args, cwd=TARGET_DIR, check=True):
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=timeout,
+            env=env,
         )
+    except subprocess.TimeoutExpired:
+        log.error("git %s 超时（%ds），可能被凭据提示阻塞。", " ".join(args), timeout)
+        return (124, "", "timeout")
     except FileNotFoundError:
         log.error("未找到 git 可执行文件，请确认已安装 Git 并在 PATH 中（或修改 GIT_BIN）。")
         return (127, "", "git not found")
@@ -157,31 +167,40 @@ def set_remote_url(url):
 
 
 def push_with_retry():
-    """推送，遇到非快进冲突时自动 pull --rebase 后重试，最多 3 次。"""
+    """推送，遇到非快进冲突时自动 pull --rebase 后重试，最多 3 次。
+    无凭据/超时等情况会给出清晰提示并安全退出，不会挂起。"""
     original_url = get_remote_url() if PAT_TOKEN else None
     if PAT_TOKEN:
         set_remote_url(auth_url(REPO_URL))
     try:
         for attempt in range(1, 4):
             cmd = ["push"] + (["-u", REMOTE, BRANCH] if attempt == 1 else [REMOTE, BRANCH])
-            rc, out, err = run_git(cmd, check=False)
+            rc, out, err = run_git(cmd, check=False, timeout=120)
             if rc == 0:
                 log.info("推送成功。")
                 return True
+            if rc == 124:
+                log.error("推送超时（可能正在等待凭据输入）。"
+                          "请在桌面环境运行，或配置 PAT / SSH 实现无人值守推送。")
+                return False
             combined = out + err
+            if any(k in combined for k in ("Authentication failed", "Permission denied",
+                                           "could not read", "denied", "403", "401")):
+                log.error("Git 认证失败。请配置 Personal Access Token 或 SSH 密钥，"
+                          "或在有桌面的环境中运行以使用 Git 凭据管理器（GCM）。详见脚本顶部说明。")
+                return False
             if any(k in combined for k in ("rejected", "non-fast-forward", "fetch first", "not fast-forward")):
                 log.warning("推送被拒绝（存在分叉），尝试 pull --rebase 后重试（第 %d 次）", attempt)
-                rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH], check=False)
+                rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH], check=False, timeout=120)
                 if rc2 != 0:
                     log.error("rebase 失败，放弃本次推送：%s %s", o2.strip(), e2.strip())
                     return False
                 continue
-            else:
-                log.error("推送失败：%s %s", out.strip(), err.strip())
-                if attempt < 3:
-                    time.sleep(3)
-                    continue
-                return False
+            log.error("推送失败：%s %s", out.strip(), err.strip())
+            if attempt < 3:
+                time.sleep(3)
+                continue
+            return False
         return False
     finally:
         if PAT_TOKEN and original_url:
