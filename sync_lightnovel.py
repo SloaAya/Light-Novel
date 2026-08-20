@@ -37,7 +37,12 @@ BOOK_NAME     = "线上游戏的老婆不可能是女生？"
 # 若想归入“轻小说”分类，改为：  TARGET_SUBDIR = os.path.join("轻小说", BOOK_NAME)
 TARGET_SUBDIR = BOOK_NAME
 
-REPO_URL      = "https://github.com/SloaAya/Light-Novel.git"
+# 推荐用 SSH：大体积推送在部分代理 / 网络下，HTTPS 上传会被重置（Connection was reset /
+# remote end hung up），而 SSH 通常能稳定通过。请先把本机公钥加到 GitHub（见脚本顶部说明）。
+# 若坚持用 HTTPS，改回下面这行并配置 PAT_TOKEN 或 Git 凭据管理器（GCM）即可：
+#   REPO_URL = "https://github.com/SloaAya/Light-Novel.git"
+REPO_URL      = "git@github.com:SloaAya/Light-Novel.git"
+# SSH 的 22 端口被封时的兜底地址（走 443）： git@ssh.github.com:443/SloaAya/Light-Novel.git
 REMOTE        = "origin"
 BRANCH        = "main"
 GIT_BIN       = "git"          # 若 git 不在 PATH，可改为完整路径，如 r"C:\Program Files\Git\bin\git.exe"
@@ -182,7 +187,7 @@ def classify_push_error(out, err):
                   "connection reset by peer", "unexpected disconnect", "early eof",
                   "the remote end hung up", "failed to connect", "could not resolve",
                   "connection timed out", "connection refused", "broken pipe",
-                  "timed out", "reset by peer")
+                  "timed out", "reset by peer", "failed to push some refs")
     if any(k in c for k in auth_keys):
         return "auth"
     if any(k in c for k in nff_keys):
@@ -201,52 +206,78 @@ def _push_backoff(attempt, max_attempts, base=5):
     time.sleep(wait)
 
 
+def get_unpushed_commits():
+    """返回本地有而 origin/main 没有的提交（从旧到新排序）。"""
+    rc, out, _ = run_git(["rev-list", "--reverse", f"{REMOTE}/{BRANCH}..{BRANCH}"], check=False)
+    if rc != 0:
+        return []
+    return [c.strip() for c in out.splitlines() if c.strip()]
+
+
+def _retry_push(cmd, max_attempts=5, label=""):
+    """对单条 push 命令按错误类型自动重试，返回 True/False。"""
+    tag = f"({label})" if label else ""
+    for attempt in range(1, max_attempts + 1):
+        rc, out, err = run_git(cmd, check=False, timeout=3600)
+        if rc == 0:
+            log.info("推送成功%s。", tag)
+            return True
+        if rc == 124:
+            log.warning("推送超时（网络过慢或被重置），重试 %d/%d %s", attempt, max_attempts, tag)
+            _push_backoff(attempt, max_attempts)
+            continue
+        kind = classify_push_error(out, err)
+        if kind == "auth":
+            log.error("Git 认证失败。请配置 Personal Access Token 或 SSH 密钥，"
+                      "或在有桌面的环境中运行以使用 Git 凭据管理器（GCM）。详见脚本顶部说明。")
+            return False
+        if kind == "nonfastforward":
+            log.warning("推送被拒绝（存在分叉），尝试 pull --rebase 后重试 %d/%d %s", attempt, max_attempts, tag)
+            rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH], check=False, timeout=3600)
+            if rc2 != 0:
+                log.error("rebase 失败，放弃本次推送：%s %s", o2.strip(), e2.strip())
+                return False
+            _push_backoff(attempt, max_attempts, base=1)
+            continue
+        if kind == "transient":
+            log.warning("网络瞬时错误（连接被重置 / 断开），重试 %d/%d %s：%s",
+                        attempt, max_attempts, tag, (out + err).strip()[:200])
+            if attempt < max_attempts:
+                _push_backoff(attempt, max_attempts)
+                continue
+            log.error("多次重试后仍因网络错误推送失败，请检查网络 / 代理后重试。")
+            return False
+        # fatal / 未知
+        log.error("推送失败%s：%s %s", tag, out.strip(), err.strip())
+        return False
+    return False
+
+
 def push_with_retry():
-    """推送，按错误类型自动处理：
-       - 非快进冲突：pull --rebase 后重试
-       - 网络瞬时错误（连接被重置 / 断开等）：指数退避后重试，最多 5 次
-       - 认证 / 终端提示：直接给出清晰提示并安全退出，不挂起
-    """
+    """推送。待推送提交较多时改用「逐提交分块推送」（旧 -> 新），
+    每块只传增量并独立重试 / 退避，可显著降低大仓库单次大上传被网络重置的概率。
+    已成功推送的部分会保留在远程，不会丢失；失败后重跑本程序可续传。"""
     original_url = get_remote_url() if PAT_TOKEN else None
     if PAT_TOKEN:
         set_remote_url(auth_url(REPO_URL))
-    max_attempts = 5
     try:
-        for attempt in range(1, max_attempts + 1):
-            cmd = ["push"] + (["-u", REMOTE, BRANCH] if attempt == 1 else [REMOTE, BRANCH])
-            rc, out, err = run_git(cmd, check=False, timeout=600)
-            if rc == 0:
-                log.info("推送成功。")
-                return True
-            if rc == 124:
-                log.warning("推送超时（网络过慢或被重置），准备重试（第 %d/%d 次）", attempt, max_attempts)
-                _push_backoff(attempt, max_attempts)
-                continue
-            kind = classify_push_error(out, err)
-            if kind == "auth":
-                log.error("Git 认证失败。请配置 Personal Access Token 或 SSH 密钥，"
-                          "或在有桌面的环境中运行以使用 Git 凭据管理器（GCM）。详见脚本顶部说明。")
+        commits = get_unpushed_commits()
+        if not commits:
+            log.info("没有需要推送的提交。")
+            return True
+        if len(commits) == 1:
+            return _retry_push(["push", "-u", REMOTE, BRANCH])
+        log.info("检测到 %d 个待推送提交，启用逐提交分块推送以降低重置风险。", len(commits))
+        for i, sha in enumerate(commits, 1):
+            ok = _retry_push(["push", REMOTE, f"{sha}:refs/heads/{BRANCH}"],
+                             label=f"块 {i}/{len(commits)}")
+            if not ok:
+                log.error("分块推送在 %d/%d 失败。已成功推送的部分已保留在远程，"
+                          "修复网络 / 配置后重跑本程序即可从断点续传。", i, len(commits))
                 return False
-            if kind == "nonfastforward":
-                log.warning("推送被拒绝（存在分叉），尝试 pull --rebase 后重试（第 %d/%d 次）", attempt, max_attempts)
-                rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH], check=False, timeout=600)
-                if rc2 != 0:
-                    log.error("rebase 失败，放弃本次推送：%s %s", o2.strip(), e2.strip())
-                    return False
-                _push_backoff(attempt, max_attempts, base=1)
-                continue
-            if kind == "transient":
-                log.warning("网络瞬时错误（连接被重置 / 断开），准备重试（第 %d/%d 次）：%s",
-                            attempt, max_attempts, (out + err).strip()[:200])
-                if attempt < max_attempts:
-                    _push_backoff(attempt, max_attempts)
-                    continue
-                log.error("多次重试后仍因网络错误推送失败，请检查网络 / 代理后重试。")
-                return False
-            # fatal / 未知
-            log.error("推送失败：%s %s", out.strip(), err.strip())
-            return False
-        return False
+        # 末次确保 tip 与上游跟踪
+        _retry_push(["push", "-u", REMOTE, BRANCH], label="tip")
+        return True
     finally:
         if PAT_TOKEN and original_url:
             set_remote_url(original_url)
