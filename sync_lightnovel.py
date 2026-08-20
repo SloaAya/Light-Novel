@@ -288,16 +288,17 @@ def git_commit_push(message):
     rc, _, _ = run_git(["diff", "--cached", "--quiet"], check=False)
     if rc == 0:
         log.info("没有需要提交的变更，跳过提交。")
-        return False
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rc, _, err = run_git(["commit", "-m", f"{message}\n\n自动同步于 {ts}"], check=False)
-    if rc != 0:
-        log.error("提交失败：%s", err.strip())
-        return False
-    log.info("已提交：%s", message)
+    else:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rc, _, err = run_git(["commit", "-m", f"{message}\n\n自动同步于 {ts}"], check=False)
+        if rc != 0:
+            log.error("提交失败：%s", err.strip())
+            return False
+        log.info("已提交：%s", message)
+    # 无论是否产生新提交，都尝试推送（历史未推送的提交也需同步）
     ok = push_with_retry()
     if not ok:
-        log.warning("提交已完成，但推送未成功，请检查网络 / 凭据后重试。")
+        log.warning("提交/推送未完全成功，请检查网络 / 凭据后重试。")
     return ok
 
 
