@@ -127,6 +127,10 @@ def ensure_repo():
     run_git(["config", "--global", "--add", "safe.directory", TARGET_DIR], check=False, cwd=None)
     # 让中文路径在日志 / 状态中可读
     run_git(["config", "--local", "core.quotepath", "false"], check=False)
+    # 大体积推送（多本 EPUB）调优：提高 postBuffer，并降级为 HTTP/1.1，
+    # 可避免部分代理 / 网络环境下 “curl 55 Send failure / 连接被重置” 的瞬时失败。
+    run_git(["config", "--local", "http.postBuffer", "524288000"], check=False)
+    run_git(["config", "--local", "http.version", "HTTP/1.1"], check=False)
     return True
 
 
@@ -166,40 +170,81 @@ def set_remote_url(url):
     run_git(["remote", "set-url", REMOTE, url], check=False)
 
 
+def classify_push_error(out, err):
+    """把 push 失败归类为：'auth' | 'nonfastforward' | 'transient' | 'fatal'。"""
+    c = (out + err).lower()
+    auth_keys = ("authentication failed", "permission denied", "could not read username",
+                 "could not read password", "terminal prompts disabled", "access denied",
+                 "403", "401")
+    nff_keys = ("rejected", "non-fast-forward", "fetch first", "not fast-forward",
+                "tip of your current branch is behind")
+    trans_keys = ("rpc failed", "send failure", "connection was reset",
+                  "connection reset by peer", "unexpected disconnect", "early eof",
+                  "the remote end hung up", "failed to connect", "could not resolve",
+                  "connection timed out", "connection refused", "broken pipe",
+                  "timed out", "reset by peer")
+    if any(k in c for k in auth_keys):
+        return "auth"
+    if any(k in c for k in nff_keys):
+        return "nonfastforward"
+    if any(k in c for k in trans_keys):
+        return "transient"
+    return "fatal"
+
+
+def _push_backoff(attempt, max_attempts, base=5):
+    """指数退避等待：5s, 10s, 20s... 上限 60s；最后一次不等待。"""
+    if attempt >= max_attempts:
+        return
+    wait = min(base * (2 ** (attempt - 1)), 60)
+    log.info("等待 %d 秒后重试...", wait)
+    time.sleep(wait)
+
+
 def push_with_retry():
-    """推送，遇到非快进冲突时自动 pull --rebase 后重试，最多 3 次。
-    无凭据/超时等情况会给出清晰提示并安全退出，不会挂起。"""
+    """推送，按错误类型自动处理：
+       - 非快进冲突：pull --rebase 后重试
+       - 网络瞬时错误（连接被重置 / 断开等）：指数退避后重试，最多 5 次
+       - 认证 / 终端提示：直接给出清晰提示并安全退出，不挂起
+    """
     original_url = get_remote_url() if PAT_TOKEN else None
     if PAT_TOKEN:
         set_remote_url(auth_url(REPO_URL))
+    max_attempts = 5
     try:
-        for attempt in range(1, 4):
+        for attempt in range(1, max_attempts + 1):
             cmd = ["push"] + (["-u", REMOTE, BRANCH] if attempt == 1 else [REMOTE, BRANCH])
-            rc, out, err = run_git(cmd, check=False, timeout=120)
+            rc, out, err = run_git(cmd, check=False, timeout=600)
             if rc == 0:
                 log.info("推送成功。")
                 return True
             if rc == 124:
-                log.error("推送超时（可能正在等待凭据输入）。"
-                          "请在桌面环境运行，或配置 PAT / SSH 实现无人值守推送。")
-                return False
-            combined = out + err
-            if any(k in combined for k in ("Authentication failed", "Permission denied",
-                                           "could not read", "denied", "403", "401")):
+                log.warning("推送超时（网络过慢或被重置），准备重试（第 %d/%d 次）", attempt, max_attempts)
+                _push_backoff(attempt, max_attempts)
+                continue
+            kind = classify_push_error(out, err)
+            if kind == "auth":
                 log.error("Git 认证失败。请配置 Personal Access Token 或 SSH 密钥，"
                           "或在有桌面的环境中运行以使用 Git 凭据管理器（GCM）。详见脚本顶部说明。")
                 return False
-            if any(k in combined for k in ("rejected", "non-fast-forward", "fetch first", "not fast-forward")):
-                log.warning("推送被拒绝（存在分叉），尝试 pull --rebase 后重试（第 %d 次）", attempt)
-                rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH], check=False, timeout=120)
+            if kind == "nonfastforward":
+                log.warning("推送被拒绝（存在分叉），尝试 pull --rebase 后重试（第 %d/%d 次）", attempt, max_attempts)
+                rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH], check=False, timeout=600)
                 if rc2 != 0:
                     log.error("rebase 失败，放弃本次推送：%s %s", o2.strip(), e2.strip())
                     return False
+                _push_backoff(attempt, max_attempts, base=1)
                 continue
+            if kind == "transient":
+                log.warning("网络瞬时错误（连接被重置 / 断开），准备重试（第 %d/%d 次）：%s",
+                            attempt, max_attempts, (out + err).strip()[:200])
+                if attempt < max_attempts:
+                    _push_backoff(attempt, max_attempts)
+                    continue
+                log.error("多次重试后仍因网络错误推送失败，请检查网络 / 代理后重试。")
+                return False
+            # fatal / 未知
             log.error("推送失败：%s %s", out.strip(), err.strip())
-            if attempt < 3:
-                time.sleep(3)
-                continue
             return False
         return False
     finally:
