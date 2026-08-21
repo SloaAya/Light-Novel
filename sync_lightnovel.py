@@ -242,7 +242,10 @@ def get_unpushed_commits():
 
 
 def _retry_push(cmd, max_attempts=5, label=""):
-    """对单条 push 命令按错误类型自动重试，返回 True/False。"""
+    """对单条 push 命令按错误类型自动重试，返回 True/False。
+    只处理「超时 / 网络瞬时错误」的重试；auth / 分叉(non-fast-forward) / fatal
+    直接返回 False，由调用方负责 pull --rebase 后重新计算范围。（rebase 会改写
+    提交 SHA，不能在本函数内用旧 SHA 反复重推，否则陷入分叉死循环。）"""
     tag = f"({label})" if label else ""
     for attempt in range(1, max_attempts + 1):
         rc, out, err = run_git(cmd, check=False, timeout=3600)
@@ -259,13 +262,8 @@ def _retry_push(cmd, max_attempts=5, label=""):
                       "或在有桌面的环境中运行以使用 Git 凭据管理器（GCM）。详见脚本顶部说明。")
             return False
         if kind == "nonfastforward":
-            log.warning("推送被拒绝（存在分叉），尝试 pull --rebase 后重试 %d/%d %s", attempt, max_attempts, tag)
-            rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH], check=False, timeout=3600)
-            if rc2 != 0:
-                log.error("rebase 失败，放弃本次推送：%s %s", o2.strip(), e2.strip())
-                return False
-            _push_backoff(attempt, max_attempts, base=1)
-            continue
+            log.warning("推送被拒绝（存在分叉）%s", tag)
+            return False  # 交给外层 rebase 后重新计算范围再推
         if kind == "transient":
             log.warning("网络瞬时错误（连接被重置 / 断开），重试 %d/%d %s：%s",
                         attempt, max_attempts, tag, (out + err).strip()[:200])
@@ -281,27 +279,40 @@ def _retry_push(cmd, max_attempts=5, label=""):
 
 
 def push_with_retry():
-    """推送。待推送提交较多时改用「逐提交分块推送」（旧 -> 新），
-    每块只传增量并独立重试 / 退避，可显著降低大仓库单次大上传被网络重置的概率。
-    已成功推送的部分会保留在远程，不会丢失；失败后重跑本程序可续传。"""
+    """逐提交分块推送（旧 -> 新）。
+    关键：每次迭代都**重新计算**待推送范围，且只推「最旧的一个提交」——
+    该提交的父节点始终是 origin/main，因此每次都是干净快进、单次上传量最小，
+    最不易被网络重置。遇分叉先 pull --rebase 到最新远程、重算范围再继续；
+    rebase 改写 SHA 也不会再用旧 SHA 死循环。已成功推送部分保留在远程，
+    失败后重跑本程序即可从断点续传。"""
     original_url = get_remote_url() if PAT_TOKEN else None
     if PAT_TOKEN:
         set_remote_url(auth_url(REPO_URL))
     try:
-        commits = get_unpushed_commits()
-        if not commits:
-            log.info("没有需要推送的提交。")
-            return True
-        if len(commits) == 1:
-            return _retry_push(["push", "-u", REMOTE, BRANCH])
-        log.info("检测到 %d 个待推送提交，启用逐提交分块推送以降低重置风险。", len(commits))
-        for i, sha in enumerate(commits, 1):
+        run_git(["fetch", REMOTE, BRANCH], check=False, timeout=600)
+        for _ in range(400):  # 上限保护，防止意外死循环
+            commits = get_unpushed_commits()
+            if not commits:
+                break  # 全部推完
+            sha = commits[0]  # 最旧的待推送提交
             ok = _retry_push(["push", REMOTE, f"{sha}:refs/heads/{BRANCH}"],
-                             label=f"块 {i}/{len(commits)}")
-            if not ok:
-                log.error("分块推送在 %d/%d 失败。已成功推送的部分已保留在远程，"
-                          "修复网络 / 配置后重跑本程序即可从断点续传。", i, len(commits))
+                             label=f"块(剩 {len(commits)})")
+            if ok:
+                continue  # 该提交已上推，下轮重算会自动跳过它
+            # 失败：拉取最新远程并 rebase 本地到其之上，再重算范围
+            run_git(["fetch", REMOTE, BRANCH], check=False, timeout=600)
+            rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH],
+                                  check=False, timeout=3600)
+            if rc2 != 0:
+                log.error("rebase 失败，放弃本次推送：%s %s", o2.strip(), e2.strip())
                 return False
+            # rebase 后 SHA 已变，检测是否真的有进展，避免停滞死循环
+            new_commits = get_unpushed_commits()
+            if new_commits and new_commits[0] == sha and len(new_commits) >= len(commits):
+                log.error("推送停滞（分叉无法经 rebase 解决），放弃。已推送部分保留在远程，"
+                          "修复冲突 / 网络后重跑可续传。")
+                return False
+            # 否则进入下一轮，用新的 commits 继续
         # 末次确保 tip 与上游跟踪
         _retry_push(["push", "-u", REMOTE, BRANCH], label="tip")
         return True
