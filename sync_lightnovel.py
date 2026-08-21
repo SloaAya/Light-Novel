@@ -81,6 +81,7 @@ GIT_BIN       = "git"          # 若 git 不在 PATH，可改为完整路径，�
 MONITOR_INTERVAL = 5           # 监控轮询间隔（秒）
 SETTLE_TIME      = 3           # 判定文件“已写完、稳定”的等待时间（秒）
 MAX_SETTLE_WAIT  = 180         # 单轮最多等待稳定的时间（秒），超时则强制同步
+MAX_DELETIONS_GUARD = 100      # 单次提交允许的最大删除文件数（超过则判定为异常，拒绝提交）
 
 LOG_DIR       = os.path.join(TARGET_DIR, ".autosync")
 LOG_FILE      = os.path.join(LOG_DIR, "sync.log")
@@ -336,12 +337,22 @@ def push_with_retry():
 
 
 def git_commit(message):
-    """提交工作树变更（有变更才提交）。返回 True=成功（含无变更），False=提交失败。"""
+    """提交工作树变更（有变更才提交）。返回 True=成功（含无变更），False=提交失败。
+    安全护栏：若暂存区包含 >=MAX_DELETIONS_GUARD 个删除（通常是工作区被意外清空 /
+    在错误目录运行 / 磁盘异常），拒绝提交并撤销暂存，防止把大规模误删推上远程。"""
     run_git(["add", "-A"], check=False)
     rc, _, _ = run_git(["diff", "--cached", "--quiet"], check=False)
     if rc == 0:
         log.info("没有需要提交的变更，跳过提交。")
         return True
+    rc, names, _ = run_git(["diff", "--cached", "--name-only", "--diff-filter=D"], check=False)
+    deletions = len([x for x in names.splitlines() if x])
+    if deletions >= MAX_DELETIONS_GUARD:
+        log.error("检测到大规模删除（%d 个文件将被删除），疑似工作区异常（如目录被清空），"
+                  "已取消本次提交并撤销暂存。请人工确认后重跑；若确属有意删除，"
+                  "请分批删除或临时调大 MAX_DELETIONS_GUARD。", deletions)
+        run_git(["reset", "-q"], check=False)  # 仅撤销暂存，不改动工作区文件
+        return False
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rc, _, err = run_git(["commit", "-m", f"{message}\n\n自动同步于 {ts}"], check=False)
     if rc != 0:
@@ -530,16 +541,26 @@ def mirror_dir(src, dst):
 
 
 def _purge_excluded_files(dst):
-    """删除 dst 目录树下已存在的系统垃圾文件（历史上被镜像过去的），返回删除数。"""
+    """删除 dst 目录树下已存在的系统垃圾文件（历史上被镜像过去的），返回删除数。
+    删除失败会记录警告（不再静默吞掉），便于发现权限 / 网络盘挂载问题。"""
     removed = 0
+    failed = 0
     for r, _dirs, files in os.walk(dst):
         for f in files:
             if f.lower() in EXCLUDE_FILE_NAMES:
+                p = os.path.join(r, f)
                 try:
-                    os.remove(os.path.join(r, f))
-                    removed += 1
+                    os.chmod(p, 0o666)  # 去掉只读属性（Windows 上只读文件无法删除）
                 except OSError:
                     pass
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError as exc:
+                    failed += 1
+                    log.warning("无法删除垃圾文件 %s：%s", p, exc)
+    if failed:
+        log.warning("%s 下有 %d 个垃圾文件删除失败，请检查权限或手动清理。", dst, failed)
     return removed
 
 
