@@ -378,12 +378,14 @@ def _replace_readme_section(text, title, bullets):
     """把 README 中 <details> 区块（summary 含 title）里的书单替换为 bullets。
     保留区块外的所有内容（标题、功能说明等）。"""
     pattern = re.compile(
-        r'(<details>\s*<summary>[^<]*' + re.escape(title) + r'[^<]*</summary>)\s*\n.*?(\n\s*</details>)',
+        r'(<details>\s*<summary>[^<]*' + re.escape(title) + r'[^<]*</summary>).*?(</details>)',
         re.DOTALL,
     )
 
     def repl(m):
-        return m.group(1) + "\n\n" + bullets + "\n" + m.group(2)
+        # 规范化为固定格式（summary 后空一行、书单、再空一行、</details>），
+        # 且只重建从 summary 到对应 </details> 的部分，避免反复累积尾部空行导致每次都产生新提交。
+        return m.group(1) + "\n\n" + bullets.rstrip() + "\n\n" + m.group(2)
 
     return pattern.subn(repl, text, count=1)
 
