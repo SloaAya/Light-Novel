@@ -116,6 +116,8 @@ def run_git(args, cwd=TARGET_DIR, check=True, timeout=None):
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     try:
+        # Windows 下避免 subprocess 启动 git.exe 时弹出黑色命令行窗口
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         proc = subprocess.run(
             [GIT_BIN, *args],
             cwd=cwd,
@@ -125,6 +127,7 @@ def run_git(args, cwd=TARGET_DIR, check=True, timeout=None):
             errors="replace",
             timeout=timeout,
             env=env,
+            creationflags=creationflags,
         )
     except subprocess.TimeoutExpired:
         log.error("git %s 超时（%ds），可能被凭据提示阻塞。", " ".join(args), timeout)
