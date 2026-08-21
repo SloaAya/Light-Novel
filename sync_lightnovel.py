@@ -234,10 +234,16 @@ def _push_backoff(attempt, max_attempts, base=5):
 
 
 def get_unpushed_commits():
-    """返回本地有而 origin/main 没有的提交（从旧到新排序）。"""
-    rc, out, _ = run_git(["rev-list", "--reverse", f"{REMOTE}/{BRANCH}..{BRANCH}"], check=False)
+    """返回本地有而远程 main 没有的提交（从旧到新排序）。
+    先 fetch 再用 FETCH_HEAD 计算，避免个别环境下 origin/main 远程跟踪引用
+    未被 fetch 刷新，导致「陈旧计数 / 误判分叉」的问题。"""
+    run_git(["fetch", REMOTE, BRANCH], check=False, timeout=600)
+    rc, out, _ = run_git(["rev-list", "--reverse", f"FETCH_HEAD..{BRANCH}"], check=False)
     if rc != 0:
-        return []
+        # 退化：改用本地远程跟踪引用估算
+        rc, out, _ = run_git(["rev-list", "--reverse", f"{REMOTE}/{BRANCH}..{BRANCH}"], check=False)
+        if rc != 0:
+            return []
     return [c.strip() for c in out.splitlines() if c.strip()]
 
 
@@ -279,32 +285,33 @@ def _retry_push(cmd, max_attempts=5, label=""):
 
 
 def push_with_retry():
-    """逐提交分块推送（旧 -> 新）。
-    关键：每次迭代都**重新计算**待推送范围，且只推「最旧的一个提交」——
-    该提交的父节点始终是 origin/main，因此每次都是干净快进、单次上传量最小，
-    最不易被网络重置。遇分叉先 pull --rebase 到最新远程、重算范围再继续；
-    rebase 改写 SHA 也不会再用旧 SHA 死循环。已成功推送部分保留在远程，
-    失败后重跑本程序即可从断点续传。"""
+    """逐提交分块推送（旧 -> 新），每次都先 fetch 并基于真实远程(FETCH_HEAD)计算待推范围。
+    关键：
+    - 待推提交均为 FETCH_HEAD(真实远程 tip) 的后代，因此每次只推最旧一个提交都是干净快进、
+      单次上传量最小，最不易被网络重置；
+    - 若远程被其他写入者(如 OneDrive/CD2 机器人)抢先推进，推送会被拒(non-fast-forward)，
+      此时重新 fetch 并把本地提交 rebase 到最新远程之上再继续——既能续传，也不会用旧 SHA 死循环。
+    已成功推送部分保留在远程，失败后重跑本程序即可从断点续传。"""
     original_url = get_remote_url() if PAT_TOKEN else None
     if PAT_TOKEN:
         set_remote_url(auth_url(REPO_URL))
     try:
-        run_git(["fetch", REMOTE, BRANCH], check=False, timeout=600)
         for _ in range(400):  # 上限保护，防止意外死循环
-            commits = get_unpushed_commits()
+            commits = get_unpushed_commits()  # 内部已 fetch 并基于 FETCH_HEAD 计算
             if not commits:
                 break  # 全部推完
-            sha = commits[0]  # 最旧的待推送提交
+            sha = commits[0]  # 最旧的待推送提交(必然是 FETCH_HEAD 的后代)
             ok = _retry_push(["push", REMOTE, f"{sha}:refs/heads/{BRANCH}"],
                              label=f"块(剩 {len(commits)})")
             if ok:
                 continue  # 该提交已上推，下轮重算会自动跳过它
-            # 失败：拉取最新远程并 rebase 本地到其之上，再重算范围
+            # 失败：说明远程又被抢先推进。重新 fetch 并把本地提交 rebase 到最新远程之上
             run_git(["fetch", REMOTE, BRANCH], check=False, timeout=600)
-            rc2, o2, e2 = run_git(["pull", "--rebase", "--autostash", REMOTE, BRANCH],
-                                  check=False, timeout=3600)
+            rc2, o2, e2 = run_git(["rebase", "FETCH_HEAD"], check=False, timeout=3600)
             if rc2 != 0:
-                log.error("rebase 失败，放弃本次推送：%s %s", o2.strip(), e2.strip())
+                log.error("rebase 到最新远程失败（可能存在文件冲突），放弃本次推送：%s %s",
+                          o2.strip(), e2.strip())
+                run_git(["rebase", "--abort"], check=False)
                 return False
             # rebase 后 SHA 已变，检测是否真的有进展，避免停滞死循环
             new_commits = get_unpushed_commits()
