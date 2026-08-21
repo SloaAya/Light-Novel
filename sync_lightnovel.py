@@ -52,6 +52,9 @@ CATEGORY_DIRS = {
     CATEGORY_DONE:    os.path.join(LIGHT_NOVEL_DIR, CATEGORY_DONE),
     CATEGORY_ONGOING: os.path.join(LIGHT_NOVEL_DIR, CATEGORY_ONGOING),
 }
+
+# 监控只盯这两个分类目录；任一个有改动就同步到 F 盘网盘 + GitHub
+WATCH_DIRS = [CATEGORY_DIRS[CATEGORY_DONE], CATEGORY_DIRS[CATEGORY_ONGOING]]
 # 种子书籍默认放入“未完结”分类（如需默认放入已完结，改 CATEGORY_DONE 即可）
 TARGET_SUBDIR = os.path.join("轻小说", CATEGORY_ONGOING, BOOK_NAME)
 
@@ -534,20 +537,24 @@ def smart_copy():
 
 
 # ---------------------------- 目录快照 / 变更检测 ----------------------------
-def snapshot_dir(root=LIGHT_NOVEL_DIR):
-    """扫描 root（排除 .git 与日志目录），返回 {相对路径: (size, mtime)}。"""
+def snapshot_dir(roots=None):
+    """扫描 roots（默认：整个 轻小说 目录，排除 .git 与日志目录）。
+    返回 {相对 LIGHT_NOVEL_DIR 的路径: (size, mtime)}，键以分类名前缀区分，避免重名碰撞。"""
+    if roots is None:
+        roots = [LIGHT_NOVEL_DIR]
     snap = {}
     skip = {".git", os.path.basename(LOG_DIR)}
-    for r, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in skip]
-        for f in files:
-            fp = os.path.join(r, f)
-            try:
-                st = os.stat(fp)
-                rel = os.path.relpath(fp, root).replace(os.sep, "/")
-                snap[rel] = (st.st_size, int(st.st_mtime))
-            except OSError:
-                pass
+    for root in roots:
+        for r, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in skip]
+            for f in files:
+                fp = os.path.join(r, f)
+                try:
+                    st = os.stat(fp)
+                    rel = os.path.relpath(fp, LIGHT_NOVEL_DIR).replace(os.sep, "/")
+                    snap[rel] = (st.st_size, int(st.st_mtime))
+                except OSError:
+                    pass
     return snap
 
 
@@ -587,13 +594,13 @@ def release_lock():
 def monitor_loop():
     if not acquire_lock():
         return
-    log.info("开始后台实时监控 %s（每 %d 秒轮询一次，Ctrl+C 退出）", LIGHT_NOVEL_DIR, MONITOR_INTERVAL)
-    prev = snapshot_dir()
+    log.info("开始后台实时监控 %s（每 %d 秒轮询一次，Ctrl+C 退出）", "、".join(WATCH_DIRS), MONITOR_INTERVAL)
+    prev = snapshot_dir(WATCH_DIRS)
     try:
         while True:
             time.sleep(MONITOR_INTERVAL)
             try:
-                cur = snapshot_dir()
+                cur = snapshot_dir(WATCH_DIRS)
                 if cur == prev:
                     continue
                 # 检测到变化 -> 等待文件写完（稳定）
@@ -601,7 +608,7 @@ def monitor_loop():
                 waited = 0
                 while True:
                     time.sleep(SETTLE_TIME)
-                    now = snapshot_dir()
+                    now = snapshot_dir(WATCH_DIRS)
                     if now == last:
                         break
                     last = now
