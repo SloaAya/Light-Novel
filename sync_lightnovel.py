@@ -44,6 +44,9 @@ from datetime import datetime
 SOURCE_DIR    = r"D:\BaiduNetdiskDownload"
 TARGET_DIR    = r"D:\Light-Novel"
 BOOK_NAME     = "线上游戏的老婆不可能是女生？"
+# 种子复制开关：源目录已不存在，默认关闭（每次运行不再报「源目录不存在」）。
+# 以后想从 SOURCE_DIR 再种子复制书籍时，改回 True 即可。
+ENABLE_SEED_COPY = False
 
 # ---- 轻小说分类目录（监控、README、F 盘镜像的核心）----
 CATEGORY_DONE    = "已完结"
@@ -788,14 +791,14 @@ def main():
         return
 
     if args.once:
-        if not args.monitor_only:
+        if ENABLE_SEED_COPY and not args.monitor_only:
             smart_copy()
         perform_sync("sync: 手动/初始同步")
         log.info("--once 完成。")
         return
 
-    # 默认模式：种子复制 + 提交推送 + 持续监控
-    if not args.monitor_only:
+    # 默认模式：（可选）种子复制 + 提交推送 + 持续监控
+    if ENABLE_SEED_COPY and not args.monitor_only:
         smart_copy()
     perform_sync("sync: 初始同步")
     monitor_loop()
