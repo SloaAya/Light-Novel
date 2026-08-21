@@ -1,6 +1,18 @@
-# 📚 个人轻小说收集
+<div align="center">
+
+# 📚 Light Novel Collection
+
+### 个人轻小说收藏库
+
+📦 EPUB · 🤖 自动整理 · ☁️ 云端双备份
+
+</div>
 
 ---
+
+## 📖 书单
+
+> 以下书单由脚本自动维护，按名称排序，随藏书变动实时更新。
 
 <details>
 <summary>📚 未完结作品</summary>
@@ -34,8 +46,6 @@
 - 霜月同学喜欢上路人角色
 
 </details>
-
----
 
 <details>
 <summary>✅ 已完结作品</summary>
@@ -73,11 +83,22 @@
 - 金庸武侠小说丛集
 - 龙族
 
-</details>  
+</details>
 
 ---
 
-## 功能  
+## ⚙️ 自动化
 
+| 功能 | 说明 |
+| --- | --- |
+| 📥 实时监控 | `轻小说/已完结` 与 `轻小说/未完结` 目录有变动即自动触发同步 |
+| 🔄 GitHub 同步 | 自动提交并推送；以本地为准，远程多余文件自动清理 |
+| ☁️ 网盘备份 | 自动镜像到网盘 `F:\LightNovel`（CloudDrive2） |
+| 📝 书单维护 | 本 README 的两个书单区块自动刷新，其余内容保持不变 |
+| 🛡️ 安全护栏 | 大规模删除保护 + 系统垃圾文件（desktop.ini 等）自动排除 |
 
+---
 
+<div align="center">
+<sub>由 <code>sync_lightnovel.py</code> 自动维护 · 最后同步见提交记录</sub>
+</div>
