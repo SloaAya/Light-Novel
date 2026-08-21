@@ -1,3 +1,8 @@
 *.ffs_db
 .autosync/
 __pycache__/
+# 系统垃圾文件（Windows/macOS 自动生成，不进仓库）
+desktop.ini
+Desktop.ini
+[Tt]humbs.db
+.DS_Store

@@ -415,6 +415,10 @@ def remove_remote_extras():
 # ---------------------------- 分类目录与 README / F 镜像 ----------------------------
 IGNORE_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", ".autosync"}
 
+# 同步要排除的系统垃圾文件（Windows/macOS 自动生成）：不提交 Git、不镜像网盘、不触发监控。
+# 比较时统一转小写。本地磁盘上的这些文件保留不删（Explorer 会自动重建），只是不再同步出去。
+EXCLUDE_FILE_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
+
 
 def ensure_category_dirs():
     for d in CATEGORY_DIRS.values():
@@ -507,6 +511,8 @@ def mirror_dir(src, dst):
     copied = 0
     for root, _dirs, files in os.walk(src):
         for f in files:
+            if f.lower() in EXCLUDE_FILE_NAMES:
+                continue  # 系统垃圾文件不同步到网盘
             sf = os.path.join(root, f)
             rel = os.path.relpath(sf, src)
             tf = os.path.join(dst, rel)
@@ -523,6 +529,20 @@ def mirror_dir(src, dst):
     return copied
 
 
+def _purge_excluded_files(dst):
+    """删除 dst 目录树下已存在的系统垃圾文件（历史上被镜像过去的），返回删除数。"""
+    removed = 0
+    for r, _dirs, files in os.walk(dst):
+        for f in files:
+            if f.lower() in EXCLUDE_FILE_NAMES:
+                try:
+                    os.remove(os.path.join(r, f))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
 def sync_to_f():
     """把 轻小说 下的两个分类镜像到 F 盘网络云盘（CloudDrive2）。
     返回 True/False（F 盘不可用时返回 False，但不影响 GitHub 推送）。"""
@@ -534,7 +554,8 @@ def sync_to_f():
         dst = F_CATEGORY_DIRS[cat]
         try:
             copied = mirror_dir(src, dst)
-            log.info("已镜像到 F 盘 %s（新增/更新 %d 个文件）", dst, copied)
+            purged = _purge_excluded_files(dst)
+            log.info("已镜像到 F 盘 %s（新增/更新 %d 个文件，清理垃圾文件 %d 个）", dst, copied, purged)
         except Exception as exc:  # F 盘网络异常不应阻断主流程
             log.warning("镜像到 F 盘 %s 失败：%s", dst, exc)
             ok = False
@@ -586,6 +607,8 @@ def smart_copy():
     copied = 0
     for root, _dirs, files in os.walk(src):
         for f in files:
+            if f.lower() in EXCLUDE_FILE_NAMES:
+                continue  # 系统垃圾文件不复制进仓库
             sf = os.path.join(root, f)
             rel = os.path.relpath(sf, src)
             tf = os.path.join(dst, rel)
@@ -616,6 +639,8 @@ def snapshot_dir(roots=None):
         for r, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if d not in skip]
             for f in files:
+                if f.lower() in EXCLUDE_FILE_NAMES:
+                    continue  # 系统垃圾文件不参与变更检测（避免 Explorer 生成 desktop.ini 就触发同步）
                 fp = os.path.join(r, f)
                 try:
                     st = os.stat(fp)
