@@ -4,6 +4,7 @@ on: workflow_dispatch
 
 jobs:
   sync:
+    if: false   # 已停用：避免与本地同步工具（D:\Light-Novel）抢同一 main 分支，且 rclone sync 方向为云盘→git 会误删书籍。恢复只需删除本行。
     runs-on: ubuntu-latest
     permissions:
       contents: write
