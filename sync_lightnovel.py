@@ -7,10 +7,11 @@ Light-Novel GitHub 自动同步与监控工具（增强版）
   1. 初始化 / 校验 Git 仓库与远程配置（已存在则直接复用）
   2. 将指定书籍（文件夹）从百度网盘下载目录种子式复制到 轻小说/未完结/ 下（增量、可重复）
   3. 自动 git add / commit / push（大仓库走 SSH + 逐提交分块推送 + 自动重试）
-  4. 后台实时监控 D:/Light-Novel/轻小说/ ：
+  4. 后台实时监控 D:/Light-Novel/轻小说/已完结 与 未完结 ：
        - 任意外部文件被复制进 已完结 / 未完结 子目录即自动提交并推送到 GitHub
        - 自动刷新 README.md 中对应分类的书名列表
        - 自动镜像到 F:/LightNovel/已完结(未完结)/ （CloudDrive2 网络云盘，失败不阻断推送）
+       - 以本地为准：GitHub 上多出来的文件（本地没有的）自动删除
   5. 完整的日志、错误处理、单实例锁，保证可重复运行
 
 目录结构约定：
@@ -334,24 +335,81 @@ def push_with_retry():
             set_remote_url(original_url)
 
 
-def git_commit_push(message):
-    """提交工作树变更（有变更才提交），随后无论如何都尝试推送（含历史未推送提交）。"""
+def git_commit(message):
+    """提交工作树变更（有变更才提交）。返回 True=成功（含无变更），False=提交失败。"""
     run_git(["add", "-A"], check=False)
     rc, _, _ = run_git(["diff", "--cached", "--quiet"], check=False)
     if rc == 0:
         log.info("没有需要提交的变更，跳过提交。")
-    else:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        rc, _, err = run_git(["commit", "-m", f"{message}\n\n自动同步于 {ts}"], check=False)
-        if rc != 0:
-            log.error("提交失败：%s", err.strip())
-            return False
-        log.info("已提交：%s", message)
-    # 无论是否产生新提交，都尝试推送（历史未推送的提交也需同步）
+        return True
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rc, _, err = run_git(["commit", "-m", f"{message}\n\n自动同步于 {ts}"], check=False)
+    if rc != 0:
+        log.error("提交失败：%s", err.strip())
+        return False
+    log.info("已提交：%s", message)
+    return True
+
+
+def git_commit_push(message):
+    """提交工作树变更（有变更才提交），随后无论如何都尝试推送（含历史未推送提交）。"""
+    if not git_commit(message):
+        return False
     ok = push_with_retry()
     if not ok:
         log.warning("提交/推送未完全成功，请检查网络 / 凭据后重试。")
     return ok
+
+
+def remove_remote_extras():
+    """以本地（D:\\Light-Novel）为准：删除 GitHub 上多出来的文件（远程有、本地没有的文件）。
+
+    要求调用前工作区已干净（先 git_commit）。
+    流程：fetch -> 对比 FETCH_HEAD 与本地文件列表 -> 远程多出的文件，
+    rebase 本地到最新远程之上后 git rm 删除并提交（推送由后续 push_with_retry 统一完成）。
+    任何一步失败都安全跳过（宁可不删，绝不错删）。返回实际删除的文件数。"""
+    rc, _, _ = run_git(["fetch", REMOTE, BRANCH], check=False, timeout=600)
+    if rc != 0:
+        log.warning("fetch 失败，跳过远程多余文件检查（不会误删）。")
+        return 0
+    rc, remote_out, _ = run_git(["ls-tree", "-r", "--name-only", "FETCH_HEAD"], check=False)
+    if rc != 0:
+        log.warning("读取远程文件列表失败，跳过远程多余文件检查。")
+        return 0
+    rc, local_out, _ = run_git(["ls-files"], check=False)
+    if rc != 0:
+        return 0
+    remote_files = {x for x in remote_out.splitlines() if x}
+    local_files = {x for x in local_out.splitlines() if x}
+    extras = sorted(remote_files - local_files)
+    if not extras:
+        return 0
+    log.info("远程比本地多 %d 个文件，将以本地为准删除（示例：%s）",
+             len(extras), "、".join(extras[:5]))
+    # 先把本地 rebase 到最新远程之上（多余文件随之进入工作区/索引），再删除。
+    rc, o, e = run_git(["rebase", "FETCH_HEAD"], check=False, timeout=3600)
+    if rc != 0:
+        log.error("rebase 到最新远程失败，跳过本次多余文件清理：%s %s", o.strip(), e.strip())
+        run_git(["rebase", "--abort"], check=False)
+        return 0
+    # 分批 git rm（--ignore-unmatch 容忍个别文件在 rebase 中已被本地提交删除），避免命令行过长。
+    for i in range(0, len(extras), 50):
+        run_git(["rm", "-q", "--ignore-unmatch", "--"] + extras[i:i + 50], check=False)
+    rc, _, _ = run_git(["diff", "--cached", "--quiet"], check=False)
+    if rc == 0:
+        log.info("rebase 后远程多余文件已不存在，无需删除。")
+        return 0
+    rc, names, _ = run_git(["diff", "--cached", "--name-only", "--diff-filter=D"], check=False)
+    removed = len([x for x in names.splitlines() if x])
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rc, o, e = run_git(["commit", "-m",
+                        f"sync: 以本地为准，删除远程多余文件 -{removed}\n\n自动同步于 {ts}"],
+                       check=False)
+    if rc != 0:
+        log.error("多余文件删除提交失败：%s", e.strip())
+        return 0
+    log.info("已删除远程多余文件 %d 个（待推送）。", removed)
+    return removed
 
 
 # ---------------------------- 分类目录与 README / F 镜像 ----------------------------
@@ -496,7 +554,8 @@ def _warn_stray_items():
 
 
 def perform_sync(message):
-    """一次完整的同步：确保目录 -> 刷新 README -> 镜像 F 盘 -> 提交并推送。"""
+    """一次完整的同步：确保目录 -> 刷新 README -> 镜像 F 盘 -> 提交本地改动
+    -> 以本地为准删除 GitHub 多余文件 -> 统一推送。"""
     ensure_category_dirs()
     regenerate_readme()
     try:
@@ -504,7 +563,16 @@ def perform_sync(message):
     except Exception as exc:
         log.warning("F 盘镜像异常：%s", exc)
     _warn_stray_items()
-    return git_commit_push(message)
+    if not git_commit(message):  # 先提交本地改动，保证工作区干净（后续 rebase 需要）
+        return False
+    try:
+        remove_remote_extras()  # 以本地为准：删除 GitHub 上多出来的文件
+    except Exception as exc:
+        log.warning("远程多余文件清理异常：%s", exc)
+    ok = push_with_retry()
+    if not ok:
+        log.warning("推送未完全成功，请检查网络 / 凭据后重试。")
+    return ok
 
 
 # ---------------------------- 文件复制（种子） ----------------------------
@@ -622,7 +690,9 @@ def monitor_loop():
                 perform_sync(
                     f"auto-sync: +{len(added)} ~{len(modified)} -{len(removed)}"
                 )
-                prev = cur
+                # 同步过程可能改动工作区（如清理远程多余文件时的 rebase + git rm），
+                # 重新快照，避免下一轮把同步自身的改动误判为新的外部变更
+                prev = snapshot_dir(WATCH_DIRS)
             except Exception as exc:  # 单次轮询出错不应中断监控
                 log.error("监控轮询出错：%s", exc)
     except KeyboardInterrupt:
