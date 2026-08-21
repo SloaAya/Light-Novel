@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Light-Novel GitHub 自动同步与监控工具
-====================================
+Light-Novel GitHub 自动同步与监控工具（增强版）
+============================================
 功能：
   1. 初始化 / 校验 Git 仓库与远程配置（已存在则直接复用）
-  2. 将指定书籍（文件夹）从百度网盘下载目录复制到 Light-Novel 目录（增量、可重复）
-  3. 自动 git add / commit / push（非快进时自动 rebase 后重试）
-  4. 后台实时监控 Light-Novel 目录，发现新增 / 修改 / 删除文件即自动同步
+  2. 将指定书籍（文件夹）从百度网盘下载目录种子式复制到 轻小说/未完结/ 下（增量、可重复）
+  3. 自动 git add / commit / push（大仓库走 SSH + 逐提交分块推送 + 自动重试）
+  4. 后台实时监控 D:/Light-Novel/轻小说/ ：
+       - 任意外部文件被复制进 已完结 / 未完结 子目录即自动提交并推送到 GitHub
+       - 自动刷新 README.md 中对应分类的书名列表
+       - 自动镜像到 F:/LightNovel/已完结(未完结)/ （CloudDrive2 网络云盘，失败不阻断推送）
   5. 完整的日志、错误处理、单实例锁，保证可重复运行
 
+目录结构约定：
+  D:/Light-Novel/
+    轻小说/
+      已完结/    <- 已完结书籍（每本一个文件夹）
+      未完结/    <- 未完结书籍（每本一个文件夹）
+    README.md    <- 由本工具自动维护两个书单区块
+    .autosync/   <- 日志与锁（已加入 .gitignore）
+
 用法：
-  python sync_lightnovel.py                  # 复制书籍 + 提交推送 + 持续后台监控
-  python sync_lightnovel.py --once           # 复制书籍 + 提交推送一次，然后退出
-  python sync_lightnovel.py --monitor-only   # 不复制书籍，仅提交当前状态并持续监控
+  python sync_lightnovel.py                  # 种子复制 + 提交推送 + 持续后台监控
+  python sync_lightnovel.py --once           # 种子复制 + 提交推送一次，然后退出
+  python sync_lightnovel.py --monitor-only   # 不复制种子，仅同步当前状态并持续监控
   python sync_lightnovel.py --init           # 仅初始化 / 校验仓库与远程配置
   python sync_lightnovel.py --status         # 查看仓库状态与监控快照
 """
 
 import os
+import re
 import sys
 import time
 import shutil
@@ -32,10 +44,25 @@ SOURCE_DIR    = r"D:\BaiduNetdiskDownload"
 TARGET_DIR    = r"D:\Light-Novel"
 BOOK_NAME     = "线上游戏的老婆不可能是女生？"
 
-# 目标子目录（相对于 TARGET_DIR）。
-# 默认按需求直接放到 Light-Novel 根目录下；
-# 若想归入“轻小说”分类，改为：  TARGET_SUBDIR = os.path.join("轻小说", BOOK_NAME)
-TARGET_SUBDIR = BOOK_NAME
+# ---- 轻小说分类目录（监控、README、F 盘镜像的核心）----
+CATEGORY_DONE    = "已完结"
+CATEGORY_ONGOING = "未完结"
+LIGHT_NOVEL_DIR  = os.path.join(TARGET_DIR, "轻小说")
+CATEGORY_DIRS = {
+    CATEGORY_DONE:    os.path.join(LIGHT_NOVEL_DIR, CATEGORY_DONE),
+    CATEGORY_ONGOING: os.path.join(LIGHT_NOVEL_DIR, CATEGORY_ONGOING),
+}
+# 种子书籍默认放入“未完结”分类（如需默认放入已完结，改 CATEGORY_DONE 即可）
+TARGET_SUBDIR = os.path.join("轻小说", CATEGORY_ONGOING, BOOK_NAME)
+
+# ---- F 盘网络云盘（CloudDrive2 挂载）镜像目录 ----
+F_TARGET_ROOT  = r"F:\LightNovel"
+F_CATEGORY_DIRS = {
+    CATEGORY_DONE:    os.path.join(F_TARGET_ROOT, CATEGORY_DONE),
+    CATEGORY_ONGOING: os.path.join(F_TARGET_ROOT, CATEGORY_ONGOING),
+}
+
+README_PATH = os.path.join(TARGET_DIR, "README.md")
 
 # 推荐用 SSH：大体积推送在部分代理 / 网络下，HTTPS 上传会被重置（Connection was reset /
 # remote end hung up），而 SSH 通常能稳定通过。请先把本机公钥加到 GitHub（见脚本顶部说明）。
@@ -55,7 +82,6 @@ LOG_DIR       = os.path.join(TARGET_DIR, ".autosync")
 LOG_FILE      = os.path.join(LOG_DIR, "sync.log")
 
 # 可选：GitHub Personal Access Token（默认留空，使用系统凭据管理器 / SSH）。
-# 若设置，推送与拉取时会临时将其注入远程 URL，避免交互式输入。
 # ⚠ 令牌等同密码：本文件本身会被同步进仓库，请务必保持为空，
 #    改用 Git Credential Manager（Windows 默认）或 SSH 密钥做认证。
 PAT_TOKEN     = ""
@@ -175,6 +201,7 @@ def set_remote_url(url):
     run_git(["remote", "set-url", REMOTE, url], check=False)
 
 
+# ---------------------------- 推送（错误分类 + 分块 + 重试） ----------------------------
 def classify_push_error(out, err):
     """把 push 失败归类为：'auth' | 'nonfastforward' | 'transient' | 'fatal'。"""
     c = (out + err).lower()
@@ -284,6 +311,7 @@ def push_with_retry():
 
 
 def git_commit_push(message):
+    """提交工作树变更（有变更才提交），随后无论如何都尝试推送（含历史未推送提交）。"""
     run_git(["add", "-A"], check=False)
     rc, _, _ = run_git(["diff", "--cached", "--quiet"], check=False)
     if rc == 0:
@@ -302,9 +330,160 @@ def git_commit_push(message):
     return ok
 
 
-# ---------------------------- 文件复制 ----------------------------
+# ---------------------------- 分类目录与 README / F 镜像 ----------------------------
+IGNORE_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", ".autosync"}
+
+
+def ensure_category_dirs():
+    for d in CATEGORY_DIRS.values():
+        os.makedirs(d, exist_ok=True)
+    for d in F_CATEGORY_DIRS.values():
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass  # F 盘（CloudDrive2）可能未挂载，忽略
+
+
+def list_books(category_dir):
+    """返回某分类目录下的一级条目（书名）列表，按名称排序。"""
+    if not os.path.isdir(category_dir):
+        return []
+    items = []
+    for name in os.listdir(category_dir):
+        if name.lower() in IGNORE_NAMES:
+            continue
+        items.append(name)
+    return sorted(items, key=lambda s: s.lower())
+
+
+def _replace_readme_section(text, title, bullets):
+    """把 README 中 <details> 区块（summary 含 title）里的书单替换为 bullets。
+    保留区块外的所有内容（标题、功能说明等）。"""
+    pattern = re.compile(
+        r'(<details>\s*<summary>[^<]*' + re.escape(title) + r'[^<]*</summary>)\s*\n.*?(\n\s*</details>)',
+        re.DOTALL,
+    )
+
+    def repl(m):
+        return m.group(1) + "\n\n" + bullets + "\n" + m.group(2)
+
+    return pattern.subn(repl, text, count=1)
+
+
+def regenerate_readme():
+    """根据 轻小说/已完结 与 轻小说/未完结 的实际内容，刷新 README 的两个书单区块。"""
+    done = list_books(CATEGORY_DIRS[CATEGORY_DONE])
+    ongoing = list_books(CATEGORY_DIRS[CATEGORY_ONGOING])
+    bullets_done = "\n".join(f"- {b}" for b in done) or "（暂无）"
+    bullets_ongoing = "\n".join(f"- {b}" for b in ongoing) or "（暂无）"
+
+    if os.path.exists(README_PATH):
+        with open(README_PATH, "r", encoding="utf-8") as f:
+            text = f.read()
+        # 若区块标题缺失则补建默认模板，否则仅替换内容
+        if "未完结作品" not in text or "已完结作品" not in text:
+            text = _default_readme(done, ongoing)
+    else:
+        text = _default_readme(done, ongoing)
+
+    text, n1 = _replace_readme_section(text, "未完结作品", bullets_ongoing)
+    text, n2 = _replace_readme_section(text, "已完结作品", bullets_done)
+
+    with open(README_PATH, "w", encoding="utf-8") as f:
+        f.write(text)
+    log.info("已更新 README.md（已完结 %d 本 / 未完结 %d 本）", len(done), len(ongoing))
+    return n1 > 0 and n2 > 0
+
+
+def _default_readme(done, ongoing):
+    bullets_done = "\n".join(f"- {b}" for b in done) or "（暂无）"
+    bullets_ongoing = "\n".join(f"- {b}" for b in ongoing) or "（暂无）"
+    return (
+        "# 📚 个人轻小说收集\n\n"
+        "---\n\n"
+        "<details>\n"
+        "<summary>📚 未完结作品</summary>\n\n"
+        f"{bullets_ongoing}\n"
+        "</details>\n\n"
+        "---\n\n"
+        "<details>\n"
+        "<summary>✅ 已完结作品</summary>\n\n"
+        f"{bullets_done}\n"
+        "</details>\n\n"
+        "---\n\n"
+        "## 功能\n"
+        "通过 Git 自动同步至 GitHub 仓库；本文件由 sync_lightnovel.py 自动维护。\n"
+    )
+
+
+def mirror_dir(src, dst):
+    """将 src 目录树增量镜像到 dst（仅复制缺失 / 变化的文件），返回复制文件数。"""
+    if not os.path.isdir(src):
+        return 0
+    copied = 0
+    for root, _dirs, files in os.walk(src):
+        for f in files:
+            sf = os.path.join(root, f)
+            rel = os.path.relpath(sf, src)
+            tf = os.path.join(dst, rel)
+            need = True
+            if os.path.exists(tf):
+                ss = os.stat(sf)
+                ts = os.stat(tf)
+                if ss.st_size == ts.st_size and abs(ss.st_mtime - ts.st_mtime) < 2:
+                    need = False
+            if need:
+                os.makedirs(os.path.dirname(tf), exist_ok=True)
+                shutil.copy2(sf, tf)
+                copied += 1
+    return copied
+
+
+def sync_to_f():
+    """把 轻小说 下的两个分类镜像到 F 盘网络云盘（CloudDrive2）。
+    返回 True/False（F 盘不可用时返回 False，但不影响 GitHub 推送）。"""
+    if not os.path.isdir(F_TARGET_ROOT):
+        log.warning("未找到网络云盘 %s（CD2 未挂载？），跳过 F 盘镜像。", F_TARGET_ROOT)
+        return False
+    ok = True
+    for cat, src in CATEGORY_DIRS.items():
+        dst = F_CATEGORY_DIRS[cat]
+        try:
+            copied = mirror_dir(src, dst)
+            log.info("已镜像到 F 盘 %s（新增/更新 %d 个文件）", dst, copied)
+        except Exception as exc:  # F 盘网络异常不应阻断主流程
+            log.warning("镜像到 F 盘 %s 失败：%s", dst, exc)
+            ok = False
+    return ok
+
+
+def _warn_stray_items():
+    """提醒：轻小说 根目录下不应直接放书，应归入 已完结/未完结。"""
+    try:
+        entries = [e for e in os.listdir(LIGHT_NOVEL_DIR)
+                   if e not in IGNORE_NAMES and e not in CATEGORY_DIRS]
+        if entries:
+            log.warning("注意：轻小说 根目录下存在非分类条目 %s，请将其移入「%s」或「%s」子目录。",
+                        entries, CATEGORY_DONE, CATEGORY_ONGOING)
+    except OSError:
+        pass
+
+
+def perform_sync(message):
+    """一次完整的同步：确保目录 -> 刷新 README -> 镜像 F 盘 -> 提交并推送。"""
+    ensure_category_dirs()
+    regenerate_readme()
+    try:
+        sync_to_f()
+    except Exception as exc:
+        log.warning("F 盘镜像异常：%s", exc)
+    _warn_stray_items()
+    return git_commit_push(message)
+
+
+# ---------------------------- 文件复制（种子） ----------------------------
 def smart_copy():
-    """将源书籍文件夹增量复制到目标目录（仅复制缺失或变化的文件）。返回复制文件数。"""
+    """将源书籍文件夹增量复制到目标分类目录（仅复制缺失或变化的文件）。返回复制文件数。"""
     src = os.path.join(SOURCE_DIR, BOOK_NAME)
     dst = os.path.join(TARGET_DIR, TARGET_SUBDIR)
     if not os.path.isdir(src):
@@ -332,17 +511,17 @@ def smart_copy():
 
 
 # ---------------------------- 目录快照 / 变更检测 ----------------------------
-def snapshot_dir():
-    """扫描 TARGET_DIR（排除 .git 与日志目录），返回 {相对路径: (size, mtime)}。"""
+def snapshot_dir(root=LIGHT_NOVEL_DIR):
+    """扫描 root（排除 .git 与日志目录），返回 {相对路径: (size, mtime)}。"""
     snap = {}
     skip = {".git", os.path.basename(LOG_DIR)}
-    for root, dirs, files in os.walk(TARGET_DIR):
+    for r, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in skip]
         for f in files:
-            fp = os.path.join(root, f)
+            fp = os.path.join(r, f)
             try:
                 st = os.stat(fp)
-                rel = os.path.relpath(fp, TARGET_DIR).replace(os.sep, "/")
+                rel = os.path.relpath(fp, root).replace(os.sep, "/")
                 snap[rel] = (st.st_size, int(st.st_mtime))
             except OSError:
                 pass
@@ -385,7 +564,7 @@ def release_lock():
 def monitor_loop():
     if not acquire_lock():
         return
-    log.info("开始后台实时监控 %s（每 %d 秒轮询一次，Ctrl+C 退出）", TARGET_DIR, MONITOR_INTERVAL)
+    log.info("开始后台实时监控 %s（每 %d 秒轮询一次，Ctrl+C 退出）", LIGHT_NOVEL_DIR, MONITOR_INTERVAL)
     prev = snapshot_dir()
     try:
         while True:
@@ -410,7 +589,7 @@ def monitor_loop():
                 cur = last
                 added, modified, removed = detect_changes(prev, cur)
                 log.info("检测到变更：新增 %d，修改 %d，删除 %d", len(added), len(modified), len(removed))
-                git_commit_push(
+                perform_sync(
                     f"auto-sync: +{len(added)} ~{len(modified)} -{len(removed)}"
                 )
                 prev = cur
@@ -427,15 +606,17 @@ def show_status():
     rc, out, _ = run_git(["status", "-s"], check=False)
     log.info("===== git status =====\n%s", out.strip() or "(干净)")
     snap = snapshot_dir()
-    log.info("当前监控快照文件数：%d", len(snap))
+    log.info("轻小说 当前监控快照文件数：%d", len(snap))
+    log.info("已完结 %d 本 / 未完结 %d 本", len(list_books(CATEGORY_DIRS[CATEGORY_DONE])),
+             len(list_books(CATEGORY_DIRS[CATEGORY_ONGOING])))
     log.info("日志文件：%s", LOG_FILE)
 
 
 # ---------------------------- 主流程 ----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Light-Novel GitHub 自动同步与监控工具")
-    parser.add_argument("--once", action="store_true", help="复制书籍 + 提交推送一次后退出")
-    parser.add_argument("--monitor-only", action="store_true", help="不复制书籍，仅提交当前状态并持续监控")
+    parser = argparse.ArgumentParser(description="Light-Novel GitHub 自动同步与监控工具（增强版）")
+    parser.add_argument("--once", action="store_true", help="种子复制 + 提交推送一次后退出")
+    parser.add_argument("--monitor-only", action="store_true", help="不复制种子，仅同步当前状态并持续监控")
     parser.add_argument("--init", action="store_true", help="仅初始化 / 校验仓库与远程配置")
     parser.add_argument("--status", action="store_true", help="查看仓库状态与监控快照")
     args = parser.parse_args()
@@ -463,14 +644,14 @@ def main():
     if args.once:
         if not args.monitor_only:
             smart_copy()
-        git_commit_push("sync: 初始/手动同步")
+        perform_sync("sync: 手动/初始同步")
         log.info("--once 完成。")
         return
 
-    # 默认模式：复制 + 提交推送 + 持续监控
+    # 默认模式：种子复制 + 提交推送 + 持续监控
     if not args.monitor_only:
         smart_copy()
-    git_commit_push("sync: 初始同步")
+    perform_sync("sync: 初始同步")
     monitor_loop()
 
 
