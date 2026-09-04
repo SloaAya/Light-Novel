@@ -18,6 +18,7 @@
 <summary>📚 未完结作品</summary>
 
 - NO GAME NO LIFE
+- README.md
 - 三坪房间的侵略者！？
 - 和非常可爱的我交往吧！
 - 在地下城寻求邂逅是否搞错了什么
@@ -53,6 +54,7 @@
 - GAMERS电玩咖
 - GJ部
 - High School D×D
+- README.md
 - 【好消息】我的不起眼未婚妻在家有够可爱
 - 不正经的魔术讲师与禁忌教典
 - 不起眼女主角培育法
