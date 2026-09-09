@@ -50,7 +50,6 @@
 <details>
 <summary>✅ 已完结作品</summary>
 
-- .verysync
 - GAMERS电玩咖
 - GJ部
 - High School D×D
