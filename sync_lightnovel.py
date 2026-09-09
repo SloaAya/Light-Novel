@@ -28,6 +28,16 @@ Light-Novel GitHub 自动同步与监控工具（增强版）
   python sync_lightnovel.py --monitor-only   # 不复制种子，仅同步当前状态并持续监控
   python sync_lightnovel.py --init           # 仅初始化 / 校验仓库与远程配置
   python sync_lightnovel.py --status         # 查看仓库状态与监控快照
+  python sync_lightnovel.py --opds           # 同步 + 监控 + 顺带开启 OPDS 书源（手机端）
+  python sync_lightnovel.py --opds-only      # 只开 OPDS 书源，不做同步
+
+OPDS 书源（详见 opds_server.py）：
+  把书库发布为标准 OPDS 目录，手机阅读器（静读天下 / Lithium / KyBook 等）
+  订阅后可直接浏览并下载 epub。默认 http://<本机IP>:8080/
+  口令通过环境变量设置（本文件会同步进 GitHub，切勿写明文口令）：
+      set LN_OPDS_USER=用户名
+      set LN_OPDS_PASS=口令
+  外网访问方案见：python opds_server.py --help-internet
 """
 
 import os
@@ -70,6 +80,13 @@ F_CATEGORY_DIRS = {
 }
 
 README_PATH = os.path.join(TARGET_DIR, "README.md")
+
+# ---- OPDS 书源服务（手机端远程同步，实现见 opds_server.py）----
+# 端口与监听地址可用环境变量覆盖：LN_OPDS_PORT / LN_OPDS_BIND
+# ⚠ 口令只从环境变量读取（LN_OPDS_USER / LN_OPDS_PASS）——本文件会同步进 GitHub，
+#    切勿在此写入明文口令。外网开放时必须设置。
+OPDS_PORT = int(os.environ.get("LN_OPDS_PORT", "8080"))
+OPDS_BIND = os.environ.get("LN_OPDS_BIND", "0.0.0.0")   # 0.0.0.0=局域网可访问
 
 # 推荐用 SSH：大体积推送在部分代理 / 网络下，HTTPS 上传会被重置（Connection was reset /
 # remote end hung up），而 SSH 通常能稳定通过。请先把本机公钥加到 GitHub（见脚本顶部说明）。
@@ -765,6 +782,30 @@ def monitor_loop():
         release_lock()
 
 
+# ---------------------------- OPDS 书源（手机端） ----------------------------
+def start_opds_background(port=OPDS_PORT, bind=OPDS_BIND):
+    """在后台线程启动 OPDS 书源服务，返回 (httpd, thread)；失败返回 (None, None)。
+    服务失败只告警，绝不影响同步 / 监控主流程。"""
+    try:
+        import opds_server
+    except Exception as exc:
+        log.error("无法加载 opds_server.py（OPDS 书源未启动）：%s", exc)
+        return None, None
+    try:
+        httpd, t = opds_server.start_background(port=port, bind=bind)
+        ip = opds_server.local_ip()
+        lib = opds_server.get_library(force=True)
+        n_books = sum(len(b) for b in lib.values())
+        n_vols = sum(1 for _ in opds_server.all_vols(lib))
+        log.info("OPDS 书源已随监控启动：http://%s:%d/ （%d 部 / %d 卷）", ip, port, n_books, n_vols)
+        if not (opds_server.AUTH_USER or opds_server.AUTH_PASS):
+            log.warning("OPDS 当前免密访问；如需外网访问请先设置 LN_OPDS_USER / LN_OPDS_PASS 环境变量。")
+        return httpd, t
+    except Exception as exc:
+        log.warning("OPDS 书源启动失败（不影响同步）：%s", exc)
+        return None, None
+
+
 # ---------------------------- 状态查看 ----------------------------
 def show_status():
     rc, out, _ = run_git(["status", "-s"], check=False)
@@ -783,6 +824,12 @@ def main():
     parser.add_argument("--monitor-only", action="store_true", help="不复制种子，仅同步当前状态并持续监控")
     parser.add_argument("--init", action="store_true", help="仅初始化 / 校验仓库与远程配置")
     parser.add_argument("--status", action="store_true", help="查看仓库状态与监控快照")
+    parser.add_argument("--opds", action="store_true",
+                        help="同步的同时启动 OPDS 书源服务（手机阅读器可订阅）")
+    parser.add_argument("--opds-only", action="store_true",
+                        help="仅启动 OPDS 书源服务，不做同步与监控")
+    parser.add_argument("--opds-port", type=int, default=OPDS_PORT,
+                        help=f"OPDS 服务端口（默认 {OPDS_PORT}）")
     args = parser.parse_args()
 
     setup_logging()
@@ -790,6 +837,15 @@ def main():
     if not git_available():
         log.error("Git 不可用，程序无法运行。")
         sys.exit(1)
+
+    if args.opds_only:
+        try:
+            import opds_server
+            opds_server._ensure_logging()
+            opds_server.run_service(port=args.opds_port, bind=OPDS_BIND)
+        except Exception as exc:
+            log.error("OPDS 服务退出：%s", exc)
+        return
 
     if args.status:
         ensure_repo()
@@ -816,6 +872,8 @@ def main():
     if ENABLE_SEED_COPY and not args.monitor_only:
         smart_copy()
     perform_sync("sync: 初始同步")
+    if args.opds:
+        start_opds_background(args.opds_port)
     monitor_loop()
 
 
