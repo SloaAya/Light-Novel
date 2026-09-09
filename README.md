@@ -4,7 +4,9 @@
 
 ### 个人轻小说收藏库
 
-📦 EPUB · 🤖 自动整理 · ☁️ 云端双备份
+📦 EPUB · 🤖 自动整理 · ☁️ 云端双备份 · 🌐 在线书源
+
+**🌐 在线访问：[https://ranqing.ccwu.cc/](https://ranqing.ccwu.cc/)**
 
 </div>
 
@@ -100,6 +102,47 @@
 
 ---
 
+## 🌐 在线书源（OPDS）
+
+固定公网地址：**https://ranqing.ccwu.cc/**（Cloudflare Named Tunnel，重启不变）
+
+| 访问方式 | 地址 | 说明 |
+| --- | --- | --- |
+| 🌍 公网 | <https://ranqing.ccwu.cc/> | 手机流量/WiFi 均可，自动 HTTPS |
+
+**启动服务**：
+
+```bash
+python opds_server.py --port 8080 --tunnel named   # 固定域名（推荐）
+# 或双击 run_named_tunnel.bat
+python opds_server.py --port 8080 --tunnel cloudflared  # 临时随机域名
+```
+
+**功能特性**：
+
+- 📱 手机/电脑自适应布局（窄屏顶栏两行、tab 可横滑）
+- 📁 书内按子目录（正篇 / 番外）**分组折叠**，支持「全部展开/折叠」
+- 🗜️ 单卷下载 / 整组打包 / 整本打包 / 整类打包（流式 ZIP，不占内存）
+- 🖼️ 自动从 epub 提取封面（支持 jpg / png / webp / gif，优先 OPF 声明的封面）
+- 📖 OPDS 阅读器（静读天下、Neat Reader 等）可直接订阅同一地址
+
+<details>
+<summary>🔧 隧道配置（域名到期/换域名时看这里）</summary>
+
+域名 `ranqing.ccwu.cc` 来自 [DNSHE](https://www.dnshe.com/) 免费域名（初始 10 年，到期前 180 天需手动续期），DNS 托管在 Cloudflare。
+
+重新绑定域名的步骤：
+
+1. Cloudflare 后台 **Add a Site** → 填**完整域名** `ranqing.ccwu.cc`（不是 `ccwu.cc`）→ 选 Free
+2. 复制 Cloudflare 分配的两条 NS
+3. 到 **DNSHE 后台** → 我的域名 → DNS 服务器 → 替换为 Cloudflare 的 NS
+4. `nslookup -type=NS ranqing.ccwu.cc` 确认已指向 Cloudflare
+5. 跑配置向导：`python setup_named_tunnel.py --hostname ranqing.ccwu.cc`
+
+</details>
+
+---
+
 ## ⚙️ 自动化
 
 | 功能 | 说明 |
@@ -109,6 +152,7 @@
 | ☁️ 网盘备份 | 自动镜像到网盘 `F:\LightNovel`（CloudDrive2） |
 | 📝 书单维护 | 本 README 的两个书单区块自动刷新，其余内容保持不变 |
 | 🛡️ 安全护栏 | 大规模删除保护 + 系统垃圾文件（desktop.ini 等）自动排除 |
+| 📱 手机书源 | 内置 OPDS 书源服务（`opds_server.py`），公网地址 <https://ranqing.ccwu.cc/> |
 
 ---
 
