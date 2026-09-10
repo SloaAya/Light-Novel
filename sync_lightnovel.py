@@ -36,7 +36,8 @@ D 盘 → F 盘网盘镜像（增删改查 + 冲突检测，D 盘为唯一数据
   python sync_lightnovel.py --mirror-f            # 执行一次完整镜像（增 / 改 / 删）
   python sync_lightnovel.py --mirror-f --mirror-dry-run    # 只预演，不落盘
   python sync_lightnovel.py --mirror-f --mirror-no-delete  # 只增改，跳过删除
-删除为「软删除」：文件移入 F:\\LightNovel\\.trash\\<时间戳>\\ 保留 30 天，可随时恢复。
+删除为「直接删除」（不可逆），但有多重安全护栏：镜像清单判归属、单次删除上限、
+F 侧 24h 内新增/修改自动保护、路径逃逸校验，确保只删 F 盘镜像目标里 D 盘不存在的多余内容。
 审计日志：.autosync/mirror.log（JSON Lines，逐条记录增/改/删/跳过/失败）。
 
 OPDS 书源（详见 opds_server.py）：
@@ -121,9 +122,7 @@ MIRROR_STATE_FILE  = os.path.join(LOG_DIR, "mirror_state.json")   # 上次镜像
 MIRROR_MANIFEST    = os.path.join(LOG_DIR, "mirror_manifest.json")  # 镜像清单：本工具曾写入 F 盘的文件
 MIRROR_REPORT_FILE = os.path.join(LOG_DIR, "mirror_report.json")  # 最近一次 查 / 同步 完整报告
 MIRROR_HTML_FILE   = os.path.join(LOG_DIR, "mirror_status.html")  # 可读的镜像状态看板（自动刷新）
-F_TRASH_ROOT       = os.path.join(F_TARGET_ROOT, ".trash")        # F 盘回收站：删除先移入，可恢复
 MAX_MIRROR_DELETIONS  = 200     # 单次镜像删除上限；超过判定为异常，拒绝执行并告警
-TRASH_KEEP_DAYS       = 30      # 回收站保留天数，超时自动清理
 MTIME_TOLERANCE       = 2       # mtime 容差（秒）：网络盘/挂载盘常有精度损失
 F_RECENT_PROTECT_SEC  = 86400   # F 侧 24h 内新建/修改的文件不自动删除（防误删）
 CONFLICT_MTIME_SLACK  = 5       # F 侧 mtime 比 D 侧新超过此值且大小不同 → 判定为冲突
@@ -563,7 +562,7 @@ def _default_readme(done, ongoing):
         "| 📥 实时监控 | `轻小说/已完结` 与 `轻小说/未完结` 目录有变动即自动触发同步 |\n"
         "| 🔄 GitHub 同步 | 自动提交并推送；以本地为准，远程多余文件自动清理 |\n"
         "| ☁️ 网盘备份 | 自动镜像到网盘 `F:\\LightNovel`（CloudDrive2），支持增 / 改 / 删 全量同步 |\n"
-        "| 🗑️ 软删除 | F 盘多余文件移入 `.trash`（保留 30 天可恢复），不做不可逆删除 |\n"
+        "| 🗑️ 删除传播 | F 盘多余文件/目录直接删除（多安全护栏，只删镜像目标里 D 盘没有的内容） |\n"
         "| ⚠️ 冲突检测 | F 侧被独立修改、清单外孤儿文件均会告警；近期外来文件自动保护 |\n"
         "| 📝 书单维护 | 本 README 的两个书单区块自动刷新，其余内容保持不变 |\n"
         "| 🛡️ 安全护栏 | 大规模删除保护 + 系统垃圾文件（desktop.ini 等）自动排除 |\n\n"
@@ -800,46 +799,19 @@ def mirror_query():
     return report
 
 
-# ---------------------------- 删除：软删除到回收站 ----------------------------
-def _move_to_trash(abs_path, rel, trash_batch):
-    """把 F 侧待删文件移入回收站目录（可恢复），而不是直接 os.remove。"""
-    target = os.path.join(trash_batch, rel.replace("/", os.sep))
+# ---------------------------- 删除：直接删除 ----------------------------
+def _delete_file(abs_path):
+    """直接删除 F 侧待删文件（不可逆）。返回 True/False。"""
     try:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-    except OSError as exc:
-        log.warning("创建回收站目录失败 %s：%s", os.path.dirname(target), exc)
-        return False
-    try:
-        os.chmod(abs_path, 0o666)    # 去掉只读属性（Windows 只读文件无法移动/删除）
+        os.chmod(abs_path, 0o666)    # 去掉只读属性（Windows 只读文件无法删除）
     except OSError:
         pass
     try:
-        shutil.move(abs_path, target)
+        os.remove(abs_path)
         return True
     except OSError as exc:
-        log.warning("移入回收站失败 %s：%s", abs_path, exc)
+        log.warning("删除失败 %s：%s", abs_path, exc)
         return False
-
-
-def _purge_old_trash():
-    """清理超过 TRASH_KEEP_DAYS 天的回收站批次目录。"""
-    if not os.path.isdir(F_TRASH_ROOT):
-        return 0
-    cutoff = time.time() - TRASH_KEEP_DAYS * 86400
-    purged = 0
-    for name in os.listdir(F_TRASH_ROOT):
-        batch = os.path.join(F_TRASH_ROOT, name)
-        if not os.path.isdir(batch):
-            continue
-        try:
-            if os.stat(batch).st_mtime < cutoff:
-                shutil.rmtree(batch, ignore_errors=True)
-                purged += 1
-        except OSError:
-            pass
-    if purged:
-        log.info("已清理 %d 个过期回收站批次（保留期 %d 天）", purged, TRASH_KEEP_DAYS)
-    return purged
 
 
 def _prune_empty_dirs(dst):
@@ -861,8 +833,8 @@ def _prune_empty_dirs(dst):
     return removed
 
 
-def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=True):
-    """递归处理 F 侧「整棵孤儿子树」——源目录里没有的整个目录树（含子目录/文件）整体移入回收站。
+def _prune_foreign_subtrees(src, dst, manifest_set, allow_delete=True):
+    """递归处理 F 侧「整棵孤儿子树」——源目录里没有的整个目录树（含子目录/文件）整体直接删除。
     与 _prune_empty_dirs 互补：后者只清"删完文件自然变空"的目录；本函数负责
     清理"我们压根没源对应"或"还有遗留文件没被识别为 delete"的整棵子树。
     安全网：
@@ -883,7 +855,7 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
     #    上 os.walk 不 yield 空目录，会漏掉"整本书已删"的空目录残留）
     src_dirs = {d for d in scan_dirs(src) if d}
     dst_dirs = {d for d in scan_dirs(dst) if d}
-    # 2) F 侧存在但 D 侧没有 → 整棵孤儿子树
+    # 2) F 侧存在但 D 侧没有 → 整棵孤儿子树（`.trash` 历史残留不在镜像范围内，不清理）
     foreign = dst_dirs - src_dirs
     foreign = {d for d in foreign if not d.split("/", 1)[0].startswith(".trash")}
     if not foreign:
@@ -908,7 +880,7 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
         if not os.path.isdir(abs_real):
             continue
         # 4) 24h 保护：子树内任一文件**或目录本身**的 mtime 在保护窗口内 → 跳过
-        # 注意：apply_mirror 先把孤儿文件移入回收站，子树会变空；
+        # 注意：apply_mirror 先把孤儿文件删除，子树会变空；
         # 只看子文件 mtime 会让 24h 保护失效。必须同时检查目录自身的 mtime。
         recent = False
         try:
@@ -935,18 +907,16 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
         if not allow_delete:
             skipped.append(rel)
             continue
-        # 5) 整棵移到回收站（shutil.move 跨盘时是 copy+delete；同盘是 rename）
-        trash_target = os.path.join(trash_batch, rel.replace("/", os.sep))
+        # 5) 整棵直接删除（不可逆；上面已通过归属/路径/24h 多重校验）
         try:
-            os.makedirs(os.path.dirname(trash_target), exist_ok=True)
-            # 去掉只读属性（CD2 上整棵移动有时因只读失败）
+            # 去掉只读属性（CD2 上整棵删除有时因只读失败）
             for r, _, fs in os.walk(abs_real):
                 for f in fs:
                     try:
                         os.chmod(os.path.join(r, f), 0o666)
                     except OSError:
                         pass
-            shutil.move(abs_real, trash_target)
+            shutil.rmtree(abs_real)
             moved.append(rel)
             # 6) 从镜像清单移除该子树下的所有 rel
             if manifest_set is not None:
@@ -954,7 +924,7 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
                 for mrel in [m for m in manifest_set if m == rel or m.startswith(prefix)]:
                     manifest_set.discard(mrel)
         except OSError as exc:
-            log.warning("无法将 F 孤儿子树 %s 移入回收站：%s", abs_real, exc)
+            log.warning("无法删除 F 孤儿子树 %s：%s", abs_real, exc)
             skipped.append(rel)
     return moved, skipped
 
@@ -965,9 +935,8 @@ def apply_mirror(plan, dry_run=False, allow_delete=True, manifest_set=None):
     manifest_set: 镜像清单中"本分类"的文件 rel 集合；孤儿子树被整棵移除时同步清理。"""
     src, dst = plan["src"], plan["dst"]
     cat = os.path.basename(dst)
-    batch = os.path.join(F_TRASH_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S"), cat)
     result = {"added": [], "updated": [], "deleted": [], "skipped": [],
-              "failed": [], "dirs_removed": 0, "dirs_trashed": [],
+              "failed": [], "dirs_removed": 0, "dirs_deleted": [],
               "dirs_skipped": [], "dry_run": dry_run}
     records = []
 
@@ -1006,7 +975,7 @@ def apply_mirror(plan, dry_run=False, allow_delete=True, manifest_set=None):
             _rec(op, rel, "failed", {"error": str(exc)})
             log.warning("镜像 %s 失败（%s）：%s", rel, op, exc)
 
-    # ---- 删（软删除到回收站）----
+    # ---- 删（直接删除）----
     if not allow_delete:
         for d in plan["delete"]:
             if not d["protected"]:
@@ -1022,24 +991,24 @@ def apply_mirror(plan, dry_run=False, allow_delete=True, manifest_set=None):
             fp = os.path.join(dst, rel.replace("/", os.sep))
             if dry_run:
                 result["skipped"].append(rel); _rec("delete", rel, "dry-run"); continue
-            if _move_to_trash(fp, rel, batch):
+            if _delete_file(fp):
                 result["deleted"].append(rel)
-                _rec("delete", rel, "ok", {"trash": os.path.join(batch, rel.replace("/", os.sep))})
+                _rec("delete", rel, "ok")
             else:
-                result["failed"].append({"rel": rel, "op": "delete", "error": "移入回收站失败"})
+                result["failed"].append({"rel": rel, "op": "delete", "error": "删除失败"})
                 _rec("delete", rel, "failed")
 
     # ---- 清理孤儿子树（递归删除源中不存在的整棵子树，含子目录/文件/残留空目录）----
-    # 关键：D 盘是唯一数据源，F 侧任何不存在的整棵子树都该被移入回收站。
+    # 关键：D 盘是唯一数据源，F 侧任何不存在的整棵子树都该被直接删除。
     # 失败兜底：删完文件后还要清空目录（_prune_empty_dirs 处理被并发残留的空目录）。
     if not dry_run:
         try:
             moved_dirs, skipped_dirs = _prune_foreign_subtrees(
-                src, dst, manifest_set, batch, allow_delete=allow_delete)
-            result["dirs_trashed"] = moved_dirs
+                src, dst, manifest_set, allow_delete=allow_delete)
+            result["dirs_deleted"] = moved_dirs
             result["dirs_skipped"] = skipped_dirs
             for d in moved_dirs:
-                _rec("rmdir", d, "ok", {"trash": os.path.join(batch, d.replace("/", os.sep))})
+                _rec("rmdir", d, "ok")
             for d in skipped_dirs:
                 _rec("rmdir", d, "skipped", {"reason": "24h 保护 / allow_delete=False"})
         except Exception as exc:
@@ -1148,7 +1117,7 @@ li.cf code{{background:#fff7ed}}
 <h2>冲突与待处理项</h2>
 <ul>{''.join(items)}</ul>
 <div class="foot">生成时间 {report['generated_at']} · 完整报告 <code>mirror_report.json</code> ·
-审计日志 <code>mirror.log</code>（删除为软删除，可在 <code>F:\\LightNovel\\.trash</code> 恢复，保留 {TRASH_KEEP_DAYS} 天）</div>
+审计日志 <code>mirror.log</code>（删除为直接删除，仅作用于镜像目标中 D 盘不存在的多余内容）</div>
 </div></body></html>"""
         os.makedirs(LOG_DIR, exist_ok=True)
         tmp = MIRROR_HTML_FILE + ".tmp"
@@ -1195,7 +1164,7 @@ def sync_to_f(dry_run=False, allow_delete=True):
     覆盖「增删改查」四类操作：
       增 = D 有 F 无 → 复制
       改 = 大小或 mtime 不同 → 覆盖（同时检测 F 侧更新的冲突）
-      删 = F 有 D 无 → 移入 F:\\LightNovel\\.trash（可恢复），并清理空目录
+      删 = F 有 D 无 → 直接删除，并清理空目录
       查 = 每轮都生成差异报告并写入审计日志
     返回 True/False（F 盘不可用时返回 False，但不影响 GitHub 推送）。"""
     if not os.path.isdir(F_TARGET_ROOT):
@@ -1240,7 +1209,7 @@ def sync_to_f(dry_run=False, allow_delete=True):
                          "一致 %d，冲突 %d，整棵孤儿子树 %d（跳过 %d），空目录清理 %d，垃圾文件清理 %d）",
                          tag, dst, len(res["added"]), len(res["updated"]), len(res["deleted"]),
                          len(res["failed"]), c["unchanged"], c["conflict"],
-                         len(res.get("dirs_trashed", [])),
+                         len(res.get("dirs_deleted", [])),
                          len(res.get("dirs_skipped", [])),
                          res["dirs_removed"], purged)
             if res["failed"]:
@@ -1257,7 +1226,6 @@ def sync_to_f(dry_run=False, allow_delete=True):
             log.warning("镜像到 F 盘 %s 失败：%s", dst, exc)
             ok = False
     if not dry_run:
-        _purge_old_trash()
         _save_manifest(manifest)
         _save_json(MIRROR_STATE_FILE, {"last_sync": _now_iso(), "categories": summary})
         # 同步后再扫一遍生成看板（此时两端应已一致）
