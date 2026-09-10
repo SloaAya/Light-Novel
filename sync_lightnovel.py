@@ -824,6 +824,86 @@ def _prune_empty_dirs(dst):
     return removed
 
 
+def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=True):
+    """递归处理 F 侧「整棵孤儿子树」——源目录里没有的整个目录树（含子目录/文件）整体移入回收站。
+    与 _prune_empty_dirs 互补：后者只清"删完文件自然变空"的目录；本函数负责
+    清理"我们压根没源对应"或"还有遗留文件没被识别为 delete"的整棵子树。
+    安全网：
+      1) 仅在 dst 范围内操作（caller 保证 dst 是 F:\\LightNovel\\{分类}）
+      2) 24h 内修改过的 F-only 子树 → 跳过并告警（防误删刚被外部工具新建的内容）
+      3) src 不存在 → 不执行任何删除（防 D 盘挂载失败引发误删）
+      4) 操作失败逐项 log，绝不阻断主流程
+    返回 (moved_dirs, skipped_dirs)，都是相对于 dst 的 rel 路径列表。"""
+    moved, skipped = [], []
+    if not os.path.isdir(src):
+        return moved, skipped                                  # D 盘不可用 → 直接返回，绝不删 F
+    # 1) 收集 D / F 各自的「中间目录」rel
+    src_dirs = set()
+    for r, dirs, _ in os.walk(src):
+        rel = os.path.relpath(r, src).replace("\\", "/")
+        if rel and rel != ".":
+            src_dirs.add(rel)
+    dst_dirs = set()
+    for r, dirs, _ in os.walk(dst):
+        rel = os.path.relpath(r, dst).replace("\\", "/")
+        if rel and rel != ".":
+            dst_dirs.add(rel)
+    # 2) F 侧存在但 D 侧没有 → 整棵孤儿子树
+    foreign = dst_dirs - src_dirs
+    foreign = {d for d in foreign if not d.split("/", 1)[0].startswith(".trash")}
+    if not foreign:
+        return moved, skipped
+    # 3) 自底向上：先删最深层的子树（避免父目录被先移走后子目录路径失效）
+    foreign_sorted = sorted(foreign, key=lambda d: d.count("/"), reverse=True)
+    cutoff = time.time() - F_RECENT_PROTECT_SEC
+    for rel in foreign_sorted:
+        abs_dir = os.path.join(dst, rel.replace("/", os.sep))
+        if not os.path.isdir(abs_dir):
+            continue
+        # 4) 24h 保护：子树内任一文件 mtime 在保护窗口内 → 跳过
+        recent = False
+        for r, _, fs in os.walk(abs_dir):
+            for f in fs:
+                try:
+                    if os.path.getmtime(os.path.join(r, f)) > cutoff:
+                        recent = True
+                        break
+                except OSError:
+                    pass
+            if recent:
+                break
+        if recent:
+            skipped.append(rel)
+            log.warning("【安全网】F 侧孤儿子树 %s 含有 24h 内新增/修改的文件，跳过整棵删除，"
+                        "请确认内容后再手动清理", rel)
+            continue
+        if not allow_delete:
+            skipped.append(rel)
+            continue
+        # 5) 整棵移到回收站（shutil.move 跨盘时是 copy+delete；同盘是 rename）
+        trash_target = os.path.join(trash_batch, rel.replace("/", os.sep))
+        try:
+            os.makedirs(os.path.dirname(trash_target), exist_ok=True)
+            # 去掉只读属性（CD2 上整棵移动有时因只读失败）
+            for r, _, fs in os.walk(abs_dir):
+                for f in fs:
+                    try:
+                        os.chmod(os.path.join(r, f), 0o666)
+                    except OSError:
+                        pass
+            shutil.move(abs_dir, trash_target)
+            moved.append(rel)
+            # 6) 从镜像清单移除该子树下的所有 rel
+            if manifest_set is not None:
+                for mrel in list(manifest_set):
+                    if mrel == rel or mrel.startswith(rel + "/"):
+                        manifest_set.discard(mrel)
+        except OSError as exc:
+            log.warning("无法将 F 孤儿子树 %s 移入回收站：%s", abs_dir, exc)
+            skipped.append(rel)
+    return moved, skipped
+
+
 # ---------------------------- 增 / 改 / 删：执行 ----------------------------
 def apply_mirror(plan, dry_run=False, allow_delete=True):
     """按计划执行镜像。dry_run=True 时只记录不落盘。返回执行结果 dict。"""
