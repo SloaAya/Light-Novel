@@ -38,6 +38,7 @@ import time
 import html
 import io
 import json
+import struct
 import errno
 import socket
 import shutil
@@ -244,22 +245,92 @@ def _opf_cover_href(zf, opf_path):
     except (KeyError, OSError):
         return None
     base = posixpath.dirname(opf_path)
-    m = (re.search(r'<meta[^>]+name=["\']cover["\'][^>]+content=["\']([^"\']+)["\']', opf, re.I)
-         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']cover["\']', opf, re.I))
-    if m:
-        cid = m.group(1)
-        im = re.search(r'<item[^>]+id=["\']' + re.escape(cid) + r'["\'][^>]*>', opf, re.I)
-        if im:
-            hm = re.search(r'href=["\']([^"\']+)["\']', im.group(0), re.I)
-            if hm:
-                return posixpath.normpath(posixpath.join(base, hm.group(1))) if base else hm.group(1)
+    # 先建一张 item-id → (href, media-type) 索引，避免把 xhtml 包装页当封面
+    item_map = {}
     for im in re.finditer(r"<item\b[^>]*>", opf, re.I):
         tag = im.group(0)
-        if re.search(r'(id=["\'][^"\']*cover|properties=["\'][^"\']*cover-image)', tag, re.I):
-            hm = re.search(r'href=["\']([^"\']+)["\']', tag, re.I)
-            if hm:
-                return posixpath.normpath(posixpath.join(base, hm.group(1))) if base else hm.group(1)
+        idm = re.search(r'id=["\']([^"\']+)["\']', tag, re.I)
+        if not idm:
+            continue
+        hm = re.search(r'href=["\']([^"\']+)["\']', tag, re.I)
+        mm = re.search(r'media-type=["\']([^"\']+)["\']', tag, re.I)
+        item_map[idm.group(1)] = (hm.group(1) if hm else "", (mm.group(1) if mm else "").lower())
+
+    def _is_image(href, media):
+        if media.startswith("image/"):
+            return True
+        return bool(re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", href or "", re.I))
+
+    def _resolve(href):
+        return posixpath.normpath(posixpath.join(base, href)) if base else href
+
+    # 1) <meta name="cover" content="X"> 必须指向图片
+    m = (re.search(r'<meta[^>]+name=["\']cover["\'][^>]+content=["\']([^"\']+)["\']', opf, re.I)
+         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']cover["\']', opf, re.I))
+    if m and m.group(1) in item_map:
+        href, media = item_map[m.group(1)]
+        if _is_image(href, media):
+            return _resolve(href)
+
+    # 2) 按文档顺序找：id 含 "cover" 或 properties 含 "cover-image"，且**必须是图片**
+    for iid, (href, media) in item_map.items():
+        if not href or not _is_image(href, media):
+            continue
+        # 简单按 item 自身判断：id 里有 cover，或整条 <item> 标签里有 cover-image
+        if "cover" in iid.lower():
+            return _resolve(href)
+    for iid, (href, media) in item_map.items():
+        if not href or not _is_image(href, media):
+            continue
+        # 整段 item 标签里找 cover-image（properties 属性）
+        pat = r'<item\b[^>]*\bid=["\']' + re.escape(iid) + r'["\'][^>]*>'
+        for im in re.finditer(pat, opf, re.I):
+            if "cover-image" in im.group(0).lower():
+                return _resolve(href)
     return None
+
+
+def _jpeg_size(data):
+    """解析 JPEG SOF 标记，返回 (宽, 高)；非 JPEG 或失败返回 (None, None)。"""
+    if not data or data[:2] != b"\xff\xd8":
+        return None, None
+    i = 2
+    while i < len(data) - 9:
+        if data[i] != 0xff:
+            break
+        marker = data[i + 1]
+        if marker in (0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
+                       0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf):
+            h = struct.unpack(">H", data[i + 5:i + 7])[0]
+            w = struct.unpack(">H", data[i + 7:i + 9])[0]
+            return w, h
+        seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
+        i += 2 + seg_len
+    return None, None
+
+
+def _png_size(data):
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or len(data) < 24:
+        return None, None
+    w = struct.unpack(">I", data[16:20])[0]
+    h = struct.unpack(">I", data[20:24])[0]
+    return w, h
+
+
+def _img_size(data):
+    """根据文件头判断图片尺寸（仅支持 JPEG / PNG；其它返回 (None,None)）。"""
+    w, h = _jpeg_size(data)
+    if w:
+        return w, h
+    return _png_size(data)
+
+
+def _looks_like_spread(data):
+    """封面判定：横宽比例 > 1.3 视为跨页/双联图，跳过找下一张。"""
+    w, h = _img_size(data)
+    if not w or not h:
+        return False
+    return (w / h) > 1.3
 
 
 def _sniff_mime(blob):
@@ -319,15 +390,18 @@ def get_cover(rel):
             # 注意：epub 里的封面常用 .webp/.gif（不止 jpg/png），必须全部纳入
             all_imgs = [(n, zf.getinfo(n).file_size) for n in zf.namelist()
                         if n.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))]
+            img_names = {n for n, _ in all_imgs}
+            sizes = dict(all_imgs)
             cand = []
-            trusted = False   # 来自 OPF/cover.xhtml 的「权威封面」标记
+            trusted = False   # 来自 OPF 的「权威封面」标记
             if opf_path:
                 h = _opf_cover_href(zf, opf_path)
-                if h:
+                # OPF 返回的封面必须**真的是图片**（部分 EPUB 用 xhtml 包装页当 cover id）
+                if h and h in img_names:
                     cand.append(h)
                     trusted = True
-            cand += [n for n, _ in all_imgs
-                     if re.search(r"(cover|封面)", n, re.I)]
+            cand += [n for n in img_names
+                     if re.search(r"(cover|封面)", n, re.I) and n not in cand]
             # 兜底：取所有图中最大的那张（真封面通常远大于装饰图/注释图）
             if all_imgs:
                 biggest = max(all_imgs, key=lambda x: x[1])
@@ -335,7 +409,6 @@ def get_cover(rel):
                     cand.append(biggest[0])
                 # 「权威封面」若实在太小（< 5KB，基本是错文件）才让位；
                 # 名义候选（仅靠文件名匹配 cover）则用 30% 大小阈值过滤装饰图
-                sizes = dict(all_imgs)
                 first_size = sizes.get(cand[0], 0)
                 if trusted and first_size < 5 * 1024 and sizes.get(biggest[0], 0) > first_size * 10:
                     cand.insert(0, biggest[0])
@@ -357,6 +430,10 @@ def get_cover(rel):
                 elif len(data) >= 6 and data[:6] in (b"GIF87a", b"GIF89a"):
                     blob, mime = data, "image/gif"
                 else:
+                    continue
+                # 跨页/双联图过滤：宽高比 > 1.3 明显是横向 spread，跳过找下一张
+                if _looks_like_spread(data):
+                    blob = mime = None
                     continue
                 break
     except (zipfile.BadZipFile, OSError):
@@ -680,189 +757,222 @@ def _accept_wants_xml(accept):
 SITE_CSS = """
 *{box-sizing:border-box}
 :root{
-  --bg:#f2f4f7; --card:#fff; --text:#1f2328; --muted:#8b949e; --border:#e5e7eb;
+  --bg:#f2f4f7; --card:#fff; --text:#1f2328; --muted:#6b7785; --border:#e5e7eb;
   --accent:#0a66c2; --accent2:#004182; --accent-fg:#fff; --hover:#eef4fb;
   --shadow:0 1px 2px rgba(16,22,26,.06),0 2px 8px rgba(16,22,26,.05);
+  --shadow-sm:0 1px 2px rgba(16,22,26,.05);
   --radius:12px;
 }
 @media (prefers-color-scheme:dark){
   :root{
     --bg:#0e1116; --card:#171c23; --text:#e8edf3; --muted:#9aa4b0; --border:#2c333d;
-    --accent:#4c9df0; --accent2:#2f7fd0; --accent-fg:#0e1116; --hover:#1d2530; --shadow:none;
+    --accent:#4c9df0; --accent2:#2f7fd0; --accent-fg:#0e1116; --hover:#1d2530;
+    --shadow:none; --shadow-sm:none;
   }
 }
-html{-webkit-text-size-adjust:100%}
+html{-webkit-text-size-adjust:100%;scroll-padding-top:76px}
 body{margin:0;background:var(--bg);color:var(--text);
   font-family:system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;
   line-height:1.55;font-size:14px}
 a{color:inherit;text-decoration:none}
 img{display:block}
+.hero,.group,.sec-head{scroll-margin-top:76px}
 
 /* ---------- 顶栏 ---------- */
-header{position:sticky;top:0;z-index:30;background:var(--card);
-  border-bottom:1px solid var(--border)}
-.hbar{max-width:1180px;margin:0 auto;padding:0 16px;display:flex;align-items:center;gap:14px;height:54px}
+header{position:sticky;top:0;z-index:50;background:var(--card);
+  border-bottom:1px solid var(--border);
+  box-shadow:0 1px 3px rgba(16,22,26,.04),0 4px 12px rgba(16,22,26,.04);
+  isolation:isolate}
+.hbar{max-width:1180px;margin:0 auto;padding:0 20px;display:flex;align-items:center;gap:14px;
+  height:58px;min-width:0}
 .brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:15px;flex-shrink:0}
-.brand .dot{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,var(--accent),var(--accent2));
-  color:var(--accent-fg);display:grid;place-items:center;font-size:13px}
-.tabs{display:flex;gap:2px;margin-left:4px}
-.tab{padding:6px 12px;border-radius:8px;font-size:13px;color:var(--muted);transition:background .12s}
+.brand .dot{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:var(--accent-fg);display:grid;place-items:center;font-size:14px;flex-shrink:0}
+.tabs{display:flex;gap:2px;margin-left:4px;flex-shrink:0}
+.tab{padding:7px 13px;border-radius:8px;font-size:13px;color:var(--muted);transition:background .12s,color .12s;
+  position:relative}
 .tab:hover{background:var(--hover);color:var(--text)}
 .tab.on{background:var(--hover);color:var(--accent);font-weight:600}
-.hsearch{flex:1;display:flex;max-width:380px;margin-left:auto}
-.hsearch input{flex:1;padding:8px 12px;font-size:13px;border:1px solid var(--border);
-  border-radius:8px 0 0 8px;background:var(--bg);color:var(--text);outline:none;min-width:0}
+.tab.on::after{content:"";position:absolute;left:14px;right:14px;bottom:-1px;height:2px;
+  background:var(--accent);border-radius:2px 2px 0 0}
+.hsearch{flex:1 1 auto;display:flex;max-width:360px;margin-left:auto;min-width:0}
+.hsearch input{flex:1;min-width:0;padding:8px 12px;font-size:13px;border:1px solid var(--border);
+  border-radius:8px 0 0 8px;background:var(--bg);color:var(--text);outline:none}
 .hsearch input:focus{border-color:var(--accent)}
 .hsearch button{padding:8px 14px;font-size:13px;border:1px solid var(--accent);
   border-left:0;border-radius:0 8px 8px 0;background:var(--accent);color:var(--accent-fg);
-  cursor:pointer;white-space:nowrap}
+  cursor:pointer;white-space:nowrap;flex-shrink:0}
 
 /* ---------- 容器 ---------- */
-.wrap{max-width:1180px;margin:0 auto;padding:18px 16px 40px}
-h1{font-size:20px;font-weight:600;margin:0 0 4px}
-h2{font-size:15px;font-weight:600;margin:24px 0 10px;display:flex;align-items:center;gap:8px}
-h2 .n{font-size:12px;font-weight:400;color:var(--muted)}
-.sub{color:var(--muted);font-size:13px;margin:0 0 16px}
-.crumb{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-bottom:14px}
+.wrap{max-width:1180px;margin:0 auto;padding:24px 20px 48px}
+h1{font-size:20px;font-weight:600;margin:0 0 4px;letter-spacing:.2px}
+h2{font-size:15px;font-weight:600;margin:28px 0 12px;display:flex;align-items:center;gap:8px;
+  padding-left:10px;border-left:3px solid var(--accent);line-height:1.2}
+h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
+.sub{color:var(--muted);font-size:13px;margin:0 0 18px}
+.crumb{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin:0 0 16px}
 .crumb a:hover{color:var(--accent)}
 
 /* ---------- 首页 ---------- */
-.hero-home{padding:26px 24px;background:var(--card);border:1px solid var(--border);
-  border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:24px}
-.hero-home h1{font-size:24px;margin-bottom:6px}
-.hero-home .sub{margin:0}
-.hero-home .tips{margin-top:16px;display:flex;flex-wrap:wrap;gap:8px}
+.hero-home{padding:30px 28px;background:var(--card);border:1px solid var(--border);
+  border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:28px;position:relative;overflow:hidden}
+.hero-home::before{content:"";position:absolute;right:-40px;top:-40px;width:180px;height:180px;
+  border-radius:50%;background:linear-gradient(135deg,var(--hover),transparent 70%);opacity:.6;pointer-events:none}
+.hero-home h1{font-size:24px;margin-bottom:6px;position:relative}
+.hero-home .sub{margin:0;position:relative}
+.hero-home .tips{margin-top:18px;display:flex;flex-wrap:wrap;gap:8px;position:relative}
 .hero-home .tip{padding:6px 12px;border-radius:20px;background:var(--hover);
   border:1px solid var(--border);font-size:12px;color:var(--muted)}
 
 /* ---------- 分类大卡 ---------- */
 .cats{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
-.cat{padding:22px;background:var(--card);border:1px solid var(--border);
+.cat{padding:24px 22px;background:var(--card);border:1px solid var(--border);
   border-radius:var(--radius);box-shadow:var(--shadow);transition:transform .14s,border-color .14s,box-shadow .14s}
-.cat:hover{transform:translateY(-3px);border-color:var(--accent)}
-.cat .ico{width:42px;height:42px;border-radius:11px;display:grid;place-items:center;
-  font-size:20px;margin-bottom:14px}
+.cat:hover{transform:translateY(-3px);border-color:var(--accent);box-shadow:0 4px 16px rgba(10,102,194,.08)}
+.cat .ico{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;
+  font-size:20px;margin-bottom:16px}
 .cat .nm{font-weight:600;font-size:17px}
-.cat .ds{font-size:12px;color:var(--muted);margin-top:4px}
-.cat .go{margin-top:14px;font-size:12px;color:var(--accent);font-weight:500}
+.cat .ds{font-size:12px;color:var(--muted);margin-top:5px}
+.cat .go{margin-top:16px;font-size:12px;color:var(--accent);font-weight:500}
 
 /* ---------- 书封网格 ---------- */
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:18px 14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:20px 14px}
 .card{display:block}
-.card .ph{position:relative;width:100%;aspect-ratio:2/3;border-radius:9px;overflow:hidden;
+.card .ph{position:relative;width:100%;aspect-ratio:2/3;border-radius:10px;overflow:hidden;
   background:var(--border);box-shadow:var(--shadow);transition:transform .14s,box-shadow .14s}
-.card:hover .ph{transform:translateY(-4px)}
+.card:hover .ph{transform:translateY(-4px);box-shadow:0 8px 18px rgba(16,22,26,.12)}
 .card .ph img{width:100%;height:100%;object-fit:cover}
 .card .ph .badge{position:absolute;right:6px;top:6px;padding:2px 8px;border-radius:20px;
-  background:rgba(15,20,26,.68);color:#fff;font-size:10px;font-weight:500;backdrop-filter:blur(6px)}
-.card .t{margin-top:8px;font-size:13px;font-weight:500;line-height:1.35;
+  background:rgba(15,20,26,.72);color:#fff;font-size:10px;font-weight:500;backdrop-filter:blur(6px)}
+.card .t{margin-top:9px;font-size:13px;font-weight:500;line-height:1.35;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .card .s{margin-top:3px;font-size:11px;color:var(--muted)}
 
 /* ---------- 卷列表 ---------- */
-.vol{display:flex;align-items:center;gap:13px;padding:11px 12px;background:var(--card);
-  border:1px solid var(--border);border-radius:var(--radius);margin-bottom:9px;
-  transition:background .12s,border-color .12s}
-.vol:hover{background:var(--hover);border-color:var(--accent)}
-.vol .ph{width:44px;height:62px;flex-shrink:0;border-radius:6px;overflow:hidden;background:var(--border)}
-.vol .ph img{width:100%;height:100%;object-fit:cover}
+.vol{display:flex;align-items:center;gap:14px;padding:12px 14px;background:var(--card);
+  border:1px solid var(--border);border-radius:var(--radius);margin-bottom:8px;
+  transition:background .12s,border-color .12s,box-shadow .12s,transform .12s}
+.vol:hover{background:var(--hover);border-color:var(--accent);
+  box-shadow:0 2px 8px rgba(10,102,194,.06);transform:translateX(2px)}
+.vol .ph{width:48px;height:72px;flex-shrink:0;border-radius:7px;overflow:hidden;background:var(--border);
+  box-shadow:var(--shadow-sm)}
+.vol .ph img{width:100%;height:100%;object-fit:cover;display:block}
 .vol .meta{flex:1;min-width:0}
 .vol .meta .t{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.vol .meta .s{font-size:12px;color:var(--muted);margin-top:2px}
-.dl{padding:7px 15px;border-radius:8px;background:var(--accent);color:var(--accent-fg);
-  font-size:12px;font-weight:500;white-space:nowrap;flex-shrink:0}
-.dl:hover{filter:brightness(1.1)}
-.dl.big{padding:10px 20px;font-size:14px;border-radius:10px}
+.vol .meta .s{font-size:12px;color:var(--muted);margin-top:3px;display:flex;align-items:center;gap:8px}
+.dl{padding:7px 16px;border-radius:8px;background:var(--accent);color:var(--accent-fg);
+  font-size:12px;font-weight:500;white-space:nowrap;flex-shrink:0;transition:filter .12s,transform .12s}
+.vol .dl{padding:8px 18px;font-size:12.5px}
+.dl:hover{filter:brightness(1.08)}
+.dl:active{transform:scale(.97)}
+.dl.big{padding:11px 22px;font-size:14px;border-radius:10px}
 .dl.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
-.dl.small{padding:5px 12px;font-size:12px}
+.dl.ghost:hover{background:var(--hover)}
+.dl.small{padding:5px 11px;font-size:11.5px;border-radius:7px}
 
 /* ---------- 分组（书内子目录，可折叠） ---------- */
 .sec-head{display:flex;align-items:center;justify-content:space-between;
-  flex-wrap:wrap;gap:8px;margin:24px 0 10px}
+  flex-wrap:wrap;gap:10px;margin:32px 0 14px}
 .sec-head h2{margin:0;display:flex;align-items:center;gap:8px}
 .sec-head .grp-tools{display:flex;align-items:center;gap:6px;margin:0;flex-shrink:0}
-.grp-tools .sp{flex:1}
-.grp-btn{padding:5px 12px;border-radius:8px;border:1px solid var(--border);
-  background:var(--card);color:var(--muted);font-size:12px;cursor:pointer}
-.grp-btn:hover{border-color:var(--accent);color:var(--accent)}
-.group{margin-bottom:14px}
-.group-head{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;
-  background:var(--card);border:1px solid var(--border);border-radius:11px 11px 0 0;
-  box-shadow:var(--shadow);user-select:none;-webkit-tap-highlight-color:transparent}
-.group:not(.open) .group-head{border-radius:11px}
+.grp-btn{padding:6px 13px;border-radius:8px;border:1px solid var(--border);
+  background:var(--card);color:var(--muted);font-size:12px;cursor:pointer;transition:all .12s}
+.grp-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--hover)}
+.group{margin-bottom:18px}
+.group-head{display:flex;align-items:center;gap:12px;padding:13px 16px;cursor:pointer;
+  background:var(--card);border:1px solid var(--border);border-radius:12px 12px 0 0;
+  box-shadow:var(--shadow);user-select:none;-webkit-tap-highlight-color:transparent;
+  transition:background .12s}
+.group:not(.open) .group-head{border-radius:12px}
+.group-head:hover{background:var(--hover)}
 .group-head:active{background:var(--hover)}
-.group-head .caret{width:18px;height:18px;flex-shrink:0;display:grid;place-items:center;
-  color:var(--muted);font-size:10px;transition:transform .18s}
+.group-head .caret{width:20px;height:20px;flex-shrink:0;display:grid;place-items:center;
+  color:var(--muted);font-size:10px;transition:transform .2s ease}
 .group.open .group-head .caret{transform:rotate(90deg)}
-.group-head .gico{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;
-  background:#eef4fb;color:var(--accent);font-size:13px;flex-shrink:0}
-.group-head .gnm{font-weight:600;font-size:14px}
-.group-head .gmeta{font-size:12px;color:var(--muted);flex:1}
-.group-body{display:none;padding:10px 6px 4px;border:1px solid var(--border);border-top:0;
-  border-radius:0 0 11px 11px;background:var(--bg)}
+.group-head .gico{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;
+  background:#eef4fb;color:var(--accent);font-size:14px;flex-shrink:0}
+.group-head .gnm{font-weight:600;font-size:14.5px}
+.group-head .gmeta{font-size:12px;color:var(--muted);flex:1;display:flex;align-items:center;gap:6px}
+.group-head .gmeta::before{content:"";width:3px;height:3px;border-radius:50%;background:var(--muted);
+  opacity:.5;flex-shrink:0}
+.group-head .gmeta:empty::before{display:none}
+.group-body{display:none;padding:12px 8px 6px;border:1px solid var(--border);border-top:0;
+  border-radius:0 0 12px 12px;background:var(--bg)}
 .group.open .group-body{display:block}
+.group-body .vol{margin-bottom:6px}
+.group-body .vol:last-child{margin-bottom:0}
 @media (prefers-reduced-motion:reduce){.group-head .caret{transition:none}}
 
 /* ---------- 详情头 ---------- */
-.hero{display:flex;gap:22px;padding:20px;background:var(--card);border:1px solid var(--border);
-  border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:22px}
-.hero .ph{width:130px;flex-shrink:0;aspect-ratio:2/3;border-radius:10px;overflow:hidden;
-  background:var(--border);box-shadow:var(--shadow)}
+.hero{display:flex;gap:24px;padding:24px;background:var(--card);border:1px solid var(--border);
+  border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:24px}
+.hero .ph{width:140px;flex-shrink:0;aspect-ratio:2/3;border-radius:12px;overflow:hidden;
+  background:var(--border);box-shadow:0 4px 14px rgba(16,22,26,.1)}
 .hero .ph img{width:100%;height:100%;object-fit:cover}
 .hero .info{flex:1;min-width:0;display:flex;flex-direction:column}
-.hero .meta-line{font-size:13px;color:var(--muted);margin:2px 0}
+.hero .meta-line{font-size:13px;color:var(--muted);margin:3px 0}
 .hero .meta-line b{color:var(--text);font-weight:500}
-.hero .desc{font-size:13px;color:var(--muted);margin-top:10px;line-height:1.7;
+.hero .desc{font-size:13px;color:var(--muted);margin-top:12px;line-height:1.7;
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.hero .actions{display:flex;gap:10px;margin-top:auto;padding-top:14px;flex-wrap:wrap}
+.hero .actions{display:flex;gap:10px;margin-top:auto;padding-top:16px;flex-wrap:wrap}
 
 /* ---------- 工具条 ---------- */
-.bar{display:flex;align-items:center;gap:10px;margin:18px 0 12px;flex-wrap:wrap}
+.bar{display:flex;align-items:center;gap:10px;margin:20px 0 14px;flex-wrap:wrap}
 .bar .spacer{flex:1}
 
 /* ---------- 分页 ---------- */
-.pager{display:flex;justify-content:center;align-items:center;gap:12px;margin:26px 0 6px}
-.pager a,.pager span{padding:8px 16px;border:1px solid var(--border);border-radius:9px;
-  background:var(--card);font-size:13px}
-.pager a:hover{border-color:var(--accent);color:var(--accent)}
+.pager{display:flex;justify-content:center;align-items:center;gap:10px;margin:30px 0 6px}
+.pager a,.pager span{padding:9px 18px;border:1px solid var(--border);border-radius:10px;
+  background:var(--card);font-size:13px;transition:all .12s}
+.pager a:hover{border-color:var(--accent);color:var(--accent);box-shadow:0 2px 6px rgba(10,102,194,.08)}
 .pager .cur{color:var(--muted);border-color:transparent;background:transparent}
-.empty{padding:50px 16px;text-align:center;color:var(--muted);font-size:14px}
-footer{margin-top:40px;padding:22px 16px;text-align:center;color:var(--muted);font-size:12px;
+.empty{padding:60px 16px;text-align:center;color:var(--muted);font-size:14px;
+  background:var(--card);border:1px dashed var(--border);border-radius:var(--radius)}
+footer{margin-top:48px;padding:24px 16px;text-align:center;color:var(--muted);font-size:12px;
   border-top:1px solid var(--border)}
-@media (max-width:600px){
-  .wrap{padding:14px 12px 32px}
+@media (max-width:760px){
+  .wrap{padding:16px 14px 36px}
   /* 顶栏变两行：①品牌+搜索 ②tab 可横滑 */
-  .hbar{flex-wrap:wrap;height:auto;padding:8px 12px;gap:8px;align-items:center}
+  .hbar{flex-wrap:wrap;height:auto;padding:10px 12px;gap:8px;align-items:center}
   .brand{flex:0 0 auto}
   .brand span{display:none}
-  .hsearch{flex:1 1 auto;max-width:none;min-width:0;margin-left:0}
+  .hsearch{flex:1 1 auto;max-width:none;min-width:0;margin-left:0;order:2}
   .hsearch input{flex:1;min-width:0;font-size:14px}
   .tabs{order:3;flex:0 0 100%;overflow-x:auto;scrollbar-width:none;
-    white-space:nowrap;margin:0 -4px;padding:0 4px}
+    white-space:nowrap;margin:2px -4px 0;padding:0 4px}
   .tabs::-webkit-scrollbar{display:none}
   .tab{padding:7px 11px;font-size:13px;flex-shrink:0}
+  .tab.on::after{display:none}
   /* 内容区 */
-  .grid{grid-template-columns:repeat(auto-fill,minmax(98px,1fr));gap:14px 10px}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:14px 10px}
   .card .t{font-size:12px;line-height:1.3;-webkit-line-clamp:2}
   .card .ph .badge{font-size:10px;padding:2px 7px}
-  .hero{gap:14px;padding:14px;align-items:stretch}
-  .hero .ph{width:110px;flex-shrink:0}
+  .hero{gap:14px;padding:16px;align-items:stretch;border-radius:10px}
+  .hero .ph{width:108px;flex-shrink:0;border-radius:9px}
   .hero .info h1{font-size:17px;margin-bottom:2px}
   .hero .meta-line{font-size:12px;margin:1px 0}
   .hero .desc{font-size:12px;margin-top:8px;line-height:1.6;
     display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
-  .hero .actions{margin-top:auto;padding-top:10px}
-  .hero .actions .dl.big{padding:9px 14px;font-size:13px;width:100%;text-align:center}
-  .hero-home{padding:18px 16px}.hero-home h1{font-size:20px}
+  .hero .actions{margin-top:auto;padding-top:12px}
+  .hero .actions .dl.big{padding:10px 14px;font-size:13px;width:100%;text-align:center}
+  .hero-home{padding:20px 18px;border-radius:10px}.hero-home h1{font-size:20px}
   .cats{grid-template-columns:1fr;gap:12px}
   .grp-tools{gap:6px}.grp-btn{padding:5px 10px}
-  .group-head{padding:10px 12px}
+  .group{margin-bottom:14px}
+  .group-head{padding:11px 12px;border-radius:10px 10px 0 0;gap:10px}
+  .group:not(.open) .group-head{border-radius:10px}
+  .group-body{border-radius:0 0 10px 10px;padding:10px 6px 4px}
   .group-head .gnm{font-size:13px}
-  .vol{padding:9px 10px;gap:10px}
-  .vol .ph{width:38px;height:54px}
+  .group-head .gico{width:24px;height:24px;font-size:13px}
+  .group-head .dl.small{padding:4px 9px;font-size:11px}
+  .vol{padding:10px 11px;gap:11px}
+  .vol .ph{width:44px;height:66px;border-radius:6px}
   .vol .meta .t{font-size:13px}
-  .vol .dl{padding:6px 12px;font-size:11px}
-  h2{font-size:14px;margin:18px 0 8px}
+  .vol .dl{padding:6px 12px;font-size:11.5px}
+  h2{font-size:14px;margin:20px 0 10px;padding-left:8px;border-left-width:2px}
+  h1{font-size:18px}
+  .sec-head{margin:24px 0 12px}
+  .bar{margin:16px 0 12px}
 }
 """
 
@@ -1010,7 +1120,7 @@ def catalog_html(cat, page=1):
     return _html_page(f"{label} · {SERVER_TITLE}", body, active=active)
 
 
-def book_html(rel, page=1):
+def book_html(rel, page=1):                                # page 参数保留以兼容旧 URL，详情页不再分页
     rel = _safe_relpath(rel)
     if not rel:
         return None
@@ -1020,7 +1130,6 @@ def book_html(rel, page=1):
     vols = get_library().get(cat, {}).get(book)
     if vols is None:
         return None
-    chunk, extra = _paginate(vols, page, "/opds/book/" + encode_path(rel) + "?page=1")
     total_size = sum(v["size"] for v in vols)
     meta = get_epub_meta(vols[0]["rel"]) if vols else {}
     author = meta.get("creator", "")
@@ -1033,9 +1142,9 @@ def book_html(rel, page=1):
 
     desc_html = f'<div class="desc">{html.escape(desc)}</div>' if desc else ""
 
-    # 按子目录分组（书内「正篇/番外/…」结构）
+    # 详情页一次性渲染全部卷（不翻页）：直接传完整 vols 列表，_render_groups 会显示所有分组
     groups = _group_vols_by_subdir(vols, cat, book)
-    groups_html = _render_groups(groups, cat, book, chunk)
+    groups_html = _render_groups(groups, cat, book, vols)
 
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span>'
@@ -1058,7 +1167,6 @@ def book_html(rel, page=1):
          f'</div></div>' if groups_html else
          f'<h2>分卷下载 <span class="n">{len(vols)} 卷</span></h2>')
         + (groups_html or '<div class="empty">这一页没有内容</div>')
-        + _pager_html(page, _next_link(extra), _prev_link(extra))
     )
     active = "done" if cat == CATEGORY_DONE else "ongoing"
     return _html_page(f"{book} · {SERVER_TITLE}", body, active=active)
