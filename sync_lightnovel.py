@@ -120,6 +120,7 @@ MIRROR_LOG_FILE    = os.path.join(LOG_DIR, "mirror.log")          # 结构化审
 MIRROR_STATE_FILE  = os.path.join(LOG_DIR, "mirror_state.json")   # 上次镜像状态（供「查」快速读取）
 MIRROR_MANIFEST    = os.path.join(LOG_DIR, "mirror_manifest.json")  # 镜像清单：本工具曾写入 F 盘的文件
 MIRROR_REPORT_FILE = os.path.join(LOG_DIR, "mirror_report.json")  # 最近一次 查 / 同步 完整报告
+MIRROR_HTML_FILE   = os.path.join(LOG_DIR, "mirror_status.html")  # 可读的镜像状态看板（自动刷新）
 F_TRASH_ROOT       = os.path.join(F_TARGET_ROOT, ".trash")        # F 盘回收站：删除先移入，可恢复
 MAX_MIRROR_DELETIONS  = 200     # 单次镜像删除上限；超过判定为异常，拒绝执行并告警
 TRASH_KEEP_DAYS       = 30      # 回收站保留天数，超时自动清理
@@ -899,6 +900,112 @@ def apply_mirror(plan, dry_run=False, allow_delete=True):
     return result
 
 
+def write_mirror_dashboard(report):
+    """把镜像差异报告渲染成一张可读的 HTML 看板（每次 查 / 同步 后自动刷新）。"""
+    try:
+        c = report["counts"]
+        consistent = (c["add"] == 0 and c["update"] == 0 and c["delete"] == 0)
+        badge = ("✅ 两端完全一致" if consistent and report["f_mounted"]
+                 else "🔄 存在差异待同步" if report["f_mounted"] else "⚠️ F 盘未挂载")
+        color = "#16a34a" if consistent and report["f_mounted"] else (
+            "#d97706" if report["f_mounted"] else "#dc2626")
+
+        rows = []
+        for cat, plan in report["categories"].items():
+            pc = plan["counts"]
+            rows.append(
+                f"<tr><td><b>{cat}</b></td><td class=n>{pc['src_total']}</td>"
+                f"<td class=n>{pc['dst_total']}</td>"
+                f"<td class=n add>{pc['add']}</td><td class=n upd>{pc['update']}</td>"
+                f"<td class=n del>{pc['delete']}</td><td class=n ok>{pc['unchanged']}</td>"
+                f"<td class=n warn>{pc['conflict']}</td></tr>")
+
+        items = []
+        for cat, plan in report["categories"].items():
+            for cf in plan["conflicts"]:
+                items.append(f"<li class=cf><span class=tag>{cf['kind']}</span>"
+                             f"<code>{cf['rel']}</code><br><span class=dt>{cf['detail']}</span></li>")
+            for d in plan["delete"]:
+                if not d["protected"]:
+                    items.append(f"<li><span class=tag del>待删</span><code>{d['rel']}</code></li>")
+        if not items:
+            items.append("<li class=empty>无待处理项</li>")
+
+        total = c["add"] + c["update"] + c["delete"]
+        src_all = c["src_total"] or 1
+        pct = round(c["unchanged"] / src_all * 100, 1) if src_all else 0.0
+
+        html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>D 盘 → F 盘 镜像状态</title>
+<style>
+:root{{--bg:#f6f7f9;--card:#fff;--bd:#e3e6ea;--tx:#1f2328;--mut:#6b7280}}
+*{{box-sizing:border-box}}
+body{{margin:0;padding:24px;background:var(--bg);color:var(--tx);
+font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}}
+.wrap{{max-width:960px;margin:0 auto}}
+h1{{font-size:20px;margin:0 0 4px}}
+.sub{{color:var(--mut);font-size:12px;margin-bottom:20px}}
+.badge{{display:inline-block;padding:6px 14px;border-radius:999px;color:#fff;
+background:{color};font-weight:600;font-size:13px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin:20px 0}}
+.card{{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px}}
+.card .k{{color:var(--mut);font-size:12px}}
+.card .v{{font-size:22px;font-weight:700;margin-top:2px}}
+.add{{color:#2563eb}} .upd{{color:#d97706}} .del{{color:#dc2626}}
+.ok{{color:#16a34a}} .warn{{color:#b45309}}
+table{{width:100%;border-collapse:collapse;background:var(--card);
+border:1px solid var(--bd);border-radius:10px;overflow:hidden}}
+th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--bd)}}
+th{{background:#f0f2f5;font-size:12px;color:var(--mut)}}
+td.n{{text-align:right;font-variant-numeric:tabular-nums}}
+h2{{font-size:15px;margin:24px 0 10px}}
+ul{{background:var(--card);border:1px solid var(--bd);border-radius:10px;
+padding:12px 12px 12px 30px;margin:0;max-height:340px;overflow:auto}}
+li{{margin-bottom:8px}}
+li.empty{{list-style:none;margin-left:-18px;color:var(--mut)}}
+code{{background:#f0f2f5;padding:1px 6px;border-radius:4px;font-size:12.5px;
+word-break:break-all}}
+.tag{{display:inline-block;font-size:11px;padding:1px 7px;border-radius:4px;
+background:#eef2f7;color:#475569;margin-right:6px;vertical-align:1px}}
+.tag.del{{background:#fee2e2;color:#b91c1c}}
+li.cf code{{background:#fff7ed}}
+.dt{{color:var(--mut);font-size:12px}}
+.bar{{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:8px}}
+.bar>i{{display:block;height:100%;background:#16a34a;width:{pct}%}}
+.foot{{color:var(--mut);font-size:12px;margin-top:20px}}
+</style></head><body><div class="wrap">
+<h1>D 盘 → F 盘 网盘镜像状态</h1>
+<div class="sub">数据源 <code>{report['source_root']}</code> · 备份目标 <code>{report['target_root']}</code></div>
+<span class="badge">{badge}</span>
+<div class="cards">
+<div class="card"><div class="k">待处理合计</div><div class="v">{total}</div></div>
+<div class="card"><div class="k">新增</div><div class="v add">{c['add']}</div></div>
+<div class="card"><div class="k">修改</div><div class="v upd">{c['update']}</div></div>
+<div class="card"><div class="k">删除</div><div class="v del">{c['delete']}</div></div>
+<div class="card"><div class="k">一致</div><div class="v ok">{c['unchanged']}</div></div>
+<div class="card"><div class="k">冲突</div><div class="v warn">{c['conflict']}</div></div>
+</div>
+<div class="bar"><i></i></div>
+<div class="sub" style="margin:6px 0 20px">一致率 {pct}%（{c['unchanged']} / {c['src_total']}）</div>
+<h2>分类明细</h2>
+<table><thead><tr><th>分类</th><th class=n>D 盘</th><th class=n>F 盘</th>
+<th class=n>增</th><th class=n>改</th><th class=n>删</th><th class=n>一致</th><th class=n>冲突</th>
+</tr></thead><tbody>{''.join(rows) or '<tr><td colspan=8>无数据</td></tr>'}</tbody></table>
+<h2>冲突与待处理项</h2>
+<ul>{''.join(items)}</ul>
+<div class="foot">生成时间 {report['generated_at']} · 完整报告 <code>mirror_report.json</code> ·
+审计日志 <code>mirror.log</code>（删除为软删除，可在 <code>F:\\LightNovel\\.trash</code> 恢复，保留 {TRASH_KEEP_DAYS} 天）</div>
+</div></body></html>"""
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp = MIRROR_HTML_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        os.replace(tmp, MIRROR_HTML_FILE)
+    except Exception as exc:      # 看板失败不应影响同步主流程
+        log.warning("生成镜像看板失败：%s", exc)
+
+
 def mirror_dir(src, dst, dry_run=False, allow_delete=True):
     """兼容旧接口：把 src 增量镜像到 dst（默认含删除传播）。返回复制文件数。"""
     plan = plan_mirror(src, dst)
@@ -948,11 +1055,15 @@ def sync_to_f(dry_run=False, allow_delete=True):
     if not manifest:
         ensure_manifest_seeded()
         manifest = _load_manifest()
+    cat_plans = {}
     for cat, src in CATEGORY_DIRS.items():
         dst = F_CATEGORY_DIRS[cat]
         try:
             known = manifest.setdefault(cat, set())
             plan = plan_mirror(src, dst, known=known)
+            plan["counts"]["orphan"] = sum(1 for d in plan["delete"]
+                                           if not d["ours"] and not d["protected"])
+            cat_plans[cat] = plan
             c = plan["counts"]
             for cf in plan["conflicts"]:
                 log.warning("%s镜像冲突（%s）：%s —— %s", tag, cat, cf["rel"], cf["detail"])
@@ -985,6 +1096,15 @@ def sync_to_f(dry_run=False, allow_delete=True):
         _purge_old_trash()
         _save_manifest(manifest)
         _save_json(MIRROR_STATE_FILE, {"last_sync": _now_iso(), "categories": summary})
+        # 同步后再扫一遍生成看板（此时两端应已一致）
+        write_mirror_dashboard({
+            "generated_at": _now_iso(),
+            "source_root": LIGHT_NOVEL_DIR, "target_root": F_TARGET_ROOT,
+            "f_mounted": True, "categories": cat_plans,
+            "counts": {k: sum(p["counts"].get(k, 0) for p in cat_plans.values())
+                       for k in ("add", "update", "delete", "protected", "orphan",
+                                 "unchanged", "conflict", "src_total", "dst_total")},
+        })
     return ok
 
 
@@ -1217,6 +1337,8 @@ def show_mirror_status():
             log.info("  …… 待删清单已截断，完整列表见 %s", MIRROR_REPORT_FILE)
     log.info("完整报告：%s", MIRROR_REPORT_FILE)
     log.info("审计日志：%s", MIRROR_LOG_FILE)
+    write_mirror_dashboard(rep)
+    log.info("可视化看板：%s", MIRROR_HTML_FILE)
     return rep
 
 
