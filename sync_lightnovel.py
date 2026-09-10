@@ -600,6 +600,32 @@ def scan_tree(root, exclude=EXCLUDE_FILE_NAMES):
     return tree
 
 
+def scan_dirs(root):
+    """递归列出 root 下**所有子目录**的相对路径（含空目录），用 scandir 避免 os.walk 在
+    某些挂载盘（CloudDrive2）上跳过空目录的坑。返回 set，根目录本身用空串 "" 表示。"""
+    dirs = set()
+    if not root or not os.path.isdir(root):
+        return dirs
+    dirs.add("")                                                 # 根目录
+    stack = [""]
+    while stack:
+        rel = stack.pop()
+        abs_dir = os.path.join(root, rel.replace("/", os.sep)) if rel else root
+        try:
+            with os.scandir(abs_dir) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            child_rel = (rel + "/" + entry.name) if rel else entry.name
+                            dirs.add(child_rel)
+                            stack.append(child_rel)
+                    except OSError:
+                        pass
+        except (OSError, PermissionError) as exc:
+            log.warning("无法扫描目录 %s：%s", abs_dir, exc)
+    return dirs
+
+
 def _append_mirror_log(records):
     """把操作明细以 JSON Lines 追加写入 .autosync/mirror.log（审计日志）。"""
     if not records:
@@ -751,7 +777,8 @@ def mirror_query():
         "f_mounted": os.path.isdir(F_TARGET_ROOT),
         "categories": {},
         "counts": {"add": 0, "update": 0, "delete": 0, "protected": 0, "orphan": 0,
-                   "unchanged": 0, "conflict": 0, "src_total": 0, "dst_total": 0},
+                   "orphan_dirs": 0, "unchanged": 0, "conflict": 0,
+                   "src_total": 0, "dst_total": 0},
     }
     if not report["f_mounted"]:
         return report
@@ -760,6 +787,12 @@ def mirror_query():
         plan = plan_mirror(src, F_CATEGORY_DIRS[cat], known=manifest.get(cat))
         plan["counts"]["orphan"] = sum(1 for d in plan["delete"]
                                        if not d["ours"] and not d["protected"])
+        # 孤儿目录数（只读，不动手）
+        src_dirs = {d for d in scan_dirs(src) if d}
+        dst_dirs = {d for d in scan_dirs(F_CATEGORY_DIRS[cat]) if d}
+        foreign_dirs = {d for d in (dst_dirs - src_dirs)
+                        if not d.split("/", 1)[0].startswith(".trash")}
+        plan["counts"]["orphan_dirs"] = len(foreign_dirs)
         report["categories"][cat] = plan
         for k in report["counts"]:
             report["counts"][k] += plan["counts"].get(k, 0)
@@ -810,15 +843,19 @@ def _purge_old_trash():
 
 
 def _prune_empty_dirs(dst):
-    """删除 dst 下因文件被删而变空的目录（自底向上），返回删除目录数。"""
+    """删除 dst 下因文件被删而变空的目录（自底向上），返回删除目录数。
+    用 scan_dirs 避免 os.walk 在 CloudDrive2 挂载盘上跳过空目录。"""
     removed = 0
-    for r, dirs, files in os.walk(dst, topdown=False):
-        if os.path.abspath(r) == os.path.abspath(dst):
+    for rel in sorted(scan_dirs(dst), key=lambda d: d.count("/"), reverse=True):
+        if not rel:                                              # 跳过根目录本身
             continue
+        abs_dir = os.path.join(dst, rel.replace("/", os.sep))
         try:
-            if not dirs and not files:
-                os.rmdir(r)
-                removed += 1
+            # 空 = 无子目录且无文件
+            with os.scandir(abs_dir) as it:
+                if not any(True for _ in it):
+                    os.rmdir(abs_dir)
+                    removed += 1
         except OSError:
             pass
     return removed
@@ -829,7 +866,7 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
     与 _prune_empty_dirs 互补：后者只清"删完文件自然变空"的目录；本函数负责
     清理"我们压根没源对应"或"还有遗留文件没被识别为 delete"的整棵子树。
     安全网：
-      1) 仅在 dst 范围内操作（caller 保证 dst 是 F:\\LightNovel\\{分类}）
+      1) 仅在 dst 范围内操作：每个候选目录做 abs+commonpath 校验，禁止触碰 dst 之外
       2) 24h 内修改过的 F-only 子树 → 跳过并告警（防误删刚被外部工具新建的内容）
       3) src 不存在 → 不执行任何删除（防 D 盘挂载失败引发误删）
       4) 操作失败逐项 log，绝不阻断主流程
@@ -837,17 +874,15 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
     moved, skipped = [], []
     if not os.path.isdir(src):
         return moved, skipped                                  # D 盘不可用 → 直接返回，绝不删 F
-    # 1) 收集 D / F 各自的「中间目录」rel
-    src_dirs = set()
-    for r, dirs, _ in os.walk(src):
-        rel = os.path.relpath(r, src).replace("\\", "/")
-        if rel and rel != ".":
-            src_dirs.add(rel)
-    dst_dirs = set()
-    for r, dirs, _ in os.walk(dst):
-        rel = os.path.relpath(r, dst).replace("\\", "/")
-        if rel and rel != ".":
-            dst_dirs.add(rel)
+    # 0) 安全校验：把 dst 解析为绝对路径并规整化，后续所有 abs_dir 必须在其下
+    try:
+        dst_abs = os.path.realpath(os.path.abspath(dst))
+    except OSError:
+        return moved, skipped
+    # 1) 收集 D / F 各自的「中间目录」rel（用 scan_dirs 而非 os.walk —— CD2 挂载盘
+    #    上 os.walk 不 yield 空目录，会漏掉"整本书已删"的空目录残留）
+    src_dirs = {d for d in scan_dirs(src) if d}
+    dst_dirs = {d for d in scan_dirs(dst) if d}
     # 2) F 侧存在但 D 侧没有 → 整棵孤儿子树
     foreign = dst_dirs - src_dirs
     foreign = {d for d in foreign if not d.split("/", 1)[0].startswith(".trash")}
@@ -857,21 +892,41 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
     foreign_sorted = sorted(foreign, key=lambda d: d.count("/"), reverse=True)
     cutoff = time.time() - F_RECENT_PROTECT_SEC
     for rel in foreign_sorted:
-        abs_dir = os.path.join(dst, rel.replace("/", os.sep))
-        if not os.path.isdir(abs_dir):
+        abs_dir = os.path.normpath(os.path.join(dst_abs, rel.replace("/", os.sep)))
+        # 1) 安全网：严格校验 abs_dir 在 dst_abs 之下，防止任何逃逸（symlink / 盘符/.. 攻击）
+        try:
+            abs_real = os.path.realpath(abs_dir)
+        except OSError:
+            skipped.append(rel)
+            log.warning("【安全网】无法解析 F 侧孤儿子树路径：%s", rel)
             continue
-        # 4) 24h 保护：子树内任一文件 mtime 在保护窗口内 → 跳过
+        if (os.path.commonpath([abs_real, dst_abs]) != dst_abs
+                or abs_real == dst_abs):
+            skipped.append(rel)
+            log.error("【安全网】F 侧孤儿子树路径逃逸 dst，拒绝操作：%s -> %s", rel, abs_real)
+            continue
+        if not os.path.isdir(abs_real):
+            continue
+        # 4) 24h 保护：子树内任一文件**或目录本身**的 mtime 在保护窗口内 → 跳过
+        # 注意：apply_mirror 先把孤儿文件移入回收站，子树会变空；
+        # 只看子文件 mtime 会让 24h 保护失效。必须同时检查目录自身的 mtime。
         recent = False
-        for r, _, fs in os.walk(abs_dir):
-            for f in fs:
-                try:
-                    if os.path.getmtime(os.path.join(r, f)) > cutoff:
-                        recent = True
-                        break
-                except OSError:
-                    pass
-            if recent:
-                break
+        try:
+            if os.path.getmtime(abs_real) > cutoff:
+                recent = True
+        except OSError:
+            pass
+        if not recent:
+            for r, _, fs in os.walk(abs_real):
+                for f in fs:
+                    try:
+                        if os.path.getmtime(os.path.join(r, f)) > cutoff:
+                            recent = True
+                            break
+                    except OSError:
+                        pass
+                if recent:
+                    break
         if recent:
             skipped.append(rel)
             log.warning("【安全网】F 侧孤儿子树 %s 含有 24h 内新增/修改的文件，跳过整棵删除，"
@@ -885,33 +940,35 @@ def _prune_foreign_subtrees(src, dst, manifest_set, trash_batch, allow_delete=Tr
         try:
             os.makedirs(os.path.dirname(trash_target), exist_ok=True)
             # 去掉只读属性（CD2 上整棵移动有时因只读失败）
-            for r, _, fs in os.walk(abs_dir):
+            for r, _, fs in os.walk(abs_real):
                 for f in fs:
                     try:
                         os.chmod(os.path.join(r, f), 0o666)
                     except OSError:
                         pass
-            shutil.move(abs_dir, trash_target)
+            shutil.move(abs_real, trash_target)
             moved.append(rel)
             # 6) 从镜像清单移除该子树下的所有 rel
             if manifest_set is not None:
-                for mrel in list(manifest_set):
-                    if mrel == rel or mrel.startswith(rel + "/"):
-                        manifest_set.discard(mrel)
+                prefix = rel + "/"
+                for mrel in [m for m in manifest_set if m == rel or m.startswith(prefix)]:
+                    manifest_set.discard(mrel)
         except OSError as exc:
-            log.warning("无法将 F 孤儿子树 %s 移入回收站：%s", abs_dir, exc)
+            log.warning("无法将 F 孤儿子树 %s 移入回收站：%s", abs_real, exc)
             skipped.append(rel)
     return moved, skipped
 
 
 # ---------------------------- 增 / 改 / 删：执行 ----------------------------
-def apply_mirror(plan, dry_run=False, allow_delete=True):
-    """按计划执行镜像。dry_run=True 时只记录不落盘。返回执行结果 dict。"""
+def apply_mirror(plan, dry_run=False, allow_delete=True, manifest_set=None):
+    """按计划执行镜像。dry_run=True 时只记录不落盘。返回执行结果 dict。
+    manifest_set: 镜像清单中"本分类"的文件 rel 集合；孤儿子树被整棵移除时同步清理。"""
     src, dst = plan["src"], plan["dst"]
     cat = os.path.basename(dst)
     batch = os.path.join(F_TRASH_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S"), cat)
     result = {"added": [], "updated": [], "deleted": [], "skipped": [],
-              "failed": [], "dirs_removed": 0, "dry_run": dry_run}
+              "failed": [], "dirs_removed": 0, "dirs_trashed": [],
+              "dirs_skipped": [], "dry_run": dry_run}
     records = []
 
     def _rec(op, rel, status, extra=None):
@@ -972,7 +1029,23 @@ def apply_mirror(plan, dry_run=False, allow_delete=True):
                 result["failed"].append({"rel": rel, "op": "delete", "error": "移入回收站失败"})
                 _rec("delete", rel, "failed")
 
-    # ---- 清理空目录 ----
+    # ---- 清理孤儿子树（递归删除源中不存在的整棵子树，含子目录/文件/残留空目录）----
+    # 关键：D 盘是唯一数据源，F 侧任何不存在的整棵子树都该被移入回收站。
+    # 失败兜底：删完文件后还要清空目录（_prune_empty_dirs 处理被并发残留的空目录）。
+    if not dry_run:
+        try:
+            moved_dirs, skipped_dirs = _prune_foreign_subtrees(
+                src, dst, manifest_set, batch, allow_delete=allow_delete)
+            result["dirs_trashed"] = moved_dirs
+            result["dirs_skipped"] = skipped_dirs
+            for d in moved_dirs:
+                _rec("rmdir", d, "ok", {"trash": os.path.join(batch, d.replace("/", os.sep))})
+            for d in skipped_dirs:
+                _rec("rmdir", d, "skipped", {"reason": "24h 保护 / allow_delete=False"})
+        except Exception as exc:
+            log.warning("清理 F 侧孤儿子树时异常：%s", exc)
+
+    # ---- 清理空目录（兜底：并发残留 / 上面没覆盖到的）----
     if allow_delete and not dry_run:
         result["dirs_removed"] = _prune_empty_dirs(dst)
 
@@ -1147,17 +1220,28 @@ def sync_to_f(dry_run=False, allow_delete=True):
             c = plan["counts"]
             for cf in plan["conflicts"]:
                 log.warning("%s镜像冲突（%s）：%s —— %s", tag, cat, cf["rel"], cf["detail"])
-            res = apply_mirror(plan, dry_run=dry_run, allow_delete=allow_delete)
+            res = apply_mirror(plan, dry_run=dry_run, allow_delete=allow_delete,
+                               manifest_set=known)
             purged = 0 if dry_run else _purge_excluded_files(dst)
             if dry_run:
-                log.info("%s%s 计划：增 %d / 改 %d / 删 %d（清单外 %d）/ 保护 %d / 一致 %d / 冲突 %d",
+                # 同时算出预演模式下的孤儿目录数
+                src_dirs = {d for d in scan_dirs(src) if d}
+                dst_dirs = {d for d in scan_dirs(dst) if d}
+                foreign_dirs = {d for d in (dst_dirs - src_dirs)
+                                if not d.split("/", 1)[0].startswith(".trash")}
+                c["orphan_dirs"] = len(foreign_dirs)
+                plan["counts"]["orphan_dirs"] = len(foreign_dirs)
+                log.info("%s%s 计划：增 %d / 改 %d / 删 %d（清单外 %d）/ 孤儿子目录 %d / 保护 %d / 一致 %d / 冲突 %d",
                          tag, dst, c["add"], c["update"], c["delete"],
-                         c.get("orphan", 0), c["protected"], c["unchanged"], c["conflict"])
+                         c.get("orphan", 0), c.get("orphan_dirs", 0),
+                         c["protected"], c["unchanged"], c["conflict"])
             else:
                 log.info("%s已镜像到 F 盘 %s（实际：增 %d / 改 %d / 删 %d / 失败 %d；"
-                         "一致 %d，冲突 %d，空目录清理 %d，垃圾文件清理 %d）",
+                         "一致 %d，冲突 %d，整棵孤儿子树 %d（跳过 %d），空目录清理 %d，垃圾文件清理 %d）",
                          tag, dst, len(res["added"]), len(res["updated"]), len(res["deleted"]),
                          len(res["failed"]), c["unchanged"], c["conflict"],
+                         len(res.get("dirs_trashed", [])),
+                         len(res.get("dirs_skipped", [])),
                          res["dirs_removed"], purged)
             if res["failed"]:
                 ok = False
@@ -1402,9 +1486,10 @@ def show_mirror_status():
     for cat, plan in rep["categories"].items():
         pc = plan["counts"]
         log.info("  [%s] D 盘 %d 个 / F 盘 %d 个 → 增 %d、改 %d、删 %d（其中清单外 %d）、"
-                 "保护 %d、一致 %d、冲突 %d",
+                 "孤儿子目录 %d、保护 %d、一致 %d、冲突 %d",
                  cat, pc["src_total"], pc["dst_total"], pc["add"], pc["update"],
-                 pc["delete"], pc.get("orphan", 0), pc["protected"], pc["unchanged"], pc["conflict"])
+                 pc["delete"], pc.get("orphan", 0), pc.get("orphan_dirs", 0),
+                 pc["protected"], pc["unchanged"], pc["conflict"])
     log.info("  合计：增 %d / 改 %d / 删 %d / 一致 %d / 冲突 %d",
              c["add"], c["update"], c["delete"], c["unchanged"], c["conflict"])
     for cat, plan in rep["categories"].items():
