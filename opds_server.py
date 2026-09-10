@@ -1020,6 +1020,48 @@ def _cover_url(rel):
     return "/cover/" + encode_path(rel)
 
 
+# 书的「主卷」优选名：多子目录时（如 High School D×D 同时有 正篇/DX/短篇/SLASHDOG），
+# 按此顺序挑子目录的第一卷作为书封/hero 封面，避免取到副刊/外传的低质量封面
+_PRIMARY_SUBDIR_PREFERENCE = ["正篇", "本篇", "主线", "main", "series"]
+
+
+def _primary_vol(vols, cat, book):
+    """从书的卷列表里挑一卷作为「书级封面」：多子目录时按 _PRIMARY_SUBDIR_PREFERENCE 优先，
+    再退到「与书名最相似的子目录」，最后按字母序挑一个。单子目录/无子目录直接返回第一卷。
+    注：根目录的散文件（空子目录）不参与"多子目录"判定，被视为附属内容。"""
+    if not vols:
+        return None
+    inner = f"{cat}/{book}/"
+    # 把卷按子目录分组（保留 book 内目录相对路径）
+    groups = {}
+    for v in vols:
+        if v["rel"].startswith(inner):
+            rem = v["rel"][len(inner):]
+        else:
+            rem = v["rel"].split("/")[-1]
+        subdir = rem.rsplit("/", 1)[0] if "/" in rem else ""
+        groups.setdefault(subdir, []).append(v)
+    # 只看「真子目录」，根目录的散文件不参与多子目录判定
+    real_subs = {k: v for k, v in groups.items() if k}
+    if len(real_subs) <= 1:
+        return vols[0]
+    # 1) 优选名命中
+    for name in _PRIMARY_SUBDIR_PREFERENCE:
+        if name in real_subs:
+            return real_subs[name][0]
+    # 2) 子目录名里包含书名（或书名包含子目录名）→ 通常正篇沿用书名
+    for sub in real_subs:
+        if sub in book or book in sub:
+            return real_subs[sub][0]
+    # 3) 子目录名是书名的前缀（≥2 字）→ 容错处理「为美好的世界献上祝福」+ 「为美好的世界献上祝福！」
+    for sub in real_subs:
+        if len(book) >= 2 and (book[:2] in sub or sub[:2] in book):
+            return real_subs[sub][0]
+    # 4) 都没命中：按中英文排序挑第一个（保证确定，不依赖文件系统顺序）
+    first = sorted(real_subs.keys(), key=lambda s: s.lower())[0]
+    return real_subs[first][0]
+
+
 def _next_link(extra):
     m = re.search(r'rel="next" href="([^"]+)"', extra or "")
     return m.group(1) if m else ""
@@ -1083,7 +1125,7 @@ def catalog_html(cat, page=1):
         chunk, extra = _paginate(keys, page, "/opds/catalog/all?page=1")
         cards = "".join(
             f'<a class="card" href="/opds/book/{encode_path(k)}">'
-            f'<div class="ph"><img src="{_cover_url(merged[k][1][0]["rel"])}" alt="" loading="lazy"></div>'
+            f'<div class="ph"><img src="{_cover_url(_primary_vol(merged[k][1], *k.split("/", 1))["rel"])}" alt="" loading="lazy"></div>'
             f'<div class="t">{html.escape(k.split("/", 1)[1])}</div>'
             f'<div class="s">{html.escape(merged[k][0])} · {len(merged[k][1])} 卷</div></a>'
             for k in chunk)
@@ -1096,7 +1138,7 @@ def catalog_html(cat, page=1):
         chunk, extra = _paginate(keys, page, "/opds/catalog/" + quote(cat) + "?page=1")
         cards = "".join(
             f'<a class="card" href="/opds/book/{encode_path(cat + "/" + b)}">'
-            f'<div class="ph"><img src="{_cover_url(books[b][0]["rel"])}" alt="" loading="lazy">'
+            f'<div class="ph"><img src="{_cover_url(_primary_vol(books[b], cat, b)["rel"])}" alt="" loading="lazy">'
             f'<span class="badge">{len(books[b])} 卷</span></div>'
             f'<div class="t">{html.escape(b)}</div>'
             f'<div class="s">{len(books[b])} 卷</div></a>'
@@ -1131,7 +1173,8 @@ def book_html(rel, page=1):                                # page 参数保留�
     if vols is None:
         return None
     total_size = sum(v["size"] for v in vols)
-    meta = get_epub_meta(vols[0]["rel"]) if vols else {}
+    primary = _primary_vol(vols, cat, book)               # hero 封面也用「主卷」
+    meta = get_epub_meta(primary["rel"]) if primary else {}
     author = meta.get("creator", "")
     desc = meta.get("description", "")
     zip_url = "/zip/" + encode_path(rel)
@@ -1151,7 +1194,7 @@ def book_html(rel, page=1):                                # page 参数保留�
         f'<a href="/opds/catalog/{quote(cat)}">{html.escape(cat)}</a><span>/</span>'
         f'<span>{html.escape(book)}</span></div>'
         '<div class="hero">'
-        f'<div class="ph"><img src="{_cover_url(vols[0]["rel"])}" alt=""></div>'
+        f'<div class="ph"><img src="{_cover_url(primary["rel"])}" alt=""></div>'
         '<div class="info">'
         f"<h1>{html.escape(book)}</h1>"
         + meta_lines + desc_html +
