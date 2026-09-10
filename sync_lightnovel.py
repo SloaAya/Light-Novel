@@ -31,6 +31,14 @@ Light-Novel GitHub 自动同步与监控工具（增强版）
   python sync_lightnovel.py --opds           # 同步 + 监控 + 顺带开启 OPDS 书源（手机端）
   python sync_lightnovel.py --opds-only      # 只开 OPDS 书源，不做同步
 
+D 盘 → F 盘网盘镜像（增删改查 + 冲突检测，D 盘为唯一数据源）：
+  python sync_lightnovel.py --mirror-status       # 查：只读差异报告，不动任何文件
+  python sync_lightnovel.py --mirror-f            # 执行一次完整镜像（增 / 改 / 删）
+  python sync_lightnovel.py --mirror-f --mirror-dry-run    # 只预演，不落盘
+  python sync_lightnovel.py --mirror-f --mirror-no-delete  # 只增改，跳过删除
+删除为「软删除」：文件移入 F:\\LightNovel\\.trash\\<时间戳>\\ 保留 30 天，可随时恢复。
+审计日志：.autosync/mirror.log（JSON Lines，逐条记录增/改/删/跳过/失败）。
+
 OPDS 书源（详见 opds_server.py）：
   把书库发布为标准 OPDS 目录，手机阅读器（静读天下 / Lithium / KyBook 等）
   订阅后可直接浏览并下载 epub。默认 http://<本机IP>:8080/
@@ -44,6 +52,7 @@ import os
 import re
 import sys
 import time
+import json
 import shutil
 import subprocess
 import logging
@@ -105,6 +114,18 @@ MAX_DELETIONS_GUARD = 100      # 单次提交允许的最大删除文件数（�
 
 LOG_DIR       = os.path.join(TARGET_DIR, ".autosync")
 LOG_FILE      = os.path.join(LOG_DIR, "sync.log")
+
+# ---- F 盘镜像（增删改查 + 冲突检测）相关 ----
+MIRROR_LOG_FILE    = os.path.join(LOG_DIR, "mirror.log")          # 结构化审计日志（JSON Lines）
+MIRROR_STATE_FILE  = os.path.join(LOG_DIR, "mirror_state.json")   # 上次镜像状态（供「查」快速读取）
+MIRROR_MANIFEST    = os.path.join(LOG_DIR, "mirror_manifest.json")  # 镜像清单：本工具曾写入 F 盘的文件
+MIRROR_REPORT_FILE = os.path.join(LOG_DIR, "mirror_report.json")  # 最近一次 查 / 同步 完整报告
+F_TRASH_ROOT       = os.path.join(F_TARGET_ROOT, ".trash")        # F 盘回收站：删除先移入，可恢复
+MAX_MIRROR_DELETIONS  = 200     # 单次镜像删除上限；超过判定为异常，拒绝执行并告警
+TRASH_KEEP_DAYS       = 30      # 回收站保留天数，超时自动清理
+MTIME_TOLERANCE       = 2       # mtime 容差（秒）：网络盘/挂载盘常有精度损失
+F_RECENT_PROTECT_SEC  = 86400   # F 侧 24h 内新建/修改的文件不自动删除（防误删）
+CONFLICT_MTIME_SLACK  = 5       # F 侧 mtime 比 D 侧新超过此值且大小不同 → 判定为冲突
 
 # 可选：GitHub Personal Access Token（默认留空，使用系统凭据管理器 / SSH）。
 # ⚠ 令牌等同密码：本文件本身会被同步进仓库，请务必保持为空，
@@ -540,7 +561,9 @@ def _default_readme(done, ongoing):
         "| --- | --- |\n"
         "| 📥 实时监控 | `轻小说/已完结` 与 `轻小说/未完结` 目录有变动即自动触发同步 |\n"
         "| 🔄 GitHub 同步 | 自动提交并推送；以本地为准，远程多余文件自动清理 |\n"
-        "| ☁️ 网盘备份 | 自动镜像到网盘 `F:\\LightNovel`（CloudDrive2） |\n"
+        "| ☁️ 网盘备份 | 自动镜像到网盘 `F:\\LightNovel`（CloudDrive2），支持增 / 改 / 删 全量同步 |\n"
+        "| 🗑️ 软删除 | F 盘多余文件移入 `.trash`（保留 30 天可恢复），不做不可逆删除 |\n"
+        "| ⚠️ 冲突检测 | F 侧被独立修改、清单外孤儿文件均会告警；近期外来文件自动保护 |\n"
         "| 📝 书单维护 | 本 README 的两个书单区块自动刷新，其余内容保持不变 |\n"
         "| 🛡️ 安全护栏 | 大规模删除保护 + 系统垃圾文件（desktop.ini 等）自动排除 |\n\n"
         "---\n\n"
@@ -550,29 +573,337 @@ def _default_readme(done, ongoing):
     )
 
 
-def mirror_dir(src, dst):
-    """将 src 目录树增量镜像到 dst（仅复制缺失 / 变化的文件），返回复制文件数。"""
-    if not os.path.isdir(src):
-        return 0
-    copied = 0
-    for root, _dirs, files in os.walk(src):
+# ---------------------------- F 盘镜像：工具函数 ----------------------------
+def _now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def scan_tree(root, exclude=EXCLUDE_FILE_NAMES):
+    """扫描目录树，返回 {相对路径(以 / 分隔): {"size": int, "mtime": float}}。
+    目录不存在或不可读时返回空字典（不抛异常）。只读操作，不会修改任何文件。"""
+    tree = {}
+    if not root or not os.path.isdir(root):
+        return tree
+    for r, _dirs, files in os.walk(root):
         for f in files:
-            if f.lower() in EXCLUDE_FILE_NAMES:
-                continue  # 系统垃圾文件不同步到网盘
-            sf = os.path.join(root, f)
-            rel = os.path.relpath(sf, src)
-            tf = os.path.join(dst, rel)
-            need = True
-            if os.path.exists(tf):
-                ss = os.stat(sf)
-                ts = os.stat(tf)
-                if ss.st_size == ts.st_size and abs(ss.st_mtime - ts.st_mtime) < 2:
-                    need = False
-            if need:
-                os.makedirs(os.path.dirname(tf), exist_ok=True)
-                shutil.copy2(sf, tf)
-                copied += 1
-    return copied
+            if f.lower() in exclude:
+                continue
+            fp = os.path.join(r, f)
+            try:
+                st = os.stat(fp)
+            except OSError as exc:
+                log.warning("无法读取文件信息 %s：%s", fp, exc)
+                continue
+            rel = os.path.relpath(fp, root).replace("\\", "/")
+            tree[rel] = {"size": st.st_size, "mtime": st.st_mtime}
+    return tree
+
+
+def _append_mirror_log(records):
+    """把操作明细以 JSON Lines 追加写入 .autosync/mirror.log（审计日志）。"""
+    if not records:
+        return
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(MIRROR_LOG_FILE, "a", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log.warning("写入镜像审计日志失败：%s", exc)
+
+
+def _save_json(path, data):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)          # 原子替换，避免写一半被读
+    except OSError as exc:
+        log.warning("写入 %s 失败：%s", path, exc)
+
+
+# ---------------------------- 镜像清单：区分「我们放的」与「F 盘外来文件」 ----------------------------
+def _load_manifest():
+    """读取镜像清单 {分类: set(相对路径)}。文件不存在 / 损坏时返回空 dict。"""
+    if not os.path.isfile(MIRROR_MANIFEST):
+        return {}
+    try:
+        with open(MIRROR_MANIFEST, "r", encoding="utf-8") as fh:
+            return {k: set(v) for k, v in json.load(fh).items()}
+    except (OSError, ValueError) as exc:
+        log.warning("镜像清单读取失败（将按空清单处理）：%s", exc)
+        return {}
+
+
+def _save_manifest(manifest):
+    _save_json(MIRROR_MANIFEST, {k: sorted(v) for k, v in manifest.items()})
+
+
+def ensure_manifest_seeded():
+    """首次运行时用 F 盘现有文件初始化清单（历史文件都是本工具镜像过去的）。
+    之后由每次同步增量维护。返回 True 表示本次发生了初始化。"""
+    if os.path.isfile(MIRROR_MANIFEST) or not os.path.isdir(F_TARGET_ROOT):
+        return False
+    manifest = {}
+    for cat, dst in F_CATEGORY_DIRS.items():
+        manifest[cat] = set(scan_tree(dst).keys())
+    _save_manifest(manifest)
+    log.info("首次运行：已用 F 盘现有文件初始化镜像清单（%s）。",
+             {k: len(v) for k, v in manifest.items()})
+    return True
+
+
+# ---------------------------- 查：差异比对（只读） ----------------------------
+def plan_mirror(src, dst, known=None):
+    """比对源（D）与目标（F），生成「增 / 改 / 删」计划并检测冲突。
+    known = 镜像清单中该分类「本工具曾写入」的相对路径集合；用于区分
+            「我们放上去、D 盘已删 → 可安全删除」与「F 盘外来文件 → 保护并告警」。
+    纯只读，绝不修改任何文件。返回结构化计划 dict。"""
+    s_tree = scan_tree(src)
+    d_tree = scan_tree(dst)
+    now = time.time()
+
+    add, update, keep, delete, conflicts = [], [], [], [], []
+
+    for rel, sm in s_tree.items():
+        dm = d_tree.get(rel)
+        if dm is None:
+            add.append({"rel": rel, "size": sm["size"]})
+            continue
+        # 改：大小不同 或 mtime 差异超过容差
+        if dm["size"] == sm["size"] and abs(dm["mtime"] - sm["mtime"]) < MTIME_TOLERANCE:
+            keep.append(rel)
+            continue
+        update.append({
+            "rel": rel,
+            "src_size": sm["size"], "dst_size": dm["size"],
+            "src_mtime": sm["mtime"], "dst_mtime": dm["mtime"],
+        })
+        # 冲突检测 1：F 侧比 D 侧更新且大小不同 → F 侧可能被独立修改过
+        if dm["size"] != sm["size"] and (dm["mtime"] - sm["mtime"]) > CONFLICT_MTIME_SLACK:
+            conflicts.append({
+                "kind": "F_NEWER",
+                "rel": rel,
+                "detail": "F 盘副本比 D 盘源文件更新且大小不同，D 盘为唯一数据源，本次将以 D 盘覆盖",
+                "dst_size": dm["size"], "src_size": sm["size"],
+                "dst_mtime": dm["mtime"], "src_mtime": sm["mtime"],
+            })
+
+    for rel, dm in d_tree.items():
+        if rel in s_tree:
+            continue
+        rec = {"rel": rel, "size": dm["size"], "mtime": dm["mtime"],
+               "ours": bool(known is not None and rel in known)}
+        if not rec["ours"] and (known is not None) and (now - dm["mtime"]) < F_RECENT_PROTECT_SEC:
+            # 冲突检测 2：既不在镜像清单里、又是 24h 内新建/修改 → F 盘独有资料，先保护不删
+            rec["protected"] = True
+            conflicts.append({
+                "kind": "F_FOREIGN_RECENT",
+                "rel": rel,
+                "detail": "该文件仅存在于 F 盘、不在镜像清单中且 24 小时内被新建/修改，"
+                          "疑似 F 盘独有资料，已跳过删除，请人工确认",
+                "dst_size": dm["size"], "dst_mtime": dm["mtime"],
+            })
+        elif not rec["ours"] and (known is not None):
+            # 冲突检测 3：清单外的历史遗留文件，D 盘没有 → 按 D 为准删除，但明确告警
+            rec["protected"] = False
+            conflicts.append({
+                "kind": "F_ORPHAN",
+                "rel": rel,
+                "detail": "该文件仅存在于 F 盘且不在镜像清单中（历史遗留/外部写入），"
+                          "按 D 盘为唯一数据源将删除之",
+                "dst_size": dm["size"], "dst_mtime": dm["mtime"],
+            })
+        else:
+            rec["protected"] = False
+        delete.append(rec)
+
+    add.sort(key=lambda x: x["rel"])
+    update.sort(key=lambda x: x["rel"])
+    delete.sort(key=lambda x: x["rel"])
+    return {
+        "src": src, "dst": dst, "scanned_at": _now_iso(),
+        "add": add,
+        "update": update,
+        "delete": delete,
+        "conflicts": conflicts,
+        "counts": {
+            "add": len(add),
+            "update": len(update),
+            "delete": sum(1 for d in delete if not d["protected"]),
+            "protected": sum(1 for d in delete if d["protected"]),
+            "unchanged": len(keep),
+            "conflict": len(conflicts),
+            "src_total": len(s_tree),
+            "dst_total": len(d_tree),
+        },
+    }
+
+
+def mirror_query():
+    """查：汇总 D→F 全部分类目录的差异，返回总报告 dict（只读）。"""
+    report = {
+        "generated_at": _now_iso(),
+        "source_root": LIGHT_NOVEL_DIR,
+        "target_root": F_TARGET_ROOT,
+        "f_mounted": os.path.isdir(F_TARGET_ROOT),
+        "categories": {},
+        "counts": {"add": 0, "update": 0, "delete": 0, "protected": 0, "orphan": 0,
+                   "unchanged": 0, "conflict": 0, "src_total": 0, "dst_total": 0},
+    }
+    if not report["f_mounted"]:
+        return report
+    manifest = _load_manifest()
+    for cat, src in CATEGORY_DIRS.items():
+        plan = plan_mirror(src, F_CATEGORY_DIRS[cat], known=manifest.get(cat))
+        plan["counts"]["orphan"] = sum(1 for d in plan["delete"]
+                                       if not d["ours"] and not d["protected"])
+        report["categories"][cat] = plan
+        for k in report["counts"]:
+            report["counts"][k] += plan["counts"].get(k, 0)
+    _save_json(MIRROR_REPORT_FILE, report)
+    return report
+
+
+# ---------------------------- 删除：软删除到回收站 ----------------------------
+def _move_to_trash(abs_path, rel, trash_batch):
+    """把 F 侧待删文件移入回收站目录（可恢复），而不是直接 os.remove。"""
+    target = os.path.join(trash_batch, rel.replace("/", os.sep))
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+    except OSError as exc:
+        log.warning("创建回收站目录失败 %s：%s", os.path.dirname(target), exc)
+        return False
+    try:
+        os.chmod(abs_path, 0o666)    # 去掉只读属性（Windows 只读文件无法移动/删除）
+    except OSError:
+        pass
+    try:
+        shutil.move(abs_path, target)
+        return True
+    except OSError as exc:
+        log.warning("移入回收站失败 %s：%s", abs_path, exc)
+        return False
+
+
+def _purge_old_trash():
+    """清理超过 TRASH_KEEP_DAYS 天的回收站批次目录。"""
+    if not os.path.isdir(F_TRASH_ROOT):
+        return 0
+    cutoff = time.time() - TRASH_KEEP_DAYS * 86400
+    purged = 0
+    for name in os.listdir(F_TRASH_ROOT):
+        batch = os.path.join(F_TRASH_ROOT, name)
+        if not os.path.isdir(batch):
+            continue
+        try:
+            if os.stat(batch).st_mtime < cutoff:
+                shutil.rmtree(batch, ignore_errors=True)
+                purged += 1
+        except OSError:
+            pass
+    if purged:
+        log.info("已清理 %d 个过期回收站批次（保留期 %d 天）", purged, TRASH_KEEP_DAYS)
+    return purged
+
+
+def _prune_empty_dirs(dst):
+    """删除 dst 下因文件被删而变空的目录（自底向上），返回删除目录数。"""
+    removed = 0
+    for r, dirs, files in os.walk(dst, topdown=False):
+        if os.path.abspath(r) == os.path.abspath(dst):
+            continue
+        try:
+            if not dirs and not files:
+                os.rmdir(r)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+# ---------------------------- 增 / 改 / 删：执行 ----------------------------
+def apply_mirror(plan, dry_run=False, allow_delete=True):
+    """按计划执行镜像。dry_run=True 时只记录不落盘。返回执行结果 dict。"""
+    src, dst = plan["src"], plan["dst"]
+    cat = os.path.basename(dst)
+    batch = os.path.join(F_TRASH_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S"), cat)
+    result = {"added": [], "updated": [], "deleted": [], "skipped": [],
+              "failed": [], "dirs_removed": 0, "dry_run": dry_run}
+    records = []
+
+    def _rec(op, rel, status, extra=None):
+        rec = {"ts": _now_iso(), "category": cat, "op": op, "rel": rel,
+               "status": status, "dry_run": dry_run}
+        if extra:
+            rec.update(extra)
+        records.append(rec)
+        return rec
+
+    # 删除保护：数量异常时拒绝执行（防止 D 盘挂载失败 / 目录被误换导致全量删除）
+    del_count = plan["counts"]["delete"]
+    if allow_delete and del_count > MAX_MIRROR_DELETIONS:
+        log.error("【安全护栏】检测到 %s 有 %d 个待删文件，超过上限 %d，本次拒绝删除。"
+                  "请确认 D 盘数据源完整后再运行；如需强制执行请调大 MAX_MIRROR_DELETIONS。",
+                  cat, del_count, MAX_MIRROR_DELETIONS)
+        allow_delete = False
+        result["guard_triggered"] = True
+
+    # ---- 增 / 改 ----
+    for item in plan["add"] + plan["update"]:
+        rel = item["rel"]
+        op = "add" if item in plan["add"] else "update"
+        sf = os.path.join(src, rel.replace("/", os.sep))
+        tf = os.path.join(dst, rel.replace("/", os.sep))
+        if dry_run:
+            result["skipped"].append(rel); _rec(op, rel, "dry-run"); continue
+        try:
+            os.makedirs(os.path.dirname(tf), exist_ok=True)
+            shutil.copy2(sf, tf)
+            (result["added"] if op == "add" else result["updated"]).append(rel)
+            _rec(op, rel, "ok", {"size": item.get("size") or item.get("src_size")})
+        except OSError as exc:
+            result["failed"].append({"rel": rel, "op": op, "error": str(exc)})
+            _rec(op, rel, "failed", {"error": str(exc)})
+            log.warning("镜像 %s 失败（%s）：%s", rel, op, exc)
+
+    # ---- 删（软删除到回收站）----
+    if not allow_delete:
+        for d in plan["delete"]:
+            if not d["protected"]:
+                result["skipped"].append(d["rel"])
+                _rec("delete", d["rel"], "skipped", {"reason": "未开启删除或触发安全护栏"})
+    else:
+        for d in plan["delete"]:
+            rel = d["rel"]
+            if d.get("protected"):
+                result["skipped"].append(rel)
+                _rec("delete", rel, "skipped", {"reason": "F 侧近期修改，保护中（冲突）"})
+                continue
+            fp = os.path.join(dst, rel.replace("/", os.sep))
+            if dry_run:
+                result["skipped"].append(rel); _rec("delete", rel, "dry-run"); continue
+            if _move_to_trash(fp, rel, batch):
+                result["deleted"].append(rel)
+                _rec("delete", rel, "ok", {"trash": os.path.join(batch, rel.replace("/", os.sep))})
+            else:
+                result["failed"].append({"rel": rel, "op": "delete", "error": "移入回收站失败"})
+                _rec("delete", rel, "failed")
+
+    # ---- 清理空目录 ----
+    if allow_delete and not dry_run:
+        result["dirs_removed"] = _prune_empty_dirs(dst)
+
+    _append_mirror_log(records)
+    return result
+
+
+def mirror_dir(src, dst, dry_run=False, allow_delete=True):
+    """兼容旧接口：把 src 增量镜像到 dst（默认含删除传播）。返回复制文件数。"""
+    plan = plan_mirror(src, dst)
+    res = apply_mirror(plan, dry_run=dry_run, allow_delete=allow_delete)
+    return len(res["added"]) + len(res["updated"])
 
 
 def _purge_excluded_files(dst):
@@ -599,22 +930,61 @@ def _purge_excluded_files(dst):
     return removed
 
 
-def sync_to_f():
-    """把 轻小说 下的两个分类镜像到 F 盘网络云盘（CloudDrive2）。
+def sync_to_f(dry_run=False, allow_delete=True):
+    """把 轻小说 下的两个分类完整镜像到 F 盘网络云盘（CloudDrive2）。
+    覆盖「增删改查」四类操作：
+      增 = D 有 F 无 → 复制
+      改 = 大小或 mtime 不同 → 覆盖（同时检测 F 侧更新的冲突）
+      删 = F 有 D 无 → 移入 F:\\LightNovel\\.trash（可恢复），并清理空目录
+      查 = 每轮都生成差异报告并写入审计日志
     返回 True/False（F 盘不可用时返回 False，但不影响 GitHub 推送）。"""
     if not os.path.isdir(F_TARGET_ROOT):
         log.warning("未找到网络云盘 %s（CD2 未挂载？），跳过 F 盘镜像。", F_TARGET_ROOT)
         return False
+    tag = "[预演] " if dry_run else ""
     ok = True
+    summary = []
+    manifest = _load_manifest()
+    if not manifest:
+        ensure_manifest_seeded()
+        manifest = _load_manifest()
     for cat, src in CATEGORY_DIRS.items():
         dst = F_CATEGORY_DIRS[cat]
         try:
-            copied = mirror_dir(src, dst)
-            purged = _purge_excluded_files(dst)
-            log.info("已镜像到 F 盘 %s（新增/更新 %d 个文件，清理垃圾文件 %d 个）", dst, copied, purged)
+            known = manifest.setdefault(cat, set())
+            plan = plan_mirror(src, dst, known=known)
+            c = plan["counts"]
+            for cf in plan["conflicts"]:
+                log.warning("%s镜像冲突（%s）：%s —— %s", tag, cat, cf["rel"], cf["detail"])
+            res = apply_mirror(plan, dry_run=dry_run, allow_delete=allow_delete)
+            purged = 0 if dry_run else _purge_excluded_files(dst)
+            if dry_run:
+                log.info("%s%s 计划：增 %d / 改 %d / 删 %d（清单外 %d）/ 保护 %d / 一致 %d / 冲突 %d",
+                         tag, dst, c["add"], c["update"], c["delete"],
+                         c.get("orphan", 0), c["protected"], c["unchanged"], c["conflict"])
+            else:
+                log.info("%s已镜像到 F 盘 %s（实际：增 %d / 改 %d / 删 %d / 失败 %d；"
+                         "一致 %d，冲突 %d，空目录清理 %d，垃圾文件清理 %d）",
+                         tag, dst, len(res["added"]), len(res["updated"]), len(res["deleted"]),
+                         len(res["failed"]), c["unchanged"], c["conflict"],
+                         res["dirs_removed"], purged)
+            if res["failed"]:
+                ok = False
+            # 维护镜像清单：新写入的记入，已删除的移出
+            known.update(res["added"])
+            known.update(res["updated"])
+            for rel in res["deleted"]:
+                known.discard(rel)
+            summary.append({"category": cat, "counts": c, "result": {
+                "added": len(res["added"]), "updated": len(res["updated"]),
+                "deleted": len(res["deleted"]), "failed": len(res["failed"])}})
         except Exception as exc:  # F 盘网络异常不应阻断主流程
             log.warning("镜像到 F 盘 %s 失败：%s", dst, exc)
             ok = False
+    if not dry_run:
+        _purge_old_trash()
+        _save_manifest(manifest)
+        _save_json(MIRROR_STATE_FILE, {"last_sync": _now_iso(), "categories": summary})
     return ok
 
 
@@ -817,6 +1187,39 @@ def show_status():
     log.info("日志文件：%s", LOG_FILE)
 
 
+# ---------------------------- F 盘镜像状态（查） ----------------------------
+def show_mirror_status():
+    """查：打印 D 盘与 F 盘的差异报告（只读，不改动任何文件）。"""
+    rep = mirror_query()
+    c = rep["counts"]
+    log.info("===== D 盘 → F 盘 镜像差异报告 =====")
+    log.info("数据源：%s", rep["source_root"])
+    log.info("备份目标：%s（%s）", rep["target_root"],
+             "已挂载" if rep["f_mounted"] else "未挂载 / 不可用")
+    if not rep["f_mounted"]:
+        log.warning("F 盘不可用，无法比对。请检查 CloudDrive2 是否已挂载。")
+        return rep
+    for cat, plan in rep["categories"].items():
+        pc = plan["counts"]
+        log.info("  [%s] D 盘 %d 个 / F 盘 %d 个 → 增 %d、改 %d、删 %d（其中清单外 %d）、"
+                 "保护 %d、一致 %d、冲突 %d",
+                 cat, pc["src_total"], pc["dst_total"], pc["add"], pc["update"],
+                 pc["delete"], pc.get("orphan", 0), pc["protected"], pc["unchanged"], pc["conflict"])
+    log.info("  合计：增 %d / 改 %d / 删 %d / 一致 %d / 冲突 %d",
+             c["add"], c["update"], c["delete"], c["unchanged"], c["conflict"])
+    for cat, plan in rep["categories"].items():
+        for cf in plan["conflicts"]:
+            log.warning("  冲突·%s [%s] %s：%s", cat, cf["kind"], cf["rel"], cf["detail"])
+        for item in plan["delete"][:20]:
+            if not item["protected"]:
+                log.info("  待删·%s：%s", cat, item["rel"])
+        if plan["counts"]["delete"] > 20:
+            log.info("  …… 待删清单已截断，完整列表见 %s", MIRROR_REPORT_FILE)
+    log.info("完整报告：%s", MIRROR_REPORT_FILE)
+    log.info("审计日志：%s", MIRROR_LOG_FILE)
+    return rep
+
+
 # ---------------------------- 主流程 ----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Light-Novel GitHub 自动同步与监控工具（增强版）")
@@ -824,6 +1227,14 @@ def main():
     parser.add_argument("--monitor-only", action="store_true", help="不复制种子，仅同步当前状态并持续监控")
     parser.add_argument("--init", action="store_true", help="仅初始化 / 校验仓库与远程配置")
     parser.add_argument("--status", action="store_true", help="查看仓库状态与监控快照")
+    parser.add_argument("--mirror-f", action="store_true",
+                        help="执行一次 D 盘 → F 盘的完整镜像（增 / 改 / 删 / 查）后退出")
+    parser.add_argument("--mirror-status", action="store_true",
+                        help="查看 D 盘与 F 盘的差异报告（只读，不做任何改动）")
+    parser.add_argument("--mirror-dry-run", action="store_true",
+                        help="配合 --mirror-f：只预演不落盘")
+    parser.add_argument("--mirror-no-delete", action="store_true",
+                        help="配合 --mirror-f：只做增 / 改，跳过删除")
     parser.add_argument("--opds", action="store_true",
                         help="同步的同时启动 OPDS 书源服务（手机阅读器可订阅）")
     parser.add_argument("--opds-only", action="store_true",
@@ -850,6 +1261,14 @@ def main():
     if args.status:
         ensure_repo()
         show_status()
+        return
+
+    if args.mirror_status:
+        show_mirror_status()
+        return
+
+    if args.mirror_f:
+        sync_to_f(dry_run=args.mirror_dry_run, allow_delete=not args.mirror_no_delete)
         return
 
     if not ensure_repo():
