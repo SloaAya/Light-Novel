@@ -1661,9 +1661,10 @@ def find_cloudflared():
     return None
 
 
-def start_named_tunnel(port, name=NAMED_TUNNEL_NAME, timeout=60):
+def start_named_tunnel(port, name=NAMED_TUNNEL_NAME, timeout=60, on_connected=None):
     """拉起**固定域名**的 named tunnel -> (proc, public_url)。
-    前提：已跑过 setup_named_tunnel.py 完成登录、建隧道、加 DNS 记录。"""
+    前提：已跑过 setup_named_tunnel.py 完成登录、建隧道、加 DNS 记录。
+    on_connected: 首次连接成功时的回调（只会触发一次）。"""
     exe = find_cloudflared()
     if not exe:
         log.error("未找到 cloudflared，无法启动 named tunnel。")
@@ -1685,10 +1686,17 @@ def start_named_tunnel(port, name=NAMED_TUNNEL_NAME, timeout=60):
         return None, None
 
     def reader():
+        fired = False
         try:
             for line in proc.stdout:
                 if re.search(r"(Registered tunnel connection|Connection .* registered)", line, re.I):
                     log.info("named tunnel 已连接：https://%s/", host)
+                    if on_connected and not fired:
+                        fired = True
+                        try:
+                            on_connected()
+                        except Exception:
+                            pass
         except (ValueError, OSError):
             pass
 
@@ -1837,9 +1845,22 @@ EXTERNET_NOTE = """
 
 
 # ---------------------------- CLI ----------------------------
+def _hide_console():
+    """隐藏本进程的控制台窗口（Windows）。无控制台（如 VBS 后台启动）时为无操作。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)   # SW_HIDE
+            log.info("服务运行正常，控制台窗口已自动隐藏（停止服务请运行 stop_opds.bat）。")
+    except Exception as exc:
+        log.warning("隐藏控制台窗口失败：%s", exc)
+
+
 def _ensure_logging():
     if not log.handlers:
-        os.makedirs(LOG_DIR, exist_ok=True)
         log.setLevel(logging.INFO)
         fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
         fh = logging.FileHandler(os.path.join(LOG_DIR, "opds.log"), encoding="utf-8")
@@ -1850,8 +1871,10 @@ def _ensure_logging():
         log.addHandler(sh)
 
 
-def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False):
-    """打印订阅信息并以**阻塞**方式运行服务（供 CLI 和 sync_lightnovel.py 复用）。"""
+def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False,
+                hide_window=False):
+    """打印订阅信息并以**阻塞**方式运行服务（供 CLI 和 sync_lightnovel.py 复用）。
+    hide_window=True 时，named tunnel 连接成功后自动隐藏控制台窗口（服务继续后台运行）。"""
     os.makedirs(COVER_CACHE_DIR, exist_ok=True)
     lib = get_library(force=True)
     n_books = sum(len(b) for b in lib.values())
@@ -1872,7 +1895,10 @@ def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False):
     cf_proc = None
     pub = public_url.rstrip("/") + "/" if public_url else ""
     if tunnel == "named":
-        cf_proc, url = start_named_tunnel(port)
+        def _on_tunnel_up():
+            if hide_window:
+                threading.Timer(3, _hide_console).start()   # 留 3 秒看清启动信息
+        cf_proc, url = start_named_tunnel(port, on_connected=_on_tunnel_up)
         if url:
             pub = url
             print(f"  固定公网地址：   {pub}")
@@ -1895,7 +1921,10 @@ def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False):
             print("  （未安装 segno/qrcode，跳过二维码，手动输入地址即可）")
     print(f"\n  书源地址： {subscribe}")
     print(f"  书库规模： {n_books} 部作品 / {n_vols} 卷")
-    print("  停止服务： Ctrl+C")
+    if hide_window and tunnel == "named":
+        print("  停止服务： 运行 stop_opds.bat（隧道连通后本窗口自动隐藏）")
+    else:
+        print("  停止服务： Ctrl+C")
     print("=" * 62 + "\n")
 
     try:
@@ -1915,6 +1944,9 @@ def main():
                     help="公网隧道：cloudflared=临时域名；named=固定域名（需先跑 setup_named_tunnel.py）")
     ap.add_argument("--public-url", default="", help="已知的公网地址，仅用于打印订阅地址/二维码")
     ap.add_argument("--no-qr", action="store_true", help="不打印二维码")
+    ap.add_argument("--hide-window", action="store_true",
+                    help="named tunnel 连接成功后自动隐藏控制台窗口（配合 run_named_tunnel.bat；"
+                         "停止服务用 stop_opds.bat）")
     ap.add_argument("--help-internet", action="store_true", help="打印外网接入方案说明后退出")
     args = ap.parse_args()
 
@@ -1924,7 +1956,8 @@ def main():
         print(EXTERNET_NOTE)
         return
 
-    run_service(args.port, args.bind, args.public_url, args.tunnel, args.no_qr)
+    run_service(args.port, args.bind, args.public_url, args.tunnel, args.no_qr,
+                hide_window=args.hide_window)
 
 
 if __name__ == "__main__":
