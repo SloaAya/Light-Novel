@@ -20,6 +20,7 @@
 <summary>📚 未完结作品</summary>
 
 - NO GAME NO LIFE
+- Silent Witch 沉默魔女的秘密
 - 三坪房间的侵略者！？
 - 不过是偶像！～但是果然颜值好高～
 - 和非常可爱的我交往吧！
