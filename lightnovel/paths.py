@@ -35,6 +35,9 @@ COVER_CACHE_DIR = os.path.join(LOG_DIR, "covers")
 META_CACHE_FILE = os.path.join(LOG_DIR, "meta_cache.json")
 # 「已读完」清单：管理员标记过的作品集合（键 = 分类/书名）。运行时状态，不进仓库。
 FINISHED_FILE   = os.path.join(LOG_DIR, "finished.json")
+# 新增卷提示：书库快照 + 「有新卷、还没点进去看」的作品（键同样 = 分类/书名）。
+# 同样落在 .autosync/，不会被同步到 GitHub / F 盘。
+UPDATES_FILE    = os.path.join(LOG_DIR, "updates.json")
 # 单实例锁的路径由 lightnovel.sync.monitor.lock_path() 现算（跟着 LOG_DIR 走），
 # 面板也从那里取，保证「监控写哪儿、面板就读哪儿」只有一个真源。
 

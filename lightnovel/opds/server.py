@@ -48,6 +48,7 @@ from .library import (
     resolve_under,
 )
 from .finished import normalize_key, toggle_finished
+from . import updates as upd
 from .feeds import (
     _accept_wants_xml,
     book_html,
@@ -378,6 +379,25 @@ class OPDSHandler(BaseHTTPRequestHandler):
                 on = toggle_finished(key)
                 log.info("「已读完」标记 %s → %s", key, "已读完" if on else "未读完")
                 self._redirect(self._local_back(form.get("back", ["/"])[0], "/opds/read"))
+                return
+            if path == "/opds/updates/clear":
+                # 与「已读完」同一套三道关：已认证 + 管理员 + 同源。
+                if role != "admin":
+                    self._forbidden("只有管理员可以清除新增卷提示。")
+                    return
+                if not self._same_origin():
+                    self._send(403, "<h1>403</h1><p>跨站请求被拒绝</p>",
+                               "text/html; charset=utf-8")
+                    return
+                form = self._form()
+                raw = form.get("key", [""])[0].strip()
+                if raw and not normalize_key(raw):
+                    self._send(400, "<h1>400</h1><p>作品参数不合法</p>",
+                               "text/html; charset=utf-8")
+                    return
+                n = upd.clear(normalize_key(raw) if raw else None)
+                log.info("清除新增卷提示：%s（%d 部）", raw or "全部", n)
+                self._redirect(self._local_back(form.get("back", ["/"])[0], "/"))
                 return
             self._notfound(path)
         except (BrokenPipeError, ConnectionResetError):

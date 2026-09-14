@@ -31,6 +31,7 @@ from .library import (
     human_size,
 )
 from .finished import load_finished
+from . import updates as upd
 
 # ---------------------------- Feed 生成 ----------------------------
 def _now_iso():
@@ -161,29 +162,35 @@ def feed_finished(page=1):
                  "/opds/read?page=" + str(page), OPDS_NAV_TYPE, extra + body)
 
 
+def _upd_suffix(pend, key):
+    n = len(pend[key]["vols"]) if key in pend else 0
+    return f" · 有更新 +{n} 卷" if n else ""
+
+
 def feed_catalog(cat, page=1):
     lib = get_library()
+    pend = upd.observe()
     if cat == "all":
         merged = {}
         for c, bs in lib.items():
             for b, vols in bs.items():
                 merged[f"{c}/{b}"] = (c, len(vols))
-        keys = sorted(merged.keys())
+        keys = upd.order_keys(sorted(merged.keys()), pend)      # 与网页版同一套排序
         chunk, extra = _paginate(keys, page, "/opds/catalog/all?page=1")
         body = "".join(
             nav_entry("urn:ln:book:" + quote(k), k.split("/", 1)[1], "/opds/book/" + encode_path(k),
-                      f"{merged[k][0]} · {merged[k][1]} 卷")
+                      f"{merged[k][0]} · {merged[k][1]} 卷" + _upd_suffix(pend, k))
             for k in chunk)
         return _feed("urn:ln:cat:all", f"{SERVER_TITLE} · 全部作品", [],
                      "/opds/catalog/all?page=" + str(page), OPDS_ACQ_TYPE, extra + body)
     if cat not in CATEGORY_DIRS:
         return None
     books = lib.get(cat, {})
-    keys = sorted(books.keys(), key=lambda s: s.lower())
+    keys = upd.order_keys([f"{cat}/{k}" for k in sorted(books.keys(), key=lambda s: s.lower())], pend)
     chunk, extra = _paginate(keys, page, "/opds/catalog/" + quote(cat) + "?page=1")
     body = "".join(
-        nav_entry("urn:ln:book:" + quote(f"{cat}/{k}"), k, "/opds/book/" + encode_path(f"{cat}/{k}"),
-                  f"{len(books[k])} 卷")
+        nav_entry("urn:ln:book:" + quote(k), k.split("/", 1)[1], "/opds/book/" + encode_path(k),
+                  f"{len(books[k.split('/', 1)[1]])} 卷" + _upd_suffix(pend, k))
         for k in chunk)
     return _feed("urn:ln:cat:" + quote(cat), f"{SERVER_TITLE} · {cat}", [],
                  "/opds/catalog/" + quote(cat) + "?page=" + str(page), OPDS_NAV_TYPE, extra + body)
@@ -251,6 +258,7 @@ SITE_CSS = """
 :root{
   --bg:#f2f4f7; --card:#fff; --text:#1f2328; --muted:#6b7785; --border:#e5e7eb;
   --accent:#0a66c2; --accent2:#004182; --accent-fg:#fff; --hover:#eef4fb;
+  --new:#bc4c00; --new-strip:rgba(188,76,0,.92);
   --shadow:0 1px 2px rgba(16,22,26,.06),0 2px 8px rgba(16,22,26,.05);
   --shadow-sm:0 1px 2px rgba(16,22,26,.05);
   --radius:12px;
@@ -259,6 +267,7 @@ SITE_CSS = """
   :root{
     --bg:#0e1116; --card:#171c23; --text:#e8edf3; --muted:#9aa4b0; --border:#2c333d;
     --accent:#4c9df0; --accent2:#2f7fd0; --accent-fg:#0e1116; --hover:#1d2530;
+    --new:#ff9d5c; --new-strip:rgba(150,58,0,.94);
     --shadow:none; --shadow-sm:none;
   }
 }
@@ -341,6 +350,15 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .card .s{margin-top:3px;font-size:11px;color:var(--muted)}
 .card .s .fin{color:#1a7f37;font-weight:500}
+.card .s .newt{color:var(--new);font-weight:500}
+/* 封面左下角的「有更新」条 —— 位置刻意避开左上角的操作按钮与右上角的卷数角标 */
+.card .ph .upd{position:absolute;left:0;right:0;bottom:0;padding:4px 7px 3px;
+  font-size:10px;font-weight:600;color:#fff;letter-spacing:.2px;
+  background:linear-gradient(180deg,transparent,var(--new-strip) 62%);
+  text-shadow:0 1px 2px rgba(0,0,0,.35)}
+/* 有更新的卡再描一道暖色边。放在上面 .card:hover .ph 之后，否则悬停时描边会被覆盖掉。 */
+.card.upd .ph{box-shadow:0 0 0 2px var(--new),var(--shadow)}
+.card.upd:hover .ph{box-shadow:0 0 0 2px var(--new),0 8px 18px rgba(16,22,26,.12)}
 
 /* 标记控件 .mkform/.mk：只在管理员页面渲染（见 _mark_form）。这里刻意不写任何
    带功能名的注释 —— CSS 对所有人下发，注释里的字样会漏进访客的页面源码里。 */
@@ -414,6 +432,11 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
 .group-head .gmeta::before{content:"";width:3px;height:3px;border-radius:50%;background:var(--muted);
   opacity:.5;flex-shrink:0}
 .group-head .gmeta:empty::before{display:none}
+/* 分组行上的「有更新 +N」药丸 + 新增卷行上的「新」标 */
+.group-head .gnew{font-size:11px;font-weight:600;color:#fff;background:var(--new);
+  padding:2px 8px;border-radius:20px;flex-shrink:0}
+.vol .meta .s .vnew{font-size:10.5px;font-weight:600;color:#fff;background:var(--new);
+  padding:1px 6px;border-radius:20px;flex-shrink:0}
 .group-body{display:none;padding:12px 8px 6px;border:1px solid var(--border);border-top:0;
   border-radius:0 0 12px 12px;background:var(--bg)}
 .group.open .group-body{display:block}
@@ -437,6 +460,19 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
 /* ---------- 工具条 ---------- */
 .bar{display:flex;align-items:center;gap:10px;margin:20px 0 14px;flex-wrap:wrap}
 .bar .spacer{flex:1}
+.bar .barupd{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0}
+.bar .barupd .cnt{font-size:12.5px;color:var(--new);font-weight:500}
+
+/* ---------- 详情页「本次新增」区块 ---------- */
+.updbox{margin:0 0 22px;padding:15px 17px;border:1px solid var(--new);
+  border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}
+.updbox .hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  font-size:14px;font-weight:600;margin-bottom:11px}
+.updbox .hd .dot{width:8px;height:8px;border-radius:50%;background:var(--new);flex-shrink:0}
+.updbox .hd .n{font-weight:400;font-size:12px;color:var(--muted)}
+.updbox .vol{margin-bottom:6px}
+.updbox .vol:last-child{margin-bottom:0}
+.updbox .vol .meta .s .sub2{color:var(--new)}
 
 /* ---------- 分页 ---------- */
 .pager{display:flex;justify-content:center;align-items:center;gap:10px;margin:30px 0 6px}
@@ -465,6 +501,10 @@ footer{margin-top:48px;padding:24px 16px;text-align:center;color:var(--muted);fo
   .grid{grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:14px 10px}
   .card .t{font-size:12px;line-height:1.3;-webkit-line-clamp:2}
   .card .ph .badge{font-size:10px;padding:2px 7px}
+  .card .ph .upd{font-size:9px;padding:3px 6px 2px}
+  .updbox{padding:12px 13px;margin-bottom:16px}
+  .updbox .hd{font-size:13px;margin-bottom:9px}
+  .group-head .gnew{font-size:10px;padding:1px 7px}
   .hero{gap:14px;padding:16px;align-items:stretch;border-radius:10px}
   .hero .ph{width:108px;flex-shrink:0;border-radius:9px}
   .hero .info h1{font-size:17px;margin-bottom:2px}
@@ -567,16 +607,25 @@ def _mark_form(key, back, finished):
 
 
 def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
-               finished=False, fin_note=""):
-    """一张书卡。``key`` 非空（= 管理员视角）时封面左上角挂「标记已读完」按钮。"""
+               finished=False, fin_note="", upd=0):
+    """一张书卡。
+
+    * ``key`` 非空（= 管理员视角）时封面左上角挂「标记已读完」按钮；
+    * ``upd`` > 0 表示这本书有新卷：封面左下角压一条「有更新」、整卡描暖色边、
+      副标题里点明新增几卷（角标只写数字，副标题给完整说法）。
+    """
     badge_html = f'<span class="badge">{html.escape(badge)}</span>' if badge else ""
     mark = _mark_form(key, back, finished) if key else ""
     sub_html = html.escape(sub) + (f' · <span class="fin">{html.escape(fin_note)}</span>'
                                   if fin_note else "")
+    if upd:
+        sub_html += f' · <span class="newt">有更新 +{upd} 卷</span>'
+    upd_html = (f'<span class="upd">有更新 +{upd}</span>' if upd else "")
     return (
-        '<div class="card">'
-        f'<a class="cardlink" href="{href}">'
-        f'<div class="ph"><img src="{_cover_url(cover_rel)}" alt="" loading="lazy">{badge_html}</div>'
+        '<div class="card%s">' % (" upd" if upd else "")
+        + f'<a class="cardlink" href="{href}">'
+        f'<div class="ph"><img src="{_cover_url(cover_rel)}" alt="" loading="lazy">'
+        f"{badge_html}{upd_html}</div>"
         f'<div class="t">{html.escape(title)}</div>'
         f'<div class="s">{sub_html}</div></a>'
         f"{mark}</div>")
@@ -644,13 +693,19 @@ def _pager_html(page, nxt, prv):
 
 def root_html(is_admin=False):
     lib = get_library()
+    upd.observe()                       # 首页也顺手做一次检测，分类卡上就能带出「N 部有更新」
+    ups = upd.counts()
+    # 有更新的分类在副标题后追加一段；先在循环外拼好，避免把 f-string 的隐式拼接切开
+    note = {c: (f' · <b style="color:var(--new)">{n} 部有更新</b>' if n else "")
+            for c, n in ups.items()}
     cats = "".join(
         f'<a class="cat" href="/opds/catalog/{quote(cat)}">'
         f'<div class="ico" style="background:{"#fff1e6" if cat == CATEGORY_DONE else "#e7f3ff"};'
         f'color:{"#bc4c00" if cat == CATEGORY_DONE else "#0a66c2"}">'
         f'{"&#10003;" if cat == CATEGORY_DONE else "&#128336;"}</div>'
         f'<div class="nm">{html.escape(cat)}</div>'
-        f'<div class="ds">{len(books)} 部作品 · {sum(len(v) for v in books.values())} 卷</div>'
+        f'<div class="ds">{len(books)} 部作品 · {sum(len(v) for v in books.values())} 卷'
+        f'{note.get(cat, "")}</div>'
         f'<div class="go">进入浏览 →</div></a>'
         for cat, books in lib.items())
     quick = (
@@ -684,15 +739,37 @@ def root_html(is_admin=False):
     return _html_page(SERVER_TITLE, body, active="", is_admin=is_admin)
 
 
+def _upd_bar(pend, back, is_admin):
+    """列表页工具条右侧的「有更新」提示：访客只看到文字，管理员多一个「全部标为已读」。
+
+    清除动作只有管理员能点（服务端也会再判一次权限）—— 否则访客随手一刷就把
+    管理员的提醒消掉了。
+    """
+    if not pend:
+        return ""
+    cnt = f'<span class="cnt">&#128293; {len(pend)} 部作品有更新</span>'
+    if not is_admin:
+        return cnt
+    esc = lambda s: html.escape(s, quote=True)          # noqa: E731
+    return (
+        '<form class="barupd" method="post" action="/opds/updates/clear">'
+        f'<input type="hidden" name="back" value="{esc(back)}">'
+        f"{cnt}"
+        '<button class="dl ghost small" type="submit">全部标为已读</button>'
+        "</form>")
+
+
 def catalog_html(cat, page=1, is_admin=False):
     lib = get_library()
     fin = load_finished() if is_admin else set()
+    pend = upd.observe()                       # 顺带做一次「新增卷」检测
+    upd_n = lambda k: len(pend[k]["vols"]) if k in pend else 0      # noqa: E731
     if cat == "all":
         merged = {}
         for c, bs in lib.items():
             for b, vols in bs.items():
                 merged[f"{c}/{b}"] = (c, vols)
-        keys = sorted(merged.keys())
+        keys = upd.order_keys(sorted(merged.keys()), pend)          # 有更新的排最前
         chunk, extra = _paginate(keys, page, "/opds/catalog/all?page=1")
         back = "/opds/catalog/all?page=" + str(page)
         cards = "".join(
@@ -701,14 +778,16 @@ def catalog_html(cat, page=1, is_admin=False):
                        k.split("/", 1)[1],
                        f"{merged[k][0]} · {len(merged[k][1])} 卷",
                        key=k if is_admin else None, back=back, finished=k in fin,
-                       fin_note="已读完" if k in fin else "")
+                       fin_note="已读完" if k in fin else "", upd=upd_n(k))
             for k in chunk)
         total = len(keys)
         label = "全部作品"
         active = "all"
     elif cat in CATEGORY_DIRS:
         books = lib.get(cat, {})
-        keys = sorted(books.keys(), key=lambda s: s.lower())
+        # 排序用的是「分类/书名」全键（pending 的键就是它），排完再拆回书名
+        keys = [k.split("/", 1)[1] for k in
+                upd.order_keys([f"{cat}/{b}" for b in sorted(books, key=lambda s: s.lower())], pend)]
         chunk, extra = _paginate(keys, page, "/opds/catalog/" + quote(cat) + "?page=1")
         back = "/opds/catalog/" + quote(cat) + "?page=" + str(page)
         cards = "".join(
@@ -717,7 +796,8 @@ def catalog_html(cat, page=1, is_admin=False):
                        b, f"{len(books[b])} 卷", badge=f"{len(books[b])} 卷",
                        key=f"{cat}/{b}" if is_admin else None, back=back,
                        finished=f"{cat}/{b}" in fin,
-                       fin_note="已读完" if f"{cat}/{b}" in fin else "")
+                       fin_note="已读完" if f"{cat}/{b}" in fin else "",
+                       upd=upd_n(f"{cat}/{b}"))
             for b in chunk)
         total = len(keys)
         label = cat
@@ -730,7 +810,8 @@ def catalog_html(cat, page=1, is_admin=False):
         '<div class="bar">'
         f"<h1 style=\"margin:0\">{html.escape(label)}</h1>"
         '<span class="spacer"></span>'
-        f'<span class="sub" style="margin:0">{total} 部作品</span>'
+        + _upd_bar(pend, back, is_admin)
+        + f'<span class="sub" style="margin:0">{total} 部作品</span>'
         "</div>"
         f'<div class="grid">{cards}</div>'
         + _pager_html(page, _next_link(extra), _prev_link(extra))
@@ -757,6 +838,11 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
     desc = meta.get("description", "")
     zip_url = "/zip/" + encode_path(rel)
 
+    # 新增卷：先检测（observe）再取这本书的待读提示，展示信息（子目录/标题）从书库索引现取
+    entry = upd.observe().get(key)
+    new_rels = set(entry["vols"]) if entry else set()
+    new_vols = [v for v in vols if v["rel"] in new_rels]
+
     meta_lines = (
         f'<div class="meta-line">作者 <b>{html.escape(author)}</b></div>' if author else "")
     meta_lines += f'<div class="meta-line">分类 <b>{html.escape(cat)}</b> · 卷数 <b>{len(vols)}</b> · 体积 <b>{human_size(total_size)}</b></div>'
@@ -769,7 +855,7 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
 
     # 详情页一次性渲染全部卷（不翻页）：直接传完整 vols 列表，_render_groups 会显示所有分组
     groups = _group_vols_by_subdir(vols, cat, book)
-    groups_html = _render_groups(groups, cat, book, vols)
+    groups_html = _render_groups(groups, cat, book, vols, new_rels)
 
     # 标记按钮：管理员才有；已读时时样式换成实心绿并提示可取消
     mark_btn = ""
@@ -796,6 +882,7 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
         + mark_btn +
         "</div>"
         "</div></div>"
+        + _upd_box(new_vols, cat, book, entry)
         + (f'<div class="sec-head">'
          f'<h2>分卷下载 <span class="n">{len(vols)} 卷</span></h2>'
          f'<div class="grp-tools">'
@@ -806,7 +893,45 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
         + (groups_html or '<div class="empty">这一页没有内容</div>')
     )
     active = "done" if cat == CATEGORY_DONE else "ongoing"
-    return _html_page(f"{book} · {SERVER_TITLE}", body, active=active, is_admin=is_admin)
+    page_html = _html_page(f"{book} · {SERVER_TITLE}", body, active=active, is_admin=is_admin)
+
+    # 「看过了」= 点进来就把这本书的更新提示收掉（回到列表就回到原位）。
+    # 只有管理员算「看过」—— 访客浏览不该静默消掉管理员的提醒。
+    if is_admin and entry:
+        upd.clear(key)
+    return page_html
+
+
+def _upd_box(new_vols, cat, book, entry):
+    """详情页顶部的「本次新增」区块：直接点名**哪个子目录、哪几卷**是新的。
+
+    只靠分组行上的小药丸还不够 —— 新卷常落在默认折叠的组里，用户得先知道去哪儿展开。
+    """
+    if not new_vols:
+        return ""
+    inner = f"{cat}/{book}/"
+    rows = []
+    for v in new_vols:
+        rem = v["rel"][len(inner):] if v["rel"].startswith(inner) else v["rel"].split("/")[-1]
+        sub = rem.rsplit("/", 1)[0] if "/" in rem else ""
+        where = f"{sub} · " if sub else ""
+        rows.append(
+            f'<a class="vol" href="/dl/{encode_path(v["rel"])}">'
+            f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy"></div>'
+            f'<div class="meta"><div class="t">{html.escape(v["title"])}</div>'
+            f'<div class="s"><span class="vnew">新</span>'
+            f'<span class="sub2">{html.escape(where)}</span>{human_size(v["size"])}'
+            f"</div></div>"
+            f'<span class="dl">下载</span></a>')
+    when = (entry or {}).get("at", "")
+    return (
+        '<div class="updbox">'
+        '<div class="hd"><span class="dot"></span>本次新增 '
+        f"{len(new_vols)} 卷"
+        + (f'<span class="n">{html.escape(when)}</span>' if when else "")
+        + "</div>"
+        + "".join(rows)
+        + "</div>")
 
 
 def _group_vols_by_subdir(vols, cat, book):
@@ -828,8 +953,12 @@ def _group_vols_by_subdir(vols, cat, book):
     return ordered
 
 
-def _render_groups(groups, cat, book, page_chunk):
-    """把分组渲染成「文件夹 + 卷列表」，并标记哪些卷在当前分页里。"""
+def _render_groups(groups, cat, book, page_chunk, new_rels=frozenset()):
+    """把分组渲染成「文件夹 + 卷列表」，并标记哪些卷在当前分页里。
+
+    ``new_rels`` 里的卷会给行加「新」标，其所属分组额外挂「有更新 +N」并**默认展开** ——
+    新卷常常落在后面那些默认折叠的组里，不展开就等于没提示。
+    """
     rels_in_page = {v["rel"] for v in page_chunk}
     out = []
     for subdir, vols in groups:
@@ -841,14 +970,17 @@ def _render_groups(groups, cat, book, page_chunk):
             zip_url = "/zip/" + encode_path(f"{cat}/{book}/{subdir}")
         else:
             zip_url = "/zip/" + encode_path(f"{cat}/{book}")
+        n_new = sum(1 for v in in_page if v["rel"] in new_rels)
         rows = "".join(
             f'<a class="vol" href="/dl/{encode_path(v["rel"])}">'
             f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy"></div>'
             f'<div class="meta"><div class="t">{html.escape(v["title"])}</div>'
-            f'<div class="s">{human_size(v["size"])}</div></div>'
+            f'<div class="s">'
+            + ('<span class="vnew">新</span>' if v["rel"] in new_rels else "")
+            + f'{human_size(v["size"])}</div></div>'
             f'<span class="dl">下载</span></a>'
             for v in in_page)
-        opened = " open" if not out else ""   # 第一组默认展开，其余折叠
+        opened = " open" if (n_new or not out) else ""   # 第一组默认展开；有更新的也展开
         out.append(
             f'<section class="group{opened}">'
             f'<header class="group-head" onclick="this.parentNode.classList.toggle(\'open\')">'
@@ -856,7 +988,8 @@ def _render_groups(groups, cat, book, page_chunk):
             f'<span class="gico">&#128194;</span>'
             f'<span class="gnm">{html.escape(group_name)}</span>'
             f'<span class="gmeta">{len(vols)} 卷</span>'
-            f'<a class="dl ghost small" href="{zip_url}" '
+            + (f'<span class="gnew">有更新 +{n_new}</span>' if n_new else "")
+            + f'<a class="dl ghost small" href="{zip_url}" '
             f'onclick="event.stopPropagation()">打包本组</a>'
             f'</header>'
             f'<div class="group-body">{rows}</div>'
