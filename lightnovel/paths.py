@@ -33,6 +33,8 @@ LOG_FILE        = os.path.join(LOG_DIR, "sync.log")
 OPDS_LOG_FILE   = os.path.join(LOG_DIR, "opds.log")
 COVER_CACHE_DIR = os.path.join(LOG_DIR, "covers")
 META_CACHE_FILE = os.path.join(LOG_DIR, "meta_cache.json")
+# 「已读完」清单：管理员标记过的作品集合（键 = 分类/书名）。运行时状态，不进仓库。
+FINISHED_FILE   = os.path.join(LOG_DIR, "finished.json")
 # 单实例锁的路径由 lightnovel.sync.monitor.lock_path() 现算（跟着 LOG_DIR 走），
 # 面板也从那里取，保证「监控写哪儿、面板就读哪儿」只有一个真源。
 
@@ -46,6 +48,10 @@ OPDS_BIND = BIND
 # 口令：留空则免密。外网访问强烈建议设置。只从环境变量读取，切勿写进源码。
 AUTH_USER = os.environ.get("LN_OPDS_USER", "")
 AUTH_PASS = os.environ.get("LN_OPDS_PASS", "")
+# 访客口令（可选）：只有管理员能看「已读完」等管理功能，访客照常浏览/下载。
+# 两级判定与免密时的降级规则见 lightnovel.opds.server.OPDSHandler._role。
+AUTH_GUEST_USER = os.environ.get("LN_OPDS_GUEST_USER", "")
+AUTH_GUEST_PASS = os.environ.get("LN_OPDS_GUEST_PASS", "")
 
 PAGE_SIZE   = 100   # 每个 feed 每页最多条目数
 RECENT_SIZE = 100   # 「最近更新」条数

@@ -5,6 +5,7 @@
 import argparse
 import base64
 import errno
+import hmac
 import html
 import json
 import logging
@@ -21,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from ..paths import (
+    AUTH_GUEST_PASS,
+    AUTH_GUEST_USER,
     AUTH_PASS,
     AUTH_USER,
     BIND,
@@ -44,17 +47,20 @@ from .library import (
     local_ip,
     resolve_under,
 )
+from .finished import normalize_key, toggle_finished
 from .feeds import (
     _accept_wants_xml,
     book_html,
     catalog_html,
     feed_book,
     feed_catalog,
+    feed_finished,
     feed_recent,
     feed_root,
     feed_search,
     index_html,
     opensearch_xml,
+    read_html,
     recent_html,
     search_html,
 )
@@ -72,23 +78,78 @@ class OPDSHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def _auth_ok(self):
-        if not AUTH_USER and not AUTH_PASS:
-            return True
+    # -------------------------------------------------------- 身份判定
+    # ⚠ 这里是全服务**唯一**的角色判定入口，也是唯一能做权限结论的地方：
+    #   只看请求本身（Authorization 头 + 来源地址），客户端传来的任何「我是管理员」
+    #   字段（query / cookie / hidden input）一律不参与判定。
+    def _basic_creds(self):
+        """解析 Basic 认证头 → (user, pass)；没有/格式不对 → None。"""
         hdr = self.headers.get("Authorization", "") or ""
         if not hdr.startswith("Basic "):
-            return False
+            return None
         try:
-            user, _, pw = base64.b64decode(hdr[6:]).decode("utf-8").partition(":")
+            raw = base64.b64decode(hdr[6:]).decode("utf-8")
+        except Exception:
+            return None
+        user, _, pw = raw.partition(":")
+        return user, pw
+
+    @staticmethod
+    def _same(secret, given):
+        """定长比较，避免用 ``==`` 比口令时的时序侧信道。"""
+        try:
+            return hmac.compare_digest(str(secret).encode("utf-8"),
+                                       str(given).encode("utf-8"))
         except Exception:
             return False
-        return user == AUTH_USER and pw == AUTH_PASS
+
+    def _is_loopback(self):
+        host = self.client_address[0] if self.client_address else ""
+        if not host:
+            return False
+        return host in ("::1", "localhost") or host.startswith("127.")
+
+    def _role(self):
+        """判定本次请求的角色 → ``"admin"`` / ``"guest"`` / ``None``（拒绝）。
+
+        判定规则（两条，无第三套逻辑）：
+          1. **配了管理员口令**（LN_OPDS_USER/PASS）：拿 Basic 凭据去比 ——
+             命中管理员=``admin``；命中访客口令（LN_OPDS_GUEST_USER/PASS）=``guest``；
+             不匹配/没带 → ``None``（401）。两级口令都留空则「访客」这一档不存在。
+          2. **完全免密**：回环地址（本机 127.0.0.1 / ::1）=``admin``，
+             其余（局域网、公网隧道）=``guest``。
+             于是「本机浏览器打开面板 = 管理员、外面的人只能看」是默认行为，
+             不需要额外配置就有安全的下限。
+
+        免密 + 公网暴露时，请在 launchers/*.bat 里设置 LN_OPDS_USER/PASS，
+        手机阅读器地址写成 ``https://用户名:口令@域名/`` 即可拿到管理员身份。
+        """
+        if AUTH_USER or AUTH_PASS:
+            creds = self._basic_creds()
+            if not creds:
+                return None
+            user, pw = creds
+            if self._same(user, AUTH_USER) and self._same(pw, AUTH_PASS):
+                return "admin"
+            if (AUTH_GUEST_USER or AUTH_GUEST_PASS) \
+                    and self._same(user, AUTH_GUEST_USER) and self._same(pw, AUTH_GUEST_PASS):
+                return "guest"
+            return None
+        return "admin" if self._is_loopback() else "guest"
 
     def _deny(self):
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="Light-Novel OPDS", charset="UTF-8"')
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _forbidden(self, msg="仅管理员可访问"):
+        """已认证但权限不够（访客访问管理员功能）→ 403，而不是 401。
+
+        区别很重要：401 会让浏览器再弹一次登录框（用户以为口令错了），403 才是
+        「你的身份没问题，但没有这个权限」。
+        """
+        self._send(403, f"<h1>403</h1><p>{html.escape(msg)}</p>", "text/html; charset=utf-8")
 
     def _send(self, code, body, ctype, extra=None, head_only=False):
         if isinstance(body, str):
@@ -119,9 +180,11 @@ class OPDSHandler(BaseHTTPRequestHandler):
         self.do_GET(head_only=True)
 
     def do_GET(self, head_only=False):
-        if not self._auth_ok():
+        role = self._role()
+        if role is None:
             self._deny()
             return
+        is_admin = role == "admin"          # 页面渲染期的唯一开关，向下逐层传递
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         qs = parse_qs(parsed.query or "")
@@ -129,14 +192,28 @@ class OPDSHandler(BaseHTTPRequestHandler):
             if path in ("/", "/index.html"):
                 accept = self.headers.get("Accept", "") or ""
                 if "atom+xml" in accept or "opds" in accept.lower():
-                    self._send(200, feed_root(), f"{OPDS_NAV_TYPE}; charset=utf-8", head_only=head_only)
+                    self._send(200, feed_root(is_admin), f"{OPDS_NAV_TYPE}; charset=utf-8", head_only=head_only)
                 else:
-                    self._send(200, index_html(), "text/html; charset=utf-8", head_only=head_only)
+                    self._send(200, index_html(is_admin), "text/html; charset=utf-8", head_only=head_only)
                 return
 
             if path == "/opds/opensearch.xml":
                 self._send(200, opensearch_xml(), "application/opensearchdescription+xml; charset=utf-8",
                            head_only=head_only)
+                return
+
+            if path == "/opds/read":
+                # 管理员专属页面：访客到此直接 403（不返回内容，也不返回「入口」）。
+                if not is_admin:
+                    self._forbidden("「已读完」仅管理员可查看。"
+                                    "配置 LN_OPDS_USER / LN_OPDS_PASS 后用它登录即可。")
+                    return
+                page = int(qs.get("page", ["1"])[0] or 1)
+                if _accept_wants_xml(self.headers.get("Accept", "")):
+                    self._send(200, feed_finished(page), f"{OPDS_NAV_TYPE}; charset=utf-8",
+                               head_only=head_only)
+                else:
+                    self._send(200, read_html(page), "text/html; charset=utf-8", head_only=head_only)
                 return
 
             m = re.match(r"^/opds/catalog/(.+)$", path)
@@ -150,7 +227,7 @@ class OPDSHandler(BaseHTTPRequestHandler):
                     else:
                         self._send(200, body, f"{OPDS_NAV_TYPE}; charset=utf-8", head_only=head_only)
                 else:
-                    body = catalog_html(cat, page)
+                    body = catalog_html(cat, page, is_admin)
                     if body is None:
                         self._notfound("分类不存在")
                     else:
@@ -167,7 +244,7 @@ class OPDSHandler(BaseHTTPRequestHandler):
                     else:
                         self._send(200, body, f"{OPDS_ACQ_TYPE}; charset=utf-8", head_only=head_only)
                 else:
-                    body = book_html(m.group(1), page)
+                    body = book_html(m.group(1), page, is_admin)
                     if body is None:
                         self._notfound("作品不存在")
                     else:
@@ -179,7 +256,8 @@ class OPDSHandler(BaseHTTPRequestHandler):
                 if _accept_wants_xml(self.headers.get("Accept", "")):
                     self._send(200, feed_recent(page), f"{OPDS_ACQ_TYPE}; charset=utf-8", head_only=head_only)
                 else:
-                    self._send(200, recent_html(page), "text/html; charset=utf-8", head_only=head_only)
+                    self._send(200, recent_html(page, is_admin), "text/html; charset=utf-8",
+                               head_only=head_only)
                 return
 
             if path == "/opds/search":
@@ -188,7 +266,8 @@ class OPDSHandler(BaseHTTPRequestHandler):
                 if _accept_wants_xml(self.headers.get("Accept", "")):
                     self._send(200, feed_search(q, page), f"{OPDS_ACQ_TYPE}; charset=utf-8", head_only=head_only)
                 else:
-                    self._send(200, search_html(q, page), "text/html; charset=utf-8", head_only=head_only)
+                    self._send(200, search_html(q, page, is_admin), "text/html; charset=utf-8",
+                               head_only=head_only)
                 return
 
             if path == "/opds/refresh":
@@ -223,6 +302,88 @@ class OPDSHandler(BaseHTTPRequestHandler):
             pass
         except Exception as exc:
             log.exception("处理请求出错 %s：%s", path, exc)
+            try:
+                self._send(500, f"<h1>500</h1><p>{html.escape(str(exc))}</p>", "text/html; charset=utf-8")
+            except Exception:
+                pass
+
+    # -------------------------------------------------------- 写操作
+    def _form(self):
+        """解析 ``application/x-www-form-urlencoded`` 表单体（限长，防内存放大）。"""
+        try:
+            n = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > 8 * 1024:
+            return {}
+        try:
+            raw = self.rfile.read(n).decode("utf-8", "replace")
+        except (OSError, ValueError):
+            return {}
+        return parse_qs(raw, keep_blank_values=True)
+
+    def _same_origin(self):
+        """只受理同站表单（CSRF 兜底）。
+
+        浏览器会把已缓存的 Basic 凭据自动带上，所以「第三方页面里放个自动提交的表单」
+        也能打到这里。判据：``Origin`` 的主机 == ``Host``（无 Origin 时看 ``Referer``）。
+        两个头都没有（curl / 脚本）→ 放行：那不是浏览器场景，谈不上 CSRF。
+        """
+        host = (self.headers.get("Host", "") or "").lower()
+        if not host:
+            return True
+        for name in ("Origin", "Referer"):
+            val = self.headers.get(name)
+            if not val:
+                continue
+            return urlparse(val).netloc.lower() == host
+        return True
+
+    def _local_back(self, back, fallback="/"):
+        """回跳地址只认本站绝对路径，堵掉开放重定向（``//evil.com`` / ``http://…``）。"""
+        back = (back or "").strip()
+        if not back.startswith("/") or back.startswith("//") or "\\" in back or "/.." in back:
+            return fallback
+        return back
+
+    def _redirect(self, location):
+        """303：刷新后是 GET，页面状态由服务端重绘，天然正确（不用前端记账）。"""
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        role = self._role()
+        if role is None:
+            self._deny()                      # 没通过身份判定：401
+            return
+        path = unquote(urlparse(self.path).path)
+        try:
+            if path == "/opds/read/toggle":
+                # 三道关：① 已认证（上面） ② 必须是管理员 ③ 必须是同源表单
+                if role != "admin":
+                    self._forbidden("只有管理员可以修改「已读完」清单。")
+                    return
+                if not self._same_origin():
+                    self._send(403, "<h1>403</h1><p>跨站请求被拒绝</p>",
+                               "text/html; charset=utf-8")
+                    return
+                form = self._form()
+                key = normalize_key(form.get("key", [""])[0])
+                if not key:
+                    self._send(400, "<h1>400</h1><p>作品参数不合法</p>",
+                               "text/html; charset=utf-8")
+                    return
+                on = toggle_finished(key)
+                log.info("「已读完」标记 %s → %s", key, "已读完" if on else "未读完")
+                self._redirect(self._local_back(form.get("back", ["/"])[0], "/opds/read"))
+                return
+            self._notfound(path)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            log.exception("处理 POST 出错 %s：%s", path, exc)
             try:
                 self._send(500, f"<h1>500</h1><p>{html.escape(str(exc))}</p>", "text/html; charset=utf-8")
             except Exception:
@@ -607,9 +768,16 @@ def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False,
     lan_url = f"http://{local_ip()}:{port}/"
     log.info("OPDS 服务启动：%s（bind %s）", lan_url, bind)
     if AUTH_USER or AUTH_PASS:
-        log.info("已启用 Basic 认证（用户 %s）", AUTH_USER or "(空)")
+        log.info("已启用 Basic 认证：管理员=%s，访客=%s",
+                 AUTH_USER or "(空)", AUTH_GUEST_USER or "(未设置：访客档不存在，非管理员一律 401)")
+        if AUTH_GUEST_USER or AUTH_GUEST_PASS:
+            log.info("访客可正常浏览/下载，但看不到「已读完」（管理员专属入口）。")
+        else:
+            log.info("「已读完」入口仅对管理员账号可见；其他人连书库都进不去（未配访客口令）。")
     else:
-        log.warning("当前为免密访问；若已暴露公网，请设置 LN_OPDS_USER / LN_OPDS_PASS。")
+        log.warning("当前为免密访问：本机(127.0.0.1)视为管理员，其余来源视为访客"
+                    "（可浏览/下载，但看不到「已读完」入口）。"
+                    "已暴露公网的话，请设置 LN_OPDS_USER / LN_OPDS_PASS。")
 
     print("\n" + "=" * 62)
     print(f"  OPDS 书源已启动   端口 {port}")

@@ -30,6 +30,7 @@ from .library import (
     get_library,
     human_size,
 )
+from .finished import load_finished
 
 # ---------------------------- Feed 生成 ----------------------------
 def _now_iso():
@@ -112,7 +113,9 @@ def _paginate(items, page, base_href):
     return chunk, extra
 
 
-def feed_root():
+def feed_root(is_admin=False):
+    """根导航。``is_admin`` 为假时「已读完」这个 subsection **不会出现**在 feed 里 ——
+    阅读器（Moon+ / 静读天下）订阅到的目录结构与访客网页一致，不多一个入口。"""
     lib = get_library()
     n_books = sum(len(b) for b in lib.values())
     n_vols = sum(1 for _ in all_vols(lib))
@@ -124,7 +127,38 @@ def feed_root():
             f"{len(books)} 部作品 · {sum(len(v) for v in books.values())} 卷"))
     entries.append(nav_entry("urn:ln:recent", "最近更新", "/opds/recent", f"最近改动的 {RECENT_SIZE} 卷"))
     entries.append(nav_entry("urn:ln:all", "全部作品", "/opds/catalog/all", f"{n_books} 部作品 · {n_vols} 卷"))
+    if is_admin:
+        n_fin = len(_finished_books())
+        entries.append(nav_entry("urn:ln:read", "已读完", "/opds/read", f"已读完的 {n_fin} 部作品"))
     return _feed("urn:ln:root", SERVER_TITLE, entries, "/")
+
+
+def _finished_books():
+    """已读完、且**当前书库里确实存在**的作品：``[(key, 分类, 书名, [卷…])]``。
+
+    清单里可能留着已被删除/改名的旧键，这里统一过滤掉 —— 列表页与 feed 都不会
+    出现点不开的死条目（也不在读取时顺手清理文件，删书是可逆的，静默丢标记更糟）。
+    """
+    lib = get_library()
+    out = []
+    for key in sorted(load_finished(), key=lambda s: s.lower()):
+        cat, _, book = key.partition("/")
+        vols = lib.get(cat, {}).get(book)
+        if vols:
+            out.append((key, cat, book, vols))
+    return out
+
+
+def feed_finished(page=1):
+    """「已读完」导航型 feed：每条指向一部作品的详情 feed（管理员专有）。"""
+    items = _finished_books()
+    chunk, extra = _paginate(items, page, "/opds/read?page=1")
+    body = "".join(
+        nav_entry("urn:ln:book:" + quote(key), book, "/opds/book/" + encode_path(key),
+                  f"{cat} · {len(vols)} 卷 · 已读完")
+        for key, cat, book, vols in chunk)
+    return _feed("urn:ln:read", f"{SERVER_TITLE} · 已读完", [],
+                 "/opds/read?page=" + str(page), OPDS_NAV_TYPE, extra + body)
 
 
 def feed_catalog(cat, page=1):
@@ -295,7 +329,8 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
 
 /* ---------- 书封网格 ---------- */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:20px 14px}
-.card{display:block}
+.card{display:block;position:relative}
+.cardlink{display:block}
 .card .ph{position:relative;width:100%;aspect-ratio:2/3;border-radius:10px;overflow:hidden;
   background:var(--border);box-shadow:var(--shadow);transition:transform .14s,box-shadow .14s}
 .card:hover .ph{transform:translateY(-4px);box-shadow:0 8px 18px rgba(16,22,26,.12)}
@@ -305,6 +340,22 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
 .card .t{margin-top:9px;font-size:13px;font-weight:500;line-height:1.35;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .card .s{margin-top:3px;font-size:11px;color:var(--muted)}
+.card .s .fin{color:#1a7f37;font-weight:500}
+
+/* 标记控件 .mkform/.mk：只在管理员页面渲染（见 _mark_form）。这里刻意不写任何
+   带功能名的注释 —— CSS 对所有人下发，注释里的字样会漏进访客的页面源码里。 */
+.mkform{position:absolute;left:6px;top:6px;margin:0;z-index:2;line-height:0}
+.mk{width:26px;height:26px;padding:0;border-radius:50%;cursor:pointer;
+  display:grid;place-items:center;font-size:13px;line-height:1;font-family:inherit;
+  border:1px solid rgba(255,255,255,.55);background:rgba(15,20,26,.55);color:#fff;
+  backdrop-filter:blur(6px);transition:background .12s,transform .12s,border-color .12s}
+.mk:hover{transform:scale(1.08);background:rgba(15,20,26,.75)}
+.mk.on{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.mk.on:hover{background:var(--accent2)}
+.actions form{display:inline;margin:0}
+.actions button.dl{font-family:inherit;cursor:pointer;border:0}
+.dl.ok{background:#1f883d;color:#fff;border:1px solid #1f883d}
+.dl.ok:hover{filter:brightness(1.06)}
 
 /* ---------- 卷列表 ---------- */
 .vol{display:flex;align-items:center;gap:14px;padding:12px 14px;background:var(--card);
@@ -440,13 +491,22 @@ FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox
            "%3Cpath d='M17.5 8h5.5v16h-5.5z' fill='white' opacity='.6'/%3E%3C/svg%3E")
 
 
-def _html_page(title, body_inner, active="", extra_css=""):
-    tabs = (
+def _html_page(title, body_inner, active="", extra_css="", is_admin=False):
+    """整页外壳。``is_admin`` 是**渲染期开关**：非管理员时「已读完」入口这段 HTML
+    根本不会被拼出来 —— 前端拿到的是「没有这个入口」的页面，而不是「用 CSS 藏起来」
+    的页面（CSS 隐藏可以用查看源码/开发者工具还原，等于没有权限控制）。
+
+    真正的权限闸门在服务端路由（``OPDSHandler`` 的 ``_role()`` 与 403 分支）；
+    这里只负责「不给入口」，属于体验层，两道一起才叫完整。
+    """
+    tabs = [
         ("done",    "/opds/catalog/" + quote(CATEGORY_DONE),    CATEGORY_DONE),
         ("ongoing", "/opds/catalog/" + quote(CATEGORY_ONGOING), CATEGORY_ONGOING),
         ("recent",  "/opds/recent",   "最近更新"),
         ("all",     "/opds/catalog/all", "全部作品"),
-    )
+    ]
+    if is_admin:
+        tabs.append(("read", "/opds/read", "已读完"))
     tab_html = "".join(
         '<a class="tab%s" href="%s">%s</a>' % (" on" if k == active else "", href, label)
         for k, href, label in tabs)
@@ -476,6 +536,41 @@ def _html_page(title, body_inner, active="", extra_css=""):
 
 def _cover_url(rel):
     return "/cover/" + encode_path(rel)
+
+
+def _mark_form(key, back, finished):
+    """「标记 / 取消已读完」表单 —— 纯 HTML 表单 POST，不依赖 JS。
+
+    用表单而不是 ``fetch()``：手机上 JS 被禁、阅读器内嵌浏览器兼容性参差都能用；
+    提交后服务端 303 跳回 ``back``，页面重绘时状态必然正确（不用前端自己记账）。
+    只有管理员渲染到这里（``is_admin`` 为真时才调用）。
+    """
+    on = " on" if finished else ""
+    tip = "已读完，点击取消标记" if finished else "标记为已读完"
+    glyph = "&#10003;" if finished else "&#9675;"
+    esc = lambda s: html.escape(s, quote=True)          # noqa: E731
+    return (
+        '<form class="mkform" method="post" action="/opds/read/toggle">'
+        f'<input type="hidden" name="key" value="{esc(key)}">'
+        f'<input type="hidden" name="back" value="{esc(back)}">'
+        f'<button class="mk{on}" type="submit" title="{tip}" aria-label="{tip}">{glyph}</button>'
+        "</form>")
+
+
+def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
+               finished=False, fin_note=""):
+    """一张书卡。``key`` 非空（= 管理员视角）时封面左上角挂「标记已读完」按钮。"""
+    badge_html = f'<span class="badge">{html.escape(badge)}</span>' if badge else ""
+    mark = _mark_form(key, back, finished) if key else ""
+    sub_html = html.escape(sub) + (f' · <span class="fin">{html.escape(fin_note)}</span>'
+                                  if fin_note else "")
+    return (
+        '<div class="card">'
+        f'<a class="cardlink" href="{href}">'
+        f'<div class="ph"><img src="{_cover_url(cover_rel)}" alt="" loading="lazy">{badge_html}</div>'
+        f'<div class="t">{html.escape(title)}</div>'
+        f'<div class="s">{sub_html}</div></a>'
+        f"{mark}</div>")
 
 
 # 书的「主卷」优选名：多子目录时（如 High School D×D 同时有 正篇/DX/短篇/SLASHDOG），
@@ -538,7 +633,7 @@ def _pager_html(page, nxt, prv):
     return f'<div class="pager">{prv_html}<span class="cur">第 {page} 页</span>{nxt_html}</div>'
 
 
-def root_html():
+def root_html(is_admin=False):
     lib = get_library()
     cats = "".join(
         f'<a class="cat" href="/opds/catalog/{quote(cat)}">'
@@ -549,6 +644,19 @@ def root_html():
         f'<div class="ds">{len(books)} 部作品 · {sum(len(v) for v in books.values())} 卷</div>'
         f'<div class="go">进入浏览 →</div></a>'
         for cat, books in lib.items())
+    quick = (
+        f'<a class="cat" href="/opds/recent"><div class="ico" style="background:#e7f3ff;color:#0a66c2">&#128336;</div>'
+        f'<div class="nm">最近更新</div><div class="ds">最近改动的 {RECENT_SIZE} 卷</div><div class="go">查看 →</div></a>'
+        f'<a class="cat" href="/opds/catalog/all"><div class="ico" style="background:#f0e7ff;color:#6639ba">&#128218;</div>'
+        f'<div class="nm">全部作品</div><div class="ds">不分分类浏览</div><div class="go">查看 →</div></a>'
+    )
+    quick_label = "最近更新 · 全部作品"
+    if is_admin:                       # 管理员才多这张卡（与顶栏 tab 同一开关）
+        n_fin = len(_finished_books())
+        quick += (
+            f'<a class="cat" href="/opds/read"><div class="ico" style="background:#dafbe1;color:#1a7f37">&#10003;</div>'
+            f'<div class="nm">已读完</div><div class="ds">已标记 {n_fin} 部作品</div><div class="go">查看 →</div></a>')
+        quick_label = "最近更新 · 全部作品 · 已读完"
     body = (
         '<div class="hero-home">'
         f"<h1>{html.escape(SERVER_TITLE)}</h1>"
@@ -561,19 +669,15 @@ def root_html():
         "</div>"
         f"<h2>分类浏览</h2>"
         f'<div class="cats">{cats}</div>'
-        f"<h2>快速入口 <span class=\"n\">最近更新 · 全部作品</span></h2>"
-        f'<div class="cats">'
-        f'<a class="cat" href="/opds/recent"><div class="ico" style="background:#e7f3ff;color:#0a66c2">&#128336;</div>'
-        f'<div class="nm">最近更新</div><div class="ds">最近改动的 {RECENT_SIZE} 卷</div><div class="go">查看 →</div></a>'
-        f'<a class="cat" href="/opds/catalog/all"><div class="ico" style="background:#f0e7ff;color:#6639ba">&#128218;</div>'
-        f'<div class="nm">全部作品</div><div class="ds">不分分类浏览</div><div class="go">查看 →</div></a>'
-        f"</div>"
+        f"<h2>快速入口 <span class=\"n\">{quick_label}</span></h2>"
+        f'<div class="cats">{quick}</div>'
     )
-    return _html_page(SERVER_TITLE, body, active="")
+    return _html_page(SERVER_TITLE, body, active="", is_admin=is_admin)
 
 
-def catalog_html(cat, page=1):
+def catalog_html(cat, page=1, is_admin=False):
     lib = get_library()
+    fin = load_finished() if is_admin else set()
     if cat == "all":
         merged = {}
         for c, bs in lib.items():
@@ -581,11 +685,14 @@ def catalog_html(cat, page=1):
                 merged[f"{c}/{b}"] = (c, vols)
         keys = sorted(merged.keys())
         chunk, extra = _paginate(keys, page, "/opds/catalog/all?page=1")
+        back = "/opds/catalog/all?page=" + str(page)
         cards = "".join(
-            f'<a class="card" href="/opds/book/{encode_path(k)}">'
-            f'<div class="ph"><img src="{_cover_url(_primary_vol(merged[k][1], *k.split("/", 1))["rel"])}" alt="" loading="lazy"></div>'
-            f'<div class="t">{html.escape(k.split("/", 1)[1])}</div>'
-            f'<div class="s">{html.escape(merged[k][0])} · {len(merged[k][1])} 卷</div></a>'
+            _book_card("/opds/book/" + encode_path(k),
+                       _primary_vol(merged[k][1], *k.split("/", 1))["rel"],
+                       k.split("/", 1)[1],
+                       f"{merged[k][0]} · {len(merged[k][1])} 卷",
+                       key=k if is_admin else None, back=back, finished=k in fin,
+                       fin_note="已读完" if k in fin else "")
             for k in chunk)
         total = len(keys)
         label = "全部作品"
@@ -594,12 +701,14 @@ def catalog_html(cat, page=1):
         books = lib.get(cat, {})
         keys = sorted(books.keys(), key=lambda s: s.lower())
         chunk, extra = _paginate(keys, page, "/opds/catalog/" + quote(cat) + "?page=1")
+        back = "/opds/catalog/" + quote(cat) + "?page=" + str(page)
         cards = "".join(
-            f'<a class="card" href="/opds/book/{encode_path(cat + "/" + b)}">'
-            f'<div class="ph"><img src="{_cover_url(_primary_vol(books[b], cat, b)["rel"])}" alt="" loading="lazy">'
-            f'<span class="badge">{len(books[b])} 卷</span></div>'
-            f'<div class="t">{html.escape(b)}</div>'
-            f'<div class="s">{len(books[b])} 卷</div></a>'
+            _book_card("/opds/book/" + encode_path(cat + "/" + b),
+                       _primary_vol(books[b], cat, b)["rel"],
+                       b, f"{len(books[b])} 卷", badge=f"{len(books[b])} 卷",
+                       key=f"{cat}/{b}" if is_admin else None, back=back,
+                       finished=f"{cat}/{b}" in fin,
+                       fin_note="已读完" if f"{cat}/{b}" in fin else "")
             for b in chunk)
         total = len(keys)
         label = cat
@@ -617,10 +726,10 @@ def catalog_html(cat, page=1):
         f'<div class="grid">{cards}</div>'
         + _pager_html(page, _next_link(extra), _prev_link(extra))
     )
-    return _html_page(f"{label} · {SERVER_TITLE}", body, active=active)
+    return _html_page(f"{label} · {SERVER_TITLE}", body, active=active, is_admin=is_admin)
 
 
-def book_html(rel, page=1):                                # page 参数保留以兼容旧 URL，详情页不再分页
+def book_html(rel, page=1, is_admin=False):               # page 参数保留以兼容旧 URL，详情页不再分页
     rel = _safe_relpath(rel)
     if not rel:
         return None
@@ -630,6 +739,8 @@ def book_html(rel, page=1):                                # page 参数保留�
     vols = get_library().get(cat, {}).get(book)
     if vols is None:
         return None
+    key = f"{cat}/{book}"
+    finished = bool(is_admin) and key in load_finished()
     total_size = sum(v["size"] for v in vols)
     primary = _primary_vol(vols, cat, book)               # hero 封面也用「主卷」
     meta = get_epub_meta(primary["rel"]) if primary else {}
@@ -640,12 +751,27 @@ def book_html(rel, page=1):                                # page 参数保留�
     meta_lines = (
         f'<div class="meta-line">作者 <b>{html.escape(author)}</b></div>' if author else "")
     meta_lines += f'<div class="meta-line">分类 <b>{html.escape(cat)}</b> · 卷数 <b>{len(vols)}</b> · 体积 <b>{human_size(total_size)}</b></div>'
+    if is_admin:                       # 访客拿到的详情页里连「阅读状态」这一行都没有
+        meta_lines += ('<div class="meta-line">阅读状态 <b style="color:#1a7f37">已读完</b></div>'
+                       if finished else
+                       '<div class="meta-line">阅读状态 <b>未读</b></div>')
 
     desc_html = f'<div class="desc">{html.escape(desc)}</div>' if desc else ""
 
     # 详情页一次性渲染全部卷（不翻页）：直接传完整 vols 列表，_render_groups 会显示所有分组
     groups = _group_vols_by_subdir(vols, cat, book)
     groups_html = _render_groups(groups, cat, book, vols)
+
+    # 标记按钮：管理员才有；已读时时样式换成实心绿并提示可取消
+    mark_btn = ""
+    if is_admin:
+        mark_btn = (
+            '<form method="post" action="/opds/read/toggle">'
+            f'<input type="hidden" name="key" value="{html.escape(key, quote=True)}">'
+            f'<input type="hidden" name="back" value="/opds/book/{html.escape(encode_path(rel), quote=True)}">'
+            f'<button class="dl big{" ok" if finished else " ghost"}" type="submit">'
+            + ("&#10003; 已读完（点击取消）" if finished else "标记为已读完")
+            + "</button></form>")
 
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span>'
@@ -658,6 +784,7 @@ def book_html(rel, page=1):                                # page 参数保留�
         + meta_lines + desc_html +
         '<div class="actions">'
         f'<a class="dl big" href="{zip_url}">⬇ 打包下载全部（{len(vols)} 卷 · {human_size(total_size)}）</a>'
+        + mark_btn +
         "</div>"
         "</div></div>"
         + (f'<div class="sec-head">'
@@ -670,7 +797,7 @@ def book_html(rel, page=1):                                # page 参数保留�
         + (groups_html or '<div class="empty">这一页没有内容</div>')
     )
     active = "done" if cat == CATEGORY_DONE else "ongoing"
-    return _html_page(f"{book} · {SERVER_TITLE}", body, active=active)
+    return _html_page(f"{book} · {SERVER_TITLE}", body, active=active, is_admin=is_admin)
 
 
 def _group_vols_by_subdir(vols, cat, book):
@@ -738,7 +865,7 @@ def _vol_rows(items):
         for c, b, v, title in items)
 
 
-def recent_html(page=1):
+def recent_html(page=1, is_admin=False):
     vols = sorted(all_vols(), key=lambda t: t[2]["mtime"], reverse=True)[:RECENT_SIZE]
     chunk, extra = _paginate(vols, page, "/opds/recent?page=1")
     rows = _vol_rows([(c, b, v, f"{b} · {v['title']}") for c, b, v in chunk])
@@ -749,10 +876,10 @@ def recent_html(page=1):
         + (rows or '<div class="empty">暂无内容</div>')
         + _pager_html(page, _next_link(extra), _prev_link(extra))
     )
-    return _html_page(f"最近更新 · {SERVER_TITLE}", body, active="recent")
+    return _html_page(f"最近更新 · {SERVER_TITLE}", body, active="recent", is_admin=is_admin)
 
 
-def search_html(q, page=1):
+def search_html(q, page=1, is_admin=False):
     q = (q or "").strip()
     if q:
         hits = []
@@ -774,12 +901,49 @@ def search_html(q, page=1):
         "<h1>搜索</h1>"
         + result_html + pager
     )
-    return _html_page(f"搜索 · {SERVER_TITLE}", body, active="")
+    return _html_page(f"搜索 · {SERVER_TITLE}", body, active="", is_admin=is_admin)
+
+
+def read_html(page=1):
+    """「已读完」列表页（**仅管理员**：服务端在路由层就会把访客挡在外面，
+    非管理员拿不到这个页面，也拿不到顶栏入口）。
+
+    管理动作只有「取消标记」一个 —— 清单是人工维护的小状态，不做批量清空：
+    误点一下只是少一条记录，不需要「不可逆」的操作来增加风险。
+    """
+    items = _finished_books()
+    chunk, extra = _paginate(items, page, "/opds/read?page=1")
+    back = "/opds/read?page=" + str(page)
+    cards = "".join(
+        _book_card("/opds/book/" + encode_path(key),
+                   _primary_vol(vols, cat, book)["rel"], book,
+                   f"{cat} · {len(vols)} 卷", badge=f"{len(vols)} 卷",
+                   key=key, back=back, finished=True, fin_note="已读完")
+        for key, cat, book, vols in chunk)
+    total = len(items)
+    if total:
+        listing = f'<div class="grid">{cards}</div>'
+    else:
+        listing = ('<div class="empty">还没有标记任何作品。<br>'
+                   '去「已完结 / 未完结」里点封面左上角的 &#9675; 即可标记为已读完。</div>')
+    body = (
+        '<div class="crumb"><a href="/">首页</a><span>/</span><span>已读完</span></div>'
+        '<div class="bar">'
+        '<h1 style="margin:0">已读完</h1>'
+        '<span class="spacer"></span>'
+        f'<span class="sub" style="margin:0">{total} 部作品</span>'
+        "</div>"
+        f'<p class="sub">点封面左上角的 &#10003; 可取消标记。'
+        f'（这份清单只保存在本机 <code>.autosync/finished.json</code>，不同步到书库/仓库）</p>'
+        + listing
+        + _pager_html(page, _next_link(extra), _prev_link(extra))
+    )
+    return _html_page(f"已读完 · {SERVER_TITLE}", body, active="read", is_admin=True)
 
 
 # 兼容旧名
-def index_html():
-    return root_html()
+def index_html(is_admin=False):
+    return root_html(is_admin=is_admin)
 
 
 
