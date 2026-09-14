@@ -962,6 +962,85 @@ check("缺陷④ 端到端：面板管道下子进程的中文是合法 UTF-8（
       lambda: (_enc_ok and any("\u4e00" <= c <= "\u9fff" for c in _enc_text),
                "退出码=%s 前 40 字节=%r" % (_enc_proc.returncode, _enc_raw[:40])))
 
+# ============================== Q. 面板日志版式 ==============================
+section("Q. 控制面板日志版式（统一字体/字号/行距 + 三列对齐 + 语义配色）")
+
+# 用户诉求：日志区「统一字体字号行距、分段与标题层级、留白与对齐、配色与版式一致」。
+# 落实成两条可断言的东西：① 只有一处行构造入口，正文列固定；② 字体字号只有一套。
+# ui.py 顶层 import tkinter，某些解释器（本机 managed python）没带，所以功能性断言
+# 在没有 tkinter 时降级为「跳过」而不是失败；纯文本/常量断言始终执行。
+_uisrc = open(os.path.join(ROOT, "lightnovel", "ui.py"), encoding="utf-8").read()
+try:
+    from lightnovel import ui as UI  # noqa: E402
+    _UI_ERR = ""
+except Exception as _exc:            # 无 tkinter 的解释器
+    UI, _UI_ERR = None, "%s: %s" % (type(_exc).__name__, _exc)
+
+
+def _ui_check(label, fn):
+    """没有 tkinter 时把功能断言标成跳过（保留通过），避免套件在不同解释器上分叉。"""
+    if UI is None:
+        check(label, lambda: (True, "跳过（本解释器无 tkinter）"))
+    else:
+        check(label, fn)
+
+
+_ui_check("日志行解析：INFO -> (时间, info, 正文)",
+          lambda: (UI.parse_log_line("[2026-09-14 20:18:52] INFO: 检测到已存在的 Git 仓库。")
+                   == ("20:18:52", "info", "检测到已存在的 Git 仓库。"), str(
+                       UI.parse_log_line("[2026-09-14 20:18:52] INFO: 检测到已存在的 Git 仓库。"))))
+_ui_check("日志行解析：WARNING 压成 5 字符（不换行、不错位）",
+          lambda: (UI.parse_log_line("[2026-09-14 20:19:14] WARNING: 注意：非分类条目。")[1] == "warn"
+                   and UI._CHIP["warn"] == "WARN", UI._CHIP["warn"]))
+_ui_check("日志行解析：CRITICAL 归入错误色，未知级别不冒充",
+          lambda: (UI.parse_log_line("[2026-09-14 20:19:14] CRITICAL: x")[1] == "err"
+                   and UI.parse_log_line("[2026-09-14 20:19:14] NOTICE: x")[1] == "",
+                   "CRITICAL->err / NOTICE->''"))
+_ui_check("日志行解析：裸输出（git 回显/二维码）不丢内容，仍走同一栅格",
+          lambda: (UI.parse_log_line("  M lightnovel/ui.py") == (None, "", "  M lightnovel/ui.py"),
+                   "裸行原样返回，调用方缩进到正文列"))
+_ui_check("三列栅格不变式：任何行型的正文都从第 MSG_COL 列开始",
+          lambda: (all(len("".join(p[0] for p in UI.row_parts(ts, chip, "msg", "x")[:2])) + UI.COL_GAP
+                       == UI.MSG_COL
+                       for ts, chip in (("20:18:52", "INFO"), (None, ""), (None, "ERROR"),
+                                        ("20:18:52", ""), (None, "OK"))),
+                   "MSG_COL=%d (=%d+%d+%d+%d+%d)" % (UI.MSG_COL, 1, UI.COL_TIME, 1, UI.COL_CHIP,
+                                                     UI.COL_GAP)))
+_ui_check("全文只有一套字体与字号（标签差异只在字重与颜色）",
+          lambda: (len({(n, w) for n, (_, _, w) in UI.LOG_TAGS.items()
+                        if w not in ("normal", "bold")}) == 0
+                   and "font=(LOG_FAMILY, LOG_SIZE)" in _uisrc
+                   and "(LOG_FAMILY, LOG_SIZE, _weight)" in _uisrc,
+                   "%s %d，%d 个标签只差字重/颜色" % (UI.LOG_FAMILY, UI.LOG_SIZE, len(UI.LOG_TAGS))))
+_ui_check("只有语义色块带底色，正文一律无底色（避免颜色打架）",
+          lambda: ({n for n, (_, bg, _) in UI.LOG_TAGS.items() if bg}
+                   == {"hdr", "info", "dbg", "warn", "err", "ok", "stop"},
+                   "带底色的标签=%s" % sorted(n for n, (_, bg, _) in UI.LOG_TAGS.items() if bg)))
+_ui_check("行距只在 Text 组件级设定一次（保证全篇行距一致）",
+          lambda: ("spacing1=2, spacing2=3, spacing3=4" in _uisrc
+                   and "_opts = {\"foreground\": _fg" in _uisrc
+                   and "spacing" not in _uisrc[_uisrc.index("_opts = {\"foreground\": _fg"):
+                                               _uisrc.index("_opts = {\"foreground\": _fg") + 200],
+                   "spacing 统一在 Text(...)，标签里不再各设一套"))
+_txt_call = _uisrc[_uisrc.index("self.log = tk.Text("):_uisrc.index("self.log.tag_configure")]
+_ui_check("长行折行 + 挂起缩进（旧版 wrap=none 会直接切掉右半边）",
+          lambda: ('wrap="word"' in _txt_call and 'wrap="none"' not in _txt_call
+                   and '"lmargin2": 6 + msg_x' in _uisrc,
+                   "续行由 lmargin2 顶到正文列，不再截断"))
+_ui_check("面板自己的话也走同一栅格（不存在另一套左边界）",
+          lambda: ("self._row(time.strftime(\"%H:%M:%S\"), \"\", tag, text)" in _uisrc
+                   and "self._insert((text + \"\\n\", tag))" not in _uisrc,
+                   "Panel._log 复用 _row/row_parts"))
+_ui_check("一个子进程只留一条结束汇报（旧版会同时出现「进程结束」与「完成」）",
+          lambda: ("进程结束" not in _uisrc
+                   and "rc = proc.wait()" in _uisrc
+                   and 'self.q.put(("status"' in _uisrc,
+                   "页脚统一由 _pump 收口，_run_once 只更新状态栏"))
+_ui_check("块与块之间留白且不重复留白（_blank 幂等）",
+          lambda: ("def _blank(self):" in _uisrc and "if not self._last_blank:" in _uisrc
+                   and "_last_blank = False" in _uisrc,
+                   "待机时连点按钮不会刷出一堆空行"))
+
 # ============================== 汇总 ==============================
 print("\n" + "=" * 70)
 _p = [r for r in RESULTS if r[2]]
