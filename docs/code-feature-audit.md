@@ -22,7 +22,15 @@
 | # | 功能 | 关键实现 |
 | --- | --- | --- |
 | 1 | HTTP/1.1 多线程服务 | `ThreadingHTTPServer`，默认 `0.0.0.0:8080`（`LN_OPDS_PORT` / `LN_OPDS_BIND` 可覆盖），`allow_reuse_address`，端口占用给出中文提示 |
-| 2 | Basic 认证 | 凭据**只**从 `LN_OPDS_USER` / `LN_OPDS_PASS` 读取；两者皆空则免密。401 带 `charset="UTF-8"` |
+| 2 | 认证 | 凭据**只**从 `LN_OPDS_USER` / `LN_OPDS_PASS` 读取；两者皆空则「回环=管理员，其余=访客」 |
+
+> **2026-09-14 更新（认证模型已改，上表第 2 行仅存历史）**：
+> 网页侧改为 `/opds/login` 口令登录 + HMAC 签名 cookie（`lightnovel/opds/session.py`，密钥在
+> `.autosync/session.key`，30 天有效），Basic 保留给阅读器与脚本。
+> 关键变化：**匿名不再被 401 拦下**，而是降级成访客 —— 书库本身对所有人开放（浏览/搜索/
+> 下载/OPDS 订阅），只有「已读完」这类管理功能要管理员身份。Basic 凭据不对时也降级成访客
+> 而不是 401，否则浏览器会把陈旧的缓存凭据反复弹成系统认证框。
+> 详见 `OPDSHandler._role` 的文档字符串与 `tests/smoke_test.py` 的 R3 / T 两节。
 | 3 | 目录穿越防护 | `_safe_relpath` + `resolve_under`（realpath 白名单），`/dl` `/cover` `/zip` 全部走该校验 |
 | 4 | HEAD 请求支持 | `do_HEAD` 复用 `do_GET(head_only=True)`，只发头部不写 body |
 | 5 | 断连容错 | `BrokenPipeError` / `ConnectionResetError` 静默吞掉；`500` 页面兜底 |

@@ -303,6 +303,15 @@ header{position:sticky;top:0;z-index:50;background:var(--card);
 .hsearch button{padding:8px 14px;font-size:13px;border:1px solid var(--accent);
   border-left:0;border-radius:0 8px 8px 0;background:var(--accent);color:var(--accent-fg);
   cursor:pointer;white-space:nowrap;flex-shrink:0}
+/* 顶栏右上角的身份入口（登录 / 退出）。访客版只有「登录」两个字 —— 不写说明文案，
+   管理员专有的字样不能出现在访客拿到的源码里（同 MARK_JS 的约定）。 */
+.hacc{flex-shrink:0;margin:0;display:inline-flex;align-items:center;line-height:1.2;
+  padding:7px 13px;border-radius:8px;border:1px solid var(--border);background:var(--card);
+  color:var(--muted);font-size:13px;font-family:inherit;white-space:nowrap;cursor:pointer;
+  transition:border-color .12s,color .12s,background .12s}
+.hacc:hover{border-color:var(--accent);color:var(--accent);background:var(--hover)}
+form.hacc{padding:0}form.hacc .hacbtn{padding:7px 13px;border:0;background:transparent;
+  color:inherit;font:inherit;cursor:pointer;border-radius:8px}
 
 /* ---------- 容器 ---------- */
 .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 48px}
@@ -492,6 +501,9 @@ footer{margin-top:48px;padding:24px 16px;text-align:center;color:var(--muted);fo
   .brand span{display:none}
   .hsearch{flex:1 1 auto;max-width:none;min-width:0;margin-left:0;order:2}
   .hsearch input{flex:1;min-width:0;font-size:14px}
+  /* 窄屏第一行：品牌 + 身份入口（搜索另起一行，见上面的 order） */
+  .hacc{order:1;margin-left:auto;padding:6px 11px;font-size:12.5px}
+  form.hacc .hacbtn{padding:6px 11px;font-size:12.5px}
   .tabs{order:3;flex:0 0 100%;overflow-x:auto;scrollbar-width:none;
     white-space:nowrap;margin:2px -4px 0;padding:0 4px}
   .tabs::-webkit-scrollbar{display:none}
@@ -693,13 +705,15 @@ MARK_JS = """
 """
 
 
-def _html_page(title, body_inner, active="", extra_css="", is_admin=False):
+def _html_page(title, body_inner, active="", extra_css="", is_admin=False, back="/"):
     """整页外壳。``is_admin`` 是**渲染期开关**：非管理员时「已读完」入口这段 HTML
     根本不会被拼出来 —— 前端拿到的是「没有这个入口」的页面，而不是「用 CSS 藏起来」
     的页面（CSS 隐藏可以用查看源码/开发者工具还原，等于没有权限控制）。
 
     真正的权限闸门在服务端路由（``OPDSHandler`` 的 ``_role()`` 与 403 分支）；
     这里只负责「不给入口」，属于体验层，两道一起才叫完整。
+
+    ``back`` 是当前页面地址：登录后跳回原处、退出后也留在原地。
     """
     tabs = [
         ("done",    "/opds/catalog/" + quote(CATEGORY_DONE),    CATEGORY_DONE),
@@ -712,6 +726,17 @@ def _html_page(title, body_inner, active="", extra_css="", is_admin=False):
     tab_html = "".join(
         '<a class="tab%s" href="%s">%s</a>' % (" on" if k == active else "", href, label)
         for k, href, label in tabs)
+    # 右上角的身份入口：管理员给「退出」，访客给「登录」。**访客页面只有「登录」两字**，
+    # 不写「登录后可看已读完」这类说明 —— 管理员专有字样不能出现在访客源码里（同 MARK_JS）。
+    back_attr = html.escape(back, quote=True)
+    if is_admin:
+        acc_html = ('<form class="hacc" method="post" action="/opds/logout">'
+                    f'<input type="hidden" name="back" value="{back_attr}">'
+                    '<button class="hacbtn" type="submit" title="退出管理员登录">退出</button>'
+                    "</form>")
+    else:
+        acc_html = (f'<a class="hacc" href="/opds/login?back={quote(back, safe="")}"'
+                    ' title="管理员登录">登录</a>')
     # grpAll：分组展开/折叠，访客也用得上，人人下发。
     # MARK_JS：标记按钮的原地生效层 —— 只有管理员页面才有那个按钮，脚本也只在管理员
     # 页面注入：既省流量，也不让「已读完」这类管理员专有字样出现在访客拿到的源码里。
@@ -734,12 +759,83 @@ def _html_page(title, body_inner, active="", extra_css="", is_admin=False):
         '<form class="hsearch" action="/opds/search">'
         '<input name="q" placeholder="搜索书名或卷名…" aria-label="搜索">'
         '<button type="submit">搜索</button></form>'
+        f"{acc_html}"
         "</div></header>"
         f'<main class="wrap">{body_inner}</main>'
         f'<footer>{html.escape(SERVER_TITLE)} · OPDS 书源 · 由 opds_server.py 自动维护</footer>'
         + script +
         "</body></html>"
     )
+
+
+# 登录页专用样式。刻意**不并进 SITE_CSS**：一是省流量（每个页面都要下发一份 CSS），
+# 二是它只在登录页用得上，混进去以后没人敢删。
+LOGIN_CSS = """
+.lgate{max-width:360px;margin:10vh auto 0}
+.lgcard{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  box-shadow:var(--shadow);padding:26px 24px}
+.lgcard h1{font-size:19px;margin:0 0 6px}
+.lgcard .sub{margin:0 0 20px;font-size:12.5px;line-height:1.6}
+.lgcard label{display:block;font-size:12.5px;color:var(--muted);margin:0 0 6px}
+.lgcard input[type=text],.lgcard input[type=password]{width:100%;padding:10px 12px;font-size:14px;
+  font-family:inherit;border:1px solid var(--border);border-radius:9px;background:var(--bg);
+  color:var(--text);outline:none;margin:0 0 15px}
+.lgcard input:focus{border-color:var(--accent)}
+.lgcard button{width:100%;padding:11px;font-size:14px;font-family:inherit;border:0;
+  border-radius:9px;background:var(--accent);color:var(--accent-fg);cursor:pointer}
+.lgcard button:hover{filter:brightness(1.08)}
+.lgcard button[disabled]{opacity:.55;cursor:not-allowed;filter:none}
+.lgerr{padding:10px 12px;border-radius:9px;background:#fff1f0;border:1px solid #ffcdd2;
+  color:#a40e26;font-size:12.5px;margin-bottom:16px;line-height:1.55}
+@media (prefers-color-scheme:dark){
+  .lgerr{background:#3a1518;border-color:#6b2b30;color:#ffb3b8}
+}
+.lgback{text-align:center;margin-top:16px;font-size:12.5px}
+"""
+
+
+def login_html(err="", back="/", wait=0):
+    """管理员登录页（公开可达 —— 它本身就是入口）。
+
+    * 文案里**不出现「已读完」**：那是管理员专有的字样，而这个页面谁都拿得到
+      （项目里有专门的断言在盯「访客源码不含管理员字样」这条约定）。
+    * ``wait`` > 0 时按钮直接禁用：连着试错之后，与其让用户点了没反应，不如把
+      还要等多久写清楚。
+    """
+    esc = lambda s: html.escape(str(s), quote=True)          # noqa: E731
+    err_html = f'<div class="lgerr">{esc(err)}</div>' if err else ""
+    btn = ('<button type="submit" disabled>请稍候…</button>' if wait
+           else '<button type="submit">登录</button>')
+    body = (
+        '<div class="lgate"><div class="lgcard">'
+        "<h1>管理员登录</h1>"
+        '<p class="sub">登录后可进行标记、清单等管理操作。<br>'
+        "不登录也可以正常浏览、搜索、下载与订阅。</p>"
+        + err_html +
+        f'<form method="post" action="/opds/login">'
+        f'<input type="hidden" name="back" value="{esc(back)}">'
+        '<label for="lg-u">用户名</label>'
+        '<input id="lg-u" name="user" type="text" autocomplete="username" autofocus>'
+        '<label for="lg-p">口令</label>'
+        '<input id="lg-p" name="pass" type="password" autocomplete="current-password">'
+        + btn +
+        "</form>"
+        '<div class="lgback"><a href="/">← 返回书库</a></div>'
+        "</div></div>")
+    return (
+        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+        '<meta name="theme-color" content="#0e1116">'
+        f'<link rel="icon" href="{FAVICON}">'
+        f"<title>{html.escape('管理员登录 · ' + SERVER_TITLE)}</title>"
+        f"<style>{SITE_CSS}{LOGIN_CSS}</style>"
+        "</head><body>"
+        '<header><div class="hbar">'
+        f'<a class="brand" href="/"><span class="dot">&#128218;</span>'
+        f'<span>{html.escape(SERVER_TITLE)}</span></a>'
+        "</div></header>"
+        f'<main class="wrap">{body}</main>'
+        "</body></html>")
 
 
 def _cover_url(rel):
@@ -982,7 +1078,8 @@ def catalog_html(cat, page=1, is_admin=False):
         f'<div class="grid">{cards}</div>'
         + _pager_html(page, _next_link(extra), _prev_link(extra))
     )
-    return _html_page(f"{label} · {SERVER_TITLE}", body, active=active, is_admin=is_admin)
+    return _html_page(f"{label} · {SERVER_TITLE}", body, active=active,
+                      is_admin=is_admin, back=back)
 
 
 def book_html(rel, page=1, is_admin=False):               # page 参数保留以兼容旧 URL，详情页不再分页
@@ -1060,7 +1157,8 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
         + (groups_html or '<div class="empty">这一页没有内容</div>')
     )
     active = "done" if cat == CATEGORY_DONE else "ongoing"
-    page_html = _html_page(f"{book} · {SERVER_TITLE}", body, active=active, is_admin=is_admin)
+    page_html = _html_page(f"{book} · {SERVER_TITLE}", body, active=active, is_admin=is_admin,
+                           back="/opds/book/" + encode_path(rel))
 
     # 「看过了」= 点进来就把这本书的更新提示收掉（回到列表就回到原位）。
     # 只有管理员算「看过」—— 访客浏览不该静默消掉管理员的提醒。
@@ -1185,7 +1283,8 @@ def recent_html(page=1, is_admin=False):
         + (rows or '<div class="empty">暂无内容</div>')
         + _pager_html(page, _next_link(extra), _prev_link(extra))
     )
-    return _html_page(f"最近更新 · {SERVER_TITLE}", body, active="recent", is_admin=is_admin)
+    return _html_page(f"最近更新 · {SERVER_TITLE}", body, active="recent", is_admin=is_admin,
+                      back="/opds/recent?page=" + str(page))
 
 
 def search_html(q, page=1, is_admin=False):
@@ -1210,7 +1309,8 @@ def search_html(q, page=1, is_admin=False):
         "<h1>搜索</h1>"
         + result_html + pager
     )
-    return _html_page(f"搜索 · {SERVER_TITLE}", body, active="", is_admin=is_admin)
+    url = "/opds/search?q=" + quote(q) + "&page=" + str(page) if q else "/opds/search"
+    return _html_page(f"搜索 · {SERVER_TITLE}", body, active="", is_admin=is_admin, back=url)
 
 
 def read_html(page=1):
@@ -1253,7 +1353,7 @@ def read_html(page=1):
         + listing
         + _pager_html(page, _next_link(extra), _prev_link(extra))
     )
-    return _html_page(f"已读完 · {SERVER_TITLE}", body, active="read", is_admin=True)
+    return _html_page(f"已读完 · {SERVER_TITLE}", body, active="read", is_admin=True, back=back)
 
 
 # 兼容旧名

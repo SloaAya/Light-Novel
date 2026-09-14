@@ -48,6 +48,7 @@ from .library import (
     resolve_under,
 )
 from .finished import normalize_key, toggle_finished
+from . import session
 from . import updates as upd
 from .feeds import (
     _accept_wants_xml,
@@ -60,6 +61,7 @@ from .feeds import (
     feed_root,
     feed_search,
     index_html,
+    login_html,
     opensearch_xml,
     read_html,
     recent_html,
@@ -110,33 +112,77 @@ class OPDSHandler(BaseHTTPRequestHandler):
             return False
         return host in ("::1", "localhost") or host.startswith("127.")
 
+    def _cookie(self, name):
+        """从 ``Cookie:`` 头里取一个值（没有 → 空串）。"""
+        return session.parse_cookie(self.headers.get("Cookie", "")).get(name, "")
+
+    def _session_ok(self):
+        """网页登录态：签名 cookie 有效即管理员。"""
+        return session.verify(self._cookie(session.COOKIE_NAME))
+
+    def _client_ip(self):
+        """节流用的来源标识：隧道下取 Cloudflare 的 ``CF-Connecting-IP``，否则取 socket 对端。"""
+        ip = (self.headers.get("CF-Connecting-IP", "") or "").strip()
+        if not ip:
+            ip = (self.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
+        if not ip:
+            ip = self.client_address[0] if self.client_address else "?"
+        return ip
+
     def _role(self):
         """判定本次请求的角色 → ``"admin"`` / ``"guest"`` / ``None``（拒绝）。
 
-        判定规则（两条，无第三套逻辑）：
-          1. **配了管理员口令**（LN_OPDS_USER/PASS）：拿 Basic 凭据去比 ——
-             命中管理员=``admin``；命中访客口令（LN_OPDS_GUEST_USER/PASS）=``guest``；
-             不匹配/没带 → ``None``（401）。两级口令都留空则「访客」这一档不存在。
-          2. **完全免密**：回环地址（本机 127.0.0.1 / ::1）=``admin``，
-             其余（局域网、公网隧道）=``guest``。
-             于是「本机浏览器打开面板 = 管理员、外面的人只能看」是默认行为，
-             不需要额外配置就有安全的下限。
+        判定规则（三条，按顺序短路）：
 
-        免密 + 公网暴露时，请在 launchers/*.bat 里设置 LN_OPDS_USER/PASS，
-        手机阅读器地址写成 ``https://用户名:口令@域名/`` 即可拿到管理员身份。
+          1. **登录 cookie 有效** → ``admin``（网页登录页拿到的那个签名 cookie）；
+          2. **Basic 凭据命中** → 管理员口令=``admin``，访客口令
+             （LN_OPDS_GUEST_USER/PASS）=``guest``；
+          3. **完全没配任何口令 + 回环地址** → ``admin``
+             （本机开机就能管，零配置的安全下限）；
+          4. 其余一律 ``guest``。
+
+        ⚠ 第 2 条**不匹配时不会拒绝**，而是落到第 4 条当访客 —— 这是刻意的：
+        浏览器会把上次输过的 Basic 凭据长期缓存并自动附上，一旦这里回 401，
+        用户每次打开书库都会被系统认证框拦一下（口令早就改过了），
+        「匿名也能正常访问」就成了空话。口令对不对由登录页明确告诉你（401 + 文案），
+        Basic 只管「带了正确凭据就升权」，不负责「带了错凭据就赶人」。
+
+        第 4 条保证**未登录也能正常浏览与下载**：全站只有「已读完」这类管理功能
+        需要管理员身份，书库本身是给访客看的。
         """
-        if AUTH_USER or AUTH_PASS:
-            creds = self._basic_creds()
-            if not creds:
-                return None
+        if self._session_ok():
+            return "admin"
+        creds = self._basic_creds()
+        if creds:
             user, pw = creds
-            if self._same(user, AUTH_USER) and self._same(pw, AUTH_PASS):
+            if (AUTH_USER or AUTH_PASS) \
+                    and self._same(user, AUTH_USER) and self._same(pw, AUTH_PASS):
                 return "admin"
             if (AUTH_GUEST_USER or AUTH_GUEST_PASS) \
                     and self._same(user, AUTH_GUEST_USER) and self._same(pw, AUTH_GUEST_PASS):
                 return "guest"
-            return None
-        return "admin" if self._is_loopback() else "guest"
+        if not (AUTH_USER or AUTH_PASS) and self._is_loopback():
+            return "admin"
+        return "guest"
+
+    # -------------------------------------------------------- 登录 cookie
+    def _is_https(self):
+        """是不是走 HTTPS 进来的（隧道会带 ``X-Forwarded-Proto``）。"""
+        proto = (self.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+        return proto == "https"
+
+    def _cookie_header(self, token, max_age=session.TTL):
+        """拼 ``Set-Cookie``：``HttpOnly`` 防脚本读取，``SameSite=Lax`` 挡跨站携带。
+
+        ``Secure`` 只在 HTTPS 时加 —— 加了之后浏览器只在 HTTPS 上回传这个 cookie，
+        本机 ``http://127.0.0.1`` 会变成「怎么登都不是管理员」。两种入口各自登录即可，
+        安全优先。
+        """
+        parts = ["%s=%s" % (session.COOKIE_NAME, token or ""),
+                 "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=%d" % max_age]
+        if self._is_https():
+            parts.append("Secure")
+        return "; ".join(parts)
 
     def _deny(self):
         self.send_response(401)
@@ -200,6 +246,18 @@ class OPDSHandler(BaseHTTPRequestHandler):
 
             if path == "/opds/opensearch.xml":
                 self._send(200, opensearch_xml(), "application/opensearchdescription+xml; charset=utf-8",
+                           head_only=head_only)
+                return
+
+            if path == "/opds/login":
+                # 登录页：访客能打开（这正是它的用途），已经是管理员的直接送回去。
+                back = self._local_back(qs.get("back", ["/"])[0], "/")
+                if is_admin:
+                    self._redirect(back)
+                    return
+                wait = session.login_throttle.retry_after(self._client_ip())
+                err = "尝试次数过多，请 %d 秒后再试。" % wait if wait else ""
+                self._send(200, login_html(err, back, wait), "text/html; charset=utf-8",
                            head_only=head_only)
                 return
 
@@ -361,12 +419,68 @@ class OPDSHandler(BaseHTTPRequestHandler):
             return fallback
         return back
 
-    def _redirect(self, location):
+    def _redirect(self, location, extra=None):
         """303：刷新后是 GET，页面状态由服务端重绘，天然正确（不用前端记账）。"""
         self.send_response(303)
         self.send_header("Location", location)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    # -------------------------------------------------------- 登录 / 退出
+    def _do_login(self):
+        """管理员登录。三道关：同源 → 节流 → 口令比对。
+
+        口令不对回 **401 + 登录页**（带 ``WWW-Authenticate`` 才会触发系统认证框，
+        这里刻意不发，所以浏览器老老实实渲染我们的错误文案）。
+        """
+        if not self._same_origin():
+            self._send(403, "<h1>403</h1><p>跨站请求被拒绝</p>", "text/html; charset=utf-8")
+            return
+        form = self._form()
+        back = self._local_back(form.get("back", ["/"])[0], "/")
+        ip = self._client_ip()
+        wait = session.login_throttle.retry_after(ip)
+        if wait:
+            self._send(429, login_html("尝试次数过多，请 %d 秒后再试。" % wait, back, wait),
+                       "text/html; charset=utf-8")
+            return
+        if not (AUTH_USER or AUTH_PASS):
+            self._send(503, login_html("服务端没有设置管理员口令（LN_OPDS_USER / LN_OPDS_PASS），"
+                                       "无法登录；不登录也可以正常浏览。", back),
+                       "text/html; charset=utf-8")
+            return
+        user = (form.get("user", [""])[0] or "").strip()
+        pw = form.get("pass", [""])[0] or ""
+        if self._same(user, AUTH_USER) and self._same(pw, AUTH_PASS):
+            session.login_throttle.ok(ip)
+            log.info("管理员登录成功（%s）", ip)
+            self._redirect(back, {"Set-Cookie": self._cookie_header(session.issue())})
+            return
+        n = session.login_throttle.fail(ip)
+        log.warning("管理员登录失败（%s 第 %d 次）", ip, n)
+        self._send(401, login_html("用户名或口令不对。", back), "text/html; charset=utf-8")
+
+    def _logout_back(self, back):
+        """退出后的落点：管理员专属页面在退出后必然 403，回首页，别把人丢进错误页。"""
+        for prefix in ("/opds/read",):
+            if back == prefix or back.startswith(prefix + "?") or back.startswith(prefix + "/"):
+                return "/"
+        return back
+
+    def _do_logout(self):
+        """退出登录：把 cookie 置空并设 ``Max-Age=0``（浏览器立刻删掉）。
+
+        用 POST 而不是 GET —— GET 退出会被「页面里塞个 <img src=...>」这类
+        跨站花招触发成「莫名掉线」。
+        """
+        if not self._same_origin():
+            self._send(403, "<h1>403</h1><p>跨站请求被拒绝</p>", "text/html; charset=utf-8")
+            return
+        back = self._local_back(self._form().get("back", ["/"])[0], "/")
+        log.info("管理员退出登录（%s）", self._client_ip())
+        self._redirect(self._logout_back(back), {"Set-Cookie": self._cookie_header("", 0)})
 
     def do_POST(self):
         role = self._role()
@@ -375,6 +489,12 @@ class OPDSHandler(BaseHTTPRequestHandler):
             return
         path = unquote(urlparse(self.path).path)
         try:
+            if path == "/opds/login":
+                self._do_login()
+                return
+            if path == "/opds/logout":
+                self._do_logout()
+                return
             if path == "/opds/read/toggle":
                 # 三道关：① 已认证（上面） ② 必须是管理员 ③ 必须是同源表单
                 if role != "admin":
@@ -763,10 +883,14 @@ EXTERNET_NOTE = """
 4) frp / 花生壳 / 樱花穿透 等国内穿透
    需要一台有公网 IP 的服务器（或买现成服务），把 127.0.0.1:8080 映射出去。
 
-安全建议：暴露到公网时务必设置口令：
+访问身份：书库本身对所有人开放（浏览 / 搜索 / 下载 / OPDS 订阅都不需要口令）；
+只有「已读完」这类管理功能要管理员身份。两条登入口令的路径：
+  * 网页：浏览器打开 /opds/login 用用户名 + 口令登录（签名 cookie，30 天有效）；
+  * 阅读器 / 脚本：把地址写成 https://用户名:口令@域名/ 直接带 Basic 凭据。
+设置口令（暴露公网时强烈建议）：
    set LN_OPDS_USER=你的用户名
    set LN_OPDS_PASS=你的口令
-阅读器里把地址写成 https://用户名:口令@域名/ 即可通过 Basic 认证。
+未设置任何口令时：本机(127.0.0.1)来源视为管理员，其余来源是访客。
 """
 
 
@@ -810,16 +934,13 @@ def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False,
     lan_url = f"http://{local_ip()}:{port}/"
     log.info("OPDS 服务启动：%s（bind %s）", lan_url, bind)
     if AUTH_USER or AUTH_PASS:
-        log.info("已启用 Basic 认证：管理员=%s，访客=%s",
-                 AUTH_USER or "(空)", AUTH_GUEST_USER or "(未设置：访客档不存在，非管理员一律 401)")
-        if AUTH_GUEST_USER or AUTH_GUEST_PASS:
-            log.info("访客可正常浏览/下载，但看不到「已读完」（管理员专属入口）。")
-        else:
-            log.info("「已读完」入口仅对管理员账号可见；其他人连书库都进不去（未配访客口令）。")
+        log.info("已启用管理员口令：网页在 /opds/login 登录（签名 cookie，%d 天）；"
+                 "阅读器可用 https://用户:口令@域名/ 直接带 Basic 凭据。", session.TTL // 86400)
+        log.info("未登录/访客：可正常浏览、搜索、下载与订阅，只是看不到「已读完」入口。")
     else:
-        log.warning("当前为免密访问：本机(127.0.0.1)视为管理员，其余来源视为访客"
-                    "（可浏览/下载，但看不到「已读完」入口）。"
-                    "已暴露公网的话，请设置 LN_OPDS_USER / LN_OPDS_PASS。")
+        log.warning("当前没有设置管理员口令：谁都不能登录，只有本机(127.0.0.1)来源算管理员。"
+                    "要管理「已读完」请设置 LN_OPDS_USER / LN_OPDS_PASS 后重启；"
+                    "书库浏览/下载对所有来源开放。")
 
     print("\n" + "=" * 62)
     print(f"  OPDS 书源已启动   端口 {port}")

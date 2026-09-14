@@ -26,6 +26,13 @@
   只存相对路径，**标题/所属子目录等展示信息渲染时再从书库索引里取** ——
   单一真源，不会留下「清单里还写着改名前的旧标题」这种坑。
 
+和一个「已读完」清单的联动
+--------------------------
+检测到某部作品多了新卷时，若它正躺在 ``finished.json`` 里，就顺手把标记摘掉
+（见 :func:`observe`）。理由：标记的语义是「这本书我看完了」，而补了新卷之后
+这个结论不成立 —— 留着它，新卷就会被「已读完」这层名义盖住，恰好和本模块想解决的
+问题撞在一起。摘标记是幂等的，重复触发不会出错；真看完再点一次即可。
+
 与 ``finished.py`` 同一套约定：运行时状态不进仓库（``.autosync/`` 已 gitignore）、
 写入原子（临时文件 + fsync + :func:`os.replace`）、读取永不抛（缺失/损坏 → 当空）、
 读写全程持锁（``ThreadingHTTPServer`` 是并发的）。
@@ -39,7 +46,8 @@ import threading
 import time
 
 from ..paths import CATEGORY_DIRS, UPDATES_FILE
-from .finished import normalize_key        # 作品键（分类/书名）的校验规则复用同一份
+# 作品键（分类/书名）的校验规则复用同一份；「已读完」清单也复用同一套落盘约定
+from .finished import is_finished, mark_finished, normalize_key
 
 log = logging.getLogger("sync")
 
@@ -191,6 +199,13 @@ def observe(lib=None):
                                     "vols": list(dict.fromkeys(old["vols"] + new_vols))}
                     dirty = True
                     log.info("检测到新增卷：%s +%d 卷", key, len(new_vols))
+                    # 已读完的作品补了新卷 → 「读完了」这个结论不再成立，自动摘掉标记。
+                    # 不摘的话，新卷会被「已读完」这层名义盖住（管理员以为全看过了），
+                    # 而这正是「新增卷提示」要防的事。标记是幂等的，重复触发无副作用；
+                    # 真看完了再标一次即可（详情页就有按钮）。
+                    if is_finished(key):
+                        mark_finished(key, False)
+                        log.info("「%s」出现新卷，已自动从「已读完」清单剔除", key)
             if live != seen:
                 state["seen"] = live
                 dirty = True
