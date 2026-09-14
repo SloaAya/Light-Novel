@@ -880,6 +880,88 @@ info("测试全程未触碰真实 F 盘 / 未执行任何 git push",
 info("本轮新增清理项之外，未删除任何功能",
      "A 类注释选项 / B 类开关功能 / D 类兼容入口 均在位（见 A 节断言）")
 
+# ============================== P. 面板状态灯与乱码 ==============================
+section("P. 控制面板：状态灯时机 + 子进程编码（乱码回归）")
+
+# 缺陷③：单实例锁必须在**初始同步之前**拿到。
+# 旧顺序是 perform_sync("sync: 初始同步") -> monitor_loop()（锁在 loop 里才写），
+# 全量镜像 + git 推送实测两分钟起步，那段时间面板读不到锁 -> 一直显示「已停止」，
+# 而且单实例保护也是空的（可并发跑两个实例互相踩）。
+_mainsrc = _src[_src.index("def main("):]
+_i_lock = _mainsrc.find("acquire_lock()")
+_i_sync = _mainsrc.find('perform_sync("sync: 初始同步")')
+check("缺陷③ 锁在初始同步之前获取（状态灯立刻变绿 + 单实例保护不留空窗）",
+      lambda: (0 <= _i_lock < _i_sync,
+               "acquire_lock@%d < perform_sync@%d" % (_i_lock, _i_sync)))
+check("缺陷③ 监控循环不再自己抢锁（锁统一由 main 的 try/finally 收尾）",
+      lambda: ("def monitor_loop" in _src
+               and "acquire_lock()" not in _src[_src.index("def monitor_loop"):_src.index("def start_opds_background")],
+               ""))
+check("锁路径只有一处定义（面板与监控不会各写一份文件名）",
+      lambda: (S.lock_path().endswith("monitor.lock")
+               and "LOCK_FILE" not in open(os.path.join(ROOT, "lightnovel", "paths.py"),
+                                           encoding="utf-8").read(),
+               "lock_path=%s" % os.path.basename(S.lock_path())))
+
+# 缺陷④：面板用 PIPE 抓子进程输出并按 UTF-8 解码，而子进程在管道里默认按系统 locale
+# （中文 Windows = cp936/GBK）输出 -> 每个汉字都解不出来，日志里整片变成「◆」。
+# 修法是子进程自己在 cli._pipe_utf8() 里把**非 tty** 的 stdout/stderr reconfigure
+# 成 UTF-8；控制台（isatty）必须保持系统代码页，否则 cmd 里反而花屏。
+# 注意：不能靠给子进程设 PYTHONIOENCODING —— 实测 PyInstaller 打出来的 exe 不认它。
+from lightnovel import cli as CLI  # noqa: E402
+
+
+class _FakeStream:
+    def __init__(self, tty):
+        self._tty = tty
+        self.enc = None
+
+    def isatty(self):
+        return self._tty
+
+    def reconfigure(self, **kw):
+        self.enc = kw.get("encoding")
+
+
+_stdout_backup, _stderr_backup = sys.stdout, sys.stderr
+try:
+    _pipe_out, _pipe_err, _tty_stream = _FakeStream(False), _FakeStream(False), _FakeStream(True)
+    sys.stdout, sys.stderr = _pipe_out, _pipe_err
+    CLI._pipe_utf8()
+    sys.stdout = _tty_stream
+    CLI._pipe_utf8()
+finally:
+    sys.stdout, sys.stderr = _stdout_backup, _stderr_backup
+
+check("缺陷④ 管道下 stdout/stderr 钉成 UTF-8（面板按 UTF-8 解码）",
+      lambda: (_pipe_out.enc == "utf-8" and _pipe_err.enc == "utf-8",
+               "stdout=%s stderr=%s" % (_pipe_out.enc, _pipe_err.enc)))
+check("缺陷④ 真实控制台不改编码（cp936 控制台按 UTF-8 输出会花屏）",
+      lambda: (_tty_stream.enc is None, "enc=%s" % _tty_stream.enc))
+
+_src_cli = open(os.path.join(ROOT, "lightnovel", "cli.py"), encoding="utf-8").read()
+_main_cli = _src_cli[_src_cli.index("def main("):]
+check("缺陷④ _pipe_utf8 在 main() 里、且在任何输出之前被调用",
+      lambda: (0 <= _main_cli.find("_pipe_utf8()") < _main_cli.find("if not argv:"),
+               "_pipe_utf8@%d" % _main_cli.find("_pipe_utf8()")))
+
+# 端到端：剥掉 PYTHONUTF8 / PYTHONIOENCODING（面板不会设它们），走真实入口拉一个
+# 管道子进程，它输出的中文必须是合法 UTF-8 —— 不是的话面板那边就会满屏 ◆。
+_ENV_CLEAN = {k: v for k, v in os.environ.items()
+              if k not in ("PYTHONUTF8", "PYTHONIOENCODING", "PYTHONLEGACYWINDOWSSTDIO")}
+_enc_proc = subprocess.run([PY, "-m", "lightnovel", "opds", "--help-internet"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           env=_ENV_CLEAN, timeout=180, cwd=ROOT)
+_enc_raw = _enc_proc.stdout
+try:
+    _enc_text = _enc_raw.decode("utf-8")
+    _enc_ok = True
+except UnicodeDecodeError:
+    _enc_text, _enc_ok = _enc_raw.decode("gbk", "replace"), False
+check("缺陷④ 端到端：面板管道下子进程的中文是合法 UTF-8（不再满屏 ◆）",
+      lambda: (_enc_ok and any("\u4e00" <= c <= "\u9fff" for c in _enc_text),
+               "退出码=%s 前 40 字节=%r" % (_enc_proc.returncode, _enc_raw[:40])))
+
 # ============================== 汇总 ==============================
 print("\n" + "=" * 70)
 _p = [r for r in RESULTS if r[2]]

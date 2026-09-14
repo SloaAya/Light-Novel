@@ -167,8 +167,18 @@ def _pid_alive(pid):
         return False
 
 
+def lock_path():
+    """单实例锁文件的路径 —— 全项目唯一真源。
+
+    特意由 ``LOG_DIR`` **现算**，而不是直接用 ``paths.LOCK_FILE``：测试会把
+    ``LOG_DIR`` 换成临时目录，只有现算才跟得上；面板也复用本函数，避免出现
+    「监控写 A、面板读 B」两处各写一份文件名的隐患。
+    """
+    return os.path.join(LOG_DIR, "monitor.lock")
+
+
 def acquire_lock():
-    lock = os.path.join(LOG_DIR, "monitor.lock")
+    lock = lock_path()
     pid = None
     try:
         with open(lock, "r", encoding="utf-8") as fh:
@@ -187,17 +197,20 @@ def acquire_lock():
 
 
 def release_lock():
-    lock = os.path.join(LOG_DIR, "monitor.lock")
     try:
-        os.remove(lock)
+        os.remove(lock_path())
     except OSError:
         pass
 
 
 # ---------------------------- 监控主循环 ----------------------------
 def monitor_loop():
-    if not acquire_lock():
-        return
+    """实时监控循环。
+
+    ⚠ 锁**不由本函数管理**：``main()`` 在初始同步之前就先占锁（那一步要跑全量
+    F 盘镜像 + git 推送，实测两分钟起步，期间没锁会让面板状态灯一直是红的、
+    单实例保护也是空的）。本函数只负责循环本身，锁由 main 的 try/finally 收尾。
+    """
     log.info("开始后台实时监控 %s（每 %d 秒轮询一次，Ctrl+C 退出）", "、".join(WATCH_DIRS), MONITOR_INTERVAL)
     prev = snapshot_dir(WATCH_DIRS)
     try:
@@ -233,8 +246,6 @@ def monitor_loop():
                 log.error("监控轮询出错：%s", exc)
     except KeyboardInterrupt:
         log.info("收到中断信号，停止监控。")
-    finally:
-        release_lock()
 
 
 # ---------------------------- OPDS 书源（手机端） ----------------------------
@@ -376,12 +387,22 @@ def main():
         return
 
     # 默认模式：（可选）种子复制 + 提交推送 + 持续监控
-    if ENABLE_SEED_COPY and not args.monitor_only:
-        smart_copy()
-    perform_sync("sync: 初始同步")
-    if args.opds:
-        start_opds_background(args.opds_port)
-    monitor_loop()
+    # ⚠ 锁必须在**初始同步之前**拿到：那一步要跑全量 F 盘镜像 + git 推送，实测
+    #   两分钟起步。期间若还没写锁，控制面板会一直显示「已停止」（用户看不出它在
+    #   干活），而且单实例保护形同虚设 —— 这段时间再启动一个实例，就会两个进程
+    #   并发跑同步/镜像/git，互相踩（rebase 撞 git rm 会造成工作区幽灵删除）。
+    if not acquire_lock():
+        log.error("已有监控实例在运行（锁文件 %s），本实例退出。", lock_path())
+        sys.exit(1)
+    try:
+        if ENABLE_SEED_COPY and not args.monitor_only:
+            smart_copy()
+        perform_sync("sync: 初始同步")
+        if args.opds:
+            start_opds_background(args.opds_port)
+        monitor_loop()
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":
