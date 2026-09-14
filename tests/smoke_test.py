@@ -159,6 +159,12 @@ import lightnovel.tunnel_setup as T                                    # noqa: E
 O = _Agg(OL, OF, OS, P)      # 对应原 opds_server.py
 S = _Agg(SG, SM, SN, P)      # 对应原 sync_lightnovel.py
 
+# 会话签名密钥一开始就隔离到临时目录：E 节的 HTTP 用例会真的走一遍 _role()，
+# 不先指一下就会在真实 .autosync/ 里生成一把密钥（测试不该有这种副作用）。
+from lightnovel.opds import session as OSESS          # noqa: E402
+_SESS_DEFAULT = OSESS.SESSION_KEY_FILE                # 打桩前的真实默认路径（T 节要核对它）
+OSESS.SESSION_KEY_FILE = os.path.join(TMP_ROOT, "session.key")
+
 # ---- 日志重定向：验证 setup_logging 真能建文件，同时保持控制台干净 ----
 slog = logging.getLogger("sync")
 _orig_log_file = S.LOG_FILE
@@ -405,19 +411,27 @@ _s, _h, _b = http("/", method="HEAD")
 check("HEAD / 只回头不带 body",
       lambda: (_s == 200 and _b == b"" and _h.get("Content-Length", "0") != "0", "len=%d" % len(_b)))
 
-# ---- Basic 认证（运行时改全局，用完即恢复）----
+# ---- Basic 凭据（运行时改全局，用完即恢复）----
+# 新版模型：Basic 只管「带了正确凭据就升权」，不负责「带了错凭据就赶人」——
+# 匿名与错口令都降级成访客（200 + 正常页面），绝不回 401。原因见 OPDSHandler._role：
+# 浏览器会把旧 Basic 凭据长期自动附上，回 401 就会每次开书库都弹一次系统认证框。
+_ADMIN = "已读完".encode("utf-8")
 _o_u, _o_p = O.AUTH_USER, O.AUTH_PASS
 O.AUTH_USER, O.AUTH_PASS = "tester", "s3cret"
 try:
     _s, _h, _b = http("/")
-    check("开启口令后无凭据 -> 401",
-          lambda: (_s == 401 and "Basic" in (_h.get("WWW-Authenticate") or ""), "status=%s" % _s))
+    check("配了口令后匿名 -> 200 访客页（不再 401，浏览器不会弹认证框）",
+          lambda: (_s == 200 and _h.get("WWW-Authenticate") is None
+                   and b"/opds/login" in _b and _ADMIN not in _b, "status=%s" % _s))
     _s, _h, _b = http("/", headers={"Authorization": "Basic " + base64.b64encode(b"tester:s3cret").decode()})
-    check("正确凭据 -> 200", lambda: (_s == 200, "status=%s" % _s))
+    check("正确凭据 -> 200（管理员视角，含「已读完」入口）",
+          lambda: (_s == 200 and _ADMIN in _b, "status=%s" % _s))
     _s, _h, _b = http("/", headers={"Authorization": "Basic " + base64.b64encode(b"tester:wrong").decode()})
-    check("错误口令 -> 401", lambda: (_s == 401, "status=%s" % _s))
+    check("错误口令 -> 200 访客页（降级而非 401，旧凭据被缓存时不会反复弹框）",
+          lambda: (_s == 200 and _ADMIN not in _b and b"/opds/login" in _b, "status=%s" % _s))
     _s, _h, _b = http("/", headers={"Authorization": "Bearer abc"})
-    check("非 Basic 认证头 -> 401", lambda: (_s == 401, "status=%s" % _s))
+    check("非 Basic 认证头 -> 200 访客页（解析不出来就当没带）",
+          lambda: (_s == 200 and _ADMIN not in _b, "status=%s" % _s))
 finally:
     O.AUTH_USER, O.AUTH_PASS = _o_u, _o_p
 
@@ -1149,15 +1163,17 @@ try:
     from lightnovel.opds import server as SRV
     from lightnovel.opds import feeds as FEED
     from lightnovel.opds import library as LIB
+    from lightnovel.opds import session as SESS
     _R_ERR = ""
 except Exception as _exc:
-    FIN = SRV = FEED = LIB = None
+    FIN = SRV = FEED = LIB = SESS = None
     _R_ERR = "%s: %s" % (type(_exc).__name__, _exc)
 
 # 全部落在临时目录，绝不碰真实 .autosync/finished.json
 _R_TMP = os.path.join(TMP_ROOT, "read")
 os.makedirs(_R_TMP, exist_ok=True)
 _FIN_DEFAULT = FIN.FINISHED_FILE if FIN is not None else ""   # 打桩前的真实默认路径
+# 会话密钥的默认路径在文件开头的导入区就存下来了（那时还没打桩），见 _SESS_DEFAULT
 
 
 def _rcheck(label, fn):
@@ -1306,20 +1322,34 @@ _rcheck("清单粒度是「作品」不是「卷」：键 = 分类/书名",
 
 # ---------- R3. 角色判定（唯一入口 _role） ----------
 _r_saved_auth = (SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS)
+# 会话密钥也指到临时目录：判定真的走到 cookie 分支时，不会去动真实 .autosync/session.key
+_SESS_KEY = os.path.join(_R_TMP, "session.key")
 
 
-def _role_of(peer, user=None, pw=None):
+def _reset_sess():
+    """把签名密钥指到临时文件并清空缓存 / 节流计数。"""
+    SESS.SESSION_KEY_FILE = _SESS_KEY
+    if os.path.exists(_SESS_KEY):
+        os.remove(_SESS_KEY)
+    SESS.forget_key()
+    SESS.login_throttle.clear()
+    return _SESS_KEY
+
+
+def _role_of(peer, user=None, pw=None, cookie=None):
     """用桩对象跑真实的 _role()，不经过网络（判定逻辑是纯函数）。"""
     import types
     h = types.SimpleNamespace()
-    if user is None:
-        h.headers = {}
-    else:
-        h.headers = {"Authorization": "Basic " + base64.b64encode(
-            ("%s:%s" % (user, pw)).encode("utf-8")).decode("ascii")}
+    hdr = {}
+    if user is not None:
+        hdr["Authorization"] = "Basic " + base64.b64encode(
+            ("%s:%s" % (user, pw)).encode("utf-8")).decode("ascii")
+    if cookie is not None:
+        hdr["Cookie"] = "%s=%s" % (SESS.COOKIE_NAME, cookie)
+    h.headers = hdr
     h.client_address = (peer, 4321)
-    h._basic_creds = types.MethodType(SRV.OPDSHandler._basic_creds, h)
-    h._is_loopback = types.MethodType(SRV.OPDSHandler._is_loopback, h)
+    for _name in ("_basic_creds", "_is_loopback", "_cookie", "_session_ok", "_client_ip"):
+        setattr(h, _name, types.MethodType(getattr(SRV.OPDSHandler, _name), h))
     h._same = SRV.OPDSHandler._same
     return SRV.OPDSHandler._role(h)
 
@@ -1331,10 +1361,11 @@ def _r_set_auth(admin=("", ""), guest=("", "")):
 
 def _r_role_noauth():
     _r_set_auth()
+    _reset_sess()
     return (_role_of("127.0.0.1") == "admin" and _role_of("127.0.0.5") == "admin"
             and _role_of("::1") == "admin" and _role_of("192.168.31.9") == "guest"
             and _role_of("100.64.0.7") == "guest",
-            "免密：回环=admin（含 127.x / ::1），其余=guest")
+            "免密：回环=admin（含 127.x / ::1），其余=guest（仍可浏览）")
 
 
 _rcheck("判定①免密：本机=管理员，局域网/公网来源=访客", _r_role_noauth)
@@ -1342,34 +1373,38 @@ _rcheck("判定①免密：本机=管理员，局域网/公网来源=访客", _r
 
 def _r_role_withpass():
     _r_set_auth(admin=("ranqing", "s3cret"))
-    return (_role_of("192.168.31.9") is None
+    _reset_sess()
+    return (_role_of("192.168.31.9") == "guest"                        # 匿名 → 访客，不再 401
             and _role_of("192.168.31.9", "ranqing", "s3cret") == "admin"
-            and _role_of("192.168.31.9", "ranqing", "wrong") is None
-            and _role_of("192.168.31.9", "guest", "hello") is None,   # 没配访客档
-            "配管理员口令：匿名/错口令=拒绝，对=admin，访客档不存在=None")
+            and _role_of("192.168.31.9", "ranqing", "wrong") == "guest"  # 错口令不赶人
+            and _role_of("192.168.31.9", "guest", "hello") == "guest"
+            and _role_of("127.0.0.1") == "guest",                     # 配了口令则本机也要登
+            "匿名/错口令=访客（可浏览）；口令正确才升 admin；配了口令回环也不再白拿管理员")
 
 
-_rcheck("判定②配了管理员口令：凭据正确才放行，未配访客档时访客一律拒绝",
+_rcheck("判定②配了管理员口令：匿名与错口令都退化成访客（浏览不受影响），只有口令正确才升权",
         _r_role_withpass)
 
 
 def _r_role_two_tier():
     _r_set_auth(admin=("ranqing", "s3cret"), guest=("guest", "hello"))
+    _reset_sess()
     return (_role_of("10.0.0.2", "ranqing", "s3cret") == "admin"
             and _role_of("10.0.0.2", "guest", "hello") == "guest"
-            and _role_of("10.0.0.2", "guest", "nope") is None
-            and _role_of("127.0.0.1") is None,        # 配了口令就不能靠来源白拿管理员
-            "两级口令：命中谁就是谁；回环不再自动升权")
+            and _role_of("10.0.0.2", "guest", "nope") == "guest"
+            and _role_of("10.0.0.2") == "guest"
+            and _role_of("127.0.0.1") == "guest",
+            "命中管理员口令=admin；其余（含访客口令/匿名）都是访客（匿名已等价于访客档）")
 
 
-_rcheck("判定③两级口令：管理员/访客各归各位，回环地址不再自动升权",
-        _r_role_two_tier)
+_rcheck("判定③两级口令：管理员口令升权，访客档与匿名同权（都是访客）", _r_role_two_tier)
 
 
 def _r_role_partial_env():
     # 只设用户名不设口令，属于「配置了一半」：仍按配了口令处理，避免半配时静默免密
     _r_set_auth(admin=("only", ""))
-    return (_role_of("127.0.0.1") is None
+    _reset_sess()
+    return (_role_of("127.0.0.1") == "guest"
             and _role_of("8.8.8.8", "only", "") == "admin",
             "半配置（只有用户名）也走口令分支，不会退化成免密")
 
@@ -1380,14 +1415,46 @@ _rcheck("判定④只配了用户名没配口令：仍走口令分支（半配�
 
 def _r_role_compare():
     _r_set_auth(admin=("u", "p"))
-    # 同一前缀不同长度不应被短口令放行（compare_digest 语义）
-    return (_role_of("1.1.1.1", "u", "p2") is None
-            and _role_of("1.1.1.1", "u2", "p") is None
-            and _role_of("1.1.1.1", "u", "P") is None,
-            "口令大小写敏感、不做前缀匹配")
+    _reset_sess()
+    # 同一前缀不同长度不应被短口令放行（compare_digest 语义）。现在「不匹配」的表现是
+    # 降级成访客而不是 401，所以断言的是「拿不到 admin」，而不是「被拒绝」。
+    bad = [("u", "p2"), ("u2", "p"), ("u", "P"), ("", "p"), ("u", ""), ("u ", "p"), ("u", "p ")]
+    return (all(_role_of("1.1.1.1", u, p) != "admin" for u, p in bad)
+            and _role_of("1.1.1.1", "u", "p") == "admin",
+            "口令大小写敏感、不接受前后空格/前缀/变体；只有完全相等才升权")
 
 
-_rcheck("判定⑤口令比较严格：大小写敏感、不接受前缀/变体", _r_role_compare)
+_rcheck("判定⑤口令比较严格：大小写敏感、不接受前缀/变体（只认完全相等）", _r_role_compare)
+
+
+def _r_role_cookie():
+    _reset_sess()
+    _r_set_auth(admin=("u", "p"))
+    tok = SESS.issue()
+    return (_role_of("8.8.8.8", cookie=tok) == "admin"            # 公网来源 + 有效 cookie → 管理员
+            and _role_of("8.8.8.8", cookie="abc.def") == "guest"  # 伪造签名无效
+            and _role_of("8.8.8.8", cookie=SESS.issue(ttl=-1)) == "guest"   # 过期无效
+            and _role_of("8.8.8.8", cookie="") == "guest"         # 空 cookie
+            and SESS.verify(tok) is True,
+            "cookie 判定：有效=admin（公网来源也认），伪造/过期/空=访客")
+
+
+_rcheck("判定⑥登录 cookie：有效即 admin（与来源地址无关），伪造或过期一律降级访客",
+        _r_role_cookie)
+
+
+def _r_role_cookie_beats_stale_basic():
+    """浏览器会把旧的 Basic 凭据长期自动附上 —— 有效的 cookie 必须能压过它。"""
+    _reset_sess()
+    _r_set_auth(admin=("u", "p"))
+    tok = SESS.issue()
+    return (_role_of("8.8.8.8", user="old", pw="stale", cookie=tok) == "admin"
+            and _role_of("8.8.8.8", user="u", pw="p") == "admin",
+            "cookie 优先于 Basic；Basic 正确也能升权（两条入口并存）")
+
+
+_rcheck("判定⑦两条登录入口并存：cookie 有效时即使带陈旧 Basic 凭据也是管理员",
+        _r_role_cookie_beats_stale_basic)
 SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = _r_saved_auth
 
 # ---------- R4. 入口显隐（渲染期开关，不是 CSS 隐藏） ----------
@@ -1874,29 +1941,35 @@ if _r_lib_ok:
           lambda: (_j5st == 303, "status=%s" % _j5st))
     _reset_fin(os.path.join(_R_TMP, "http_finished.json"))
 
-    # 两级口令下的 HTTP 行为
+    # 口令配置下的 HTTP 行为（新版模型：匿名 = 访客，不再 401）
     SRV.AUTH_USER, SRV.AUTH_PASS = "ranqing", "s3cret"
     SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = "guest", "hello"
+    _reset_sess()
 
     def _basic(u, p):
         return {"Authorization": "Basic " + base64.b64encode(
             ("%s:%s" % (u, p)).encode("utf-8")).decode("ascii")}
 
-    _nst, _, _ = _http(_r_port, "/")
-    _wst, _, _ = _http(_r_port, "/", headers=_basic("ranqing", "nope"))
+    _nst, _nb, _ = _http(_r_port, "/")
+    _wst, _wb, _ = _http(_r_port, "/", headers=_basic("ranqing", "nope"))
     _ast, _ab, _ = _http(_r_port, "/", headers=_basic("ranqing", "s3cret"))
     _vst, _vb, _ = _http(_r_port, "/", headers=_basic("guest", "hello"))
     _vr, _, _ = _http(_r_port, "/opds/read", headers=_basic("guest", "hello"))
-    check("HTTP 配口令：匿名 401 / 错口令 401",
-          lambda: (_nst == 401 and _wst == 401, "匿名=%s 错口令=%s" % (_nst, _wst)))
+    _ar, _, _ = _http(_r_port, "/opds/read", headers=_basic("ranqing", "s3cret"))
+    check("HTTP 配了口令也照常放行匿名/错口令 → 200（访客身份；浏览器不会再弹认证框）",
+          lambda: (_nst == 200 and _wst == 200 and "已读完" not in _nb
+                   and "已读完" not in _wb, "匿名=%s 错口令=%s" % (_nst, _wst)))
+    check("HTTP 匿名拿到的是**真页面**（不是空壳/错误页）",
+          lambda: ("<!doctype html" in _nb and "/opds/search" in _nb and len(_nb) > 2000,
+                   "%d 字节" % len(_nb)))
     check("HTTP 管理员口令（哪怕来自局域网）→ 含「已读完」入口，/opds/read 200",
-          lambda: ("已读完" in _ab and _ast == 200
-                   and _http(_r_port, "/opds/read", headers=_basic("ranqing", "s3cret"))[0] == 200,
-                   "首页=%s" % _ast))
+          lambda: ("已读完" in _ab and _ast == 200 and _ar == 200,
+                   "首页=%s 列表=%s" % (_ast, _ar)))
     check("HTTP 访客口令：能看书库但看不到入口，且 /opds/read 被 403",
           lambda: (_vst == 200 and "已读完" not in _vb and _vr == 403,
                    "首页=%s 列表=%s" % (_vst, _vr)))
     SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = _r_saved_auth
+    _reset_sess()
 
 if _r_srv is not None:
     try:
@@ -2325,6 +2398,368 @@ if _s_srv is not None:
 if UPD is not None:
     FEED.get_library = _s_orig_get                     # 还原，别影响后续任何读取
     LIB.get_library = _s_orig_get
+
+# ==================== T. 管理员登录 + 已读完自动摘除 ====================
+section("T. 管理员登录（签名 cookie）与「已读完」自动摘除")
+
+_T_TMP = os.path.join(TMP_ROOT, "session")
+os.makedirs(_T_TMP, exist_ok=True)
+_t_saved_auth = (SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS)
+
+
+def _t_reset():
+    """密钥 / 已读完清单 / 更新状态全部指到临时目录，绝不碰真实 .autosync。"""
+    SESS.SESSION_KEY_FILE = os.path.join(_T_TMP, "session.key")
+    if os.path.exists(SESS.SESSION_KEY_FILE):
+        os.remove(SESS.SESSION_KEY_FILE)
+    SESS.forget_key()
+    SESS.login_throttle.clear()
+    _reset_fin(os.path.join(_T_TMP, "finished.json"))
+    if UPD is not None:
+        UPD.UPDATES_FILE = os.path.join(_T_TMP, "updates.json")
+        if os.path.exists(UPD.UPDATES_FILE):
+            os.remove(UPD.UPDATES_FILE)
+    return SESS.SESSION_KEY_FILE
+
+
+def _tcheck(label, fn):
+    if SESS is None or FIN is None:
+        _rskip(label, "session/finished 模块不可用：%s" % _R_ERR)
+    else:
+        check(label, fn)
+
+
+# ---------- T1. 会话令牌本体（纯函数，不经过网络） ----------
+def _t_token():
+    _t_reset()
+    tok = SESS.issue()
+    tampered = tok[:-1] + ("0" if tok[-1] != "0" else "1")
+    return (tok.count(".") == 1 and SESS.verify(tok)
+            and not SESS.verify(tampered)
+            and not SESS.verify(SESS.issue(ttl=-1))           # 已过期
+            and not SESS.verify("") and not SESS.verify(None) and not SESS.verify("abc")
+            and not SESS.verify("99999999999.deadbeef")       # 签名是假的
+            and not SESS.verify("notanint." + SESS._sign("notanint")),   # 签名真、时间戳是乱的
+            "签发/校验/篡改/过期/格式乱 六种情况都符合预期")
+
+
+def _t_keyfile():
+    p = _t_reset()
+    SESS.key()                                            # 首次调用触发生成
+    text = ""
+    if os.path.isfile(p):
+        with open(p, encoding="ascii") as f:
+            text = f.read().strip()
+    k1 = SESS.key()
+    SESS.forget_key()
+    k2 = SESS.key()                                       # 重新读盘 → 必须是同一把
+    return (len(text) == 64 and all(c in "0123456789abcdef" for c in text)
+            and len(k1) == 32 and k1 == k2,
+            "32 字节随机密钥 ✓ hex 落盘 ✓ 重读一致（重启不掉线）")
+
+
+def _t_key_location():
+    return (os.path.dirname(_SESS_DEFAULT) == P.LOG_DIR
+            and os.path.basename(_SESS_DEFAULT) == "session.key"
+            and os.path.basename(P.LOG_DIR) == ".autosync",
+            "%s（默认值；测试期间打桩到临时目录 → .autosync 已 gitignore，密钥不会进仓库）"
+            % _SESS_DEFAULT)
+
+
+def _t_key_rotates():
+    """密钥文件坏掉/被删 → 换一把新的，而不是拿个可猜的值继续跑。"""
+    p = _t_reset()
+    old = SESS.key()
+    with open(p, "w", encoding="ascii") as f:
+        f.write("short")                                  # 太短 → 判为无效
+    SESS.forget_key()
+    new = SESS.key()
+    return (new != old and len(new) == 32 and os.path.getsize(p) == 64,
+            "坏密钥文件 → 自动换新并覆盖")
+
+
+def _t_cookie_parse():
+    pc = SESS.parse_cookie
+    return (pc("ln_adm=abc") == {"ln_adm": "abc"}
+            and pc("a=1; ln_adm=xyz; b=2") == {"a": "1", "ln_adm": "xyz", "b": "2"}
+            and pc("") == {} and pc(None) == {}
+            and pc("ln_adm=first; ln_adm=second")["ln_adm"] == "first"
+            and pc("novalue; k=") == {"k": ""},
+            "单值/多值/空头/同名取首个/无等号项 都处理正确")
+
+
+def _t_throttle():
+    th = SESS.Throttle(limit=3, window=100, lock_for=50)
+    seq = [th.fail("x", now=1000.0) for _ in range(3)]
+    locked = th.retry_after("x", now=1000.0)
+    other = th.retry_after("y", now=1000.0)
+    freed = th.retry_after("x", now=1200.0)               # 过了窗口 → 自动遗忘
+    th.ok("x")
+    return (seq == [1, 2, 0] and locked == 51 and other == 0 and freed == 0
+            and th.retry_after("x", now=1000.0) == 0,
+            "连错 3 次锁 50 秒；别的来源不受影响；过期/成功即解锁")
+
+
+for _lbl, _fn in [
+    ("会话令牌：签名有效才认，篡改/过期/格式乱一律拒绝", _t_token),
+    ("签名密钥：32 字节随机数、hex 落盘、重读一致", _t_keyfile),
+    ("密钥落在 .autosync/session.key（gitignore 内，不进仓库）", _t_key_location),
+    ("密钥文件损坏 → 自动换一把新的（不会用可猜的密钥继续跑）", _t_key_rotates),
+    ("Cookie 头解析：多值/空值/同名/无等号", _t_cookie_parse),
+    ("登录失败节流：连错即锁，只锁该来源，成功或超时即解", _t_throttle),
+]:
+    _tcheck(_lbl, _fn)
+
+
+# ---------- T2. HTTP 端到端：登录 → 管理页 → 退出 ----------
+_t_srv = None
+_t_port = 0
+if SESS is not None:
+    _t_reset()
+    SRV.AUTH_USER, SRV.AUTH_PASS = "ran", "147258"
+    SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = "", ""
+    try:
+        _t_srv = SRV.make_server(port=0, bind="0.0.0.0")
+        _t_port = _t_srv.server_address[1]
+        threading.Thread(target=_t_srv.serve_forever, daemon=True).start()
+    except Exception as _exc:                             # noqa: BLE001
+        _t_srv = None
+        _t_err = "%s: %s" % (type(_exc).__name__, _exc)
+_T_ORIGIN = "http://127.0.0.1:%d" % _t_port
+
+
+def _thcheck(label, fn):
+    if _t_srv is None:
+        _rskip(label, "无法起测试服务（%s）" % ("session 不可用" if SESS is None else "端口不可用"))
+    else:
+        check(label, fn)
+
+
+def _t_http(path, method="GET", body=None, headers=None, host="127.0.0.1"):
+    import http.client as _hc
+    conn = _hc.HTTPConnection(host, _t_port, timeout=30)
+    hdrs = dict(headers or {})
+    if host != "127.0.0.1":
+        hdrs["Host"] = "%s:%d" % (host, _t_port)
+    if body is not None:
+        hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+    conn.request(method, path, body=body, headers=hdrs)
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8", "replace")
+    out = (resp.status, text, resp.getheader("Set-Cookie") or "", resp.getheader("Location") or "")
+    conn.close()
+    return out
+
+
+def _t_token_of(set_cookie):
+    return set_cookie.split("=", 1)[1].split(";")[0] if "=" in (set_cookie or "") else ""
+
+
+if _t_srv is not None:
+    SESS.login_throttle.clear()
+    _t_st, _t_body, _, _ = _t_http("/")
+    check("T1 未登录访问首页 → 200 正常浏览，只有「登录」入口、没有管理员入口",
+          lambda: (_t_st == 200 and "<!doctype html" in _t_body and len(_t_body) > 2000
+                   and "已读完" not in _t_body and "/opds/read" not in _t_body
+                   and "/opds/login" in _t_body,
+                   "status=%s 登录入口=%s" % (_t_st, "/opds/login" in _t_body)))
+    _t_lg, _t_lb, _, _ = _t_http("/opds/login")
+    check("T2 登录页 200，且自身不含管理员专有字样/路由（它本来就是公开页面）",
+          lambda: (_t_lg == 200 and 'action="/opds/login"' in _t_lb
+                   and "已读完" not in _t_lb and "/opds/read" not in _t_lb
+                   and "/opds/updates/clear" not in _t_lb,
+                   "status=%s" % _t_lg))
+    _t_rd, _, _, _ = _t_http("/opds/read")
+    check("T3 未登录访问管理页 → 403（不给内容，也不给入口）",
+          lambda: (_t_rd == 403, "status=%s" % _t_rd))
+    _t_x, _, _, _ = _t_http("/opds/login", "POST", urlencode({"user": "ran", "pass": "147258"}),
+                            {"Origin": "https://evil.example.com"})
+    check("T4 跨站登录 → 403（CSRF 兜底）", lambda: (_t_x == 403, "status=%s" % _t_x))
+
+    SESS.login_throttle.clear()
+    _t_w, _t_wb, _t_wck, _ = _t_http("/opds/login", "POST",
+                                     urlencode({"user": "ran", "pass": "nope", "back": "/"}),
+                                     {"Origin": _T_ORIGIN})
+    check("T5 口令错 → 401 + 登录页文案，且**不下发** cookie",
+          lambda: (_t_w == 401 and not _t_wck and "不对" in _t_wb,
+                   "status=%s cookie=%r" % (_t_w, _t_wck)))
+
+    SESS.login_throttle.clear()
+    _t_ok, _, _t_ck, _t_loc = _t_http("/opds/login", "POST",
+                                      urlencode({"user": "ran", "pass": "147258", "back": "/"}),
+                                      {"Origin": _T_ORIGIN})
+    _t_tok = _t_token_of(_t_ck)
+    check("T6 口令对 → 303 跳回 back，并下发 HttpOnly + SameSite=Lax 的签名 cookie",
+          lambda: (_t_ok == 303 and _t_loc == "/" and SESS.verify(_t_tok)
+                   and "HttpOnly" in _t_ck and "SameSite=Lax" in _t_ck
+                   and "Max-Age=" in _t_ck and "Secure" not in _t_ck,
+                   "status=%s loc=%s cookie=%s" % (_t_ok, _t_loc, _t_ck)))
+    _t_h = {"Cookie": "%s=%s" % (SESS.COOKIE_NAME, _t_tok)}
+    _t_ast, _t_ab, _, _ = _t_http("/", headers=_t_h)
+    check("T7 带上 cookie → 首页变成管理员版（出现「已读完」入口与「退出」）",
+          lambda: (_t_ast == 200 and "已读完" in _t_ab and "退出" in _t_ab
+                   and "/opds/read" in _t_ab, "status=%s" % _t_ast))
+    _t_rst, _, _, _ = _t_http("/opds/read", headers=_t_h)
+    check("T8 登录后能打开「已读完」清单页", lambda: (_t_rst == 200, "status=%s" % _t_rst))
+    _t_bad, _t_bb, _, _ = _t_http("/", headers={"Cookie": "%s=forged.sig" % SESS.COOKIE_NAME})
+    check("T9 伪造 cookie → 退回访客页面（不报错、也不是管理员）",
+          lambda: (_t_bad == 200 and "已读完" not in _t_bb, "status=%s" % _t_bad))
+
+    _t_lst, _, _t_lck, _t_lloc = _t_http("/opds/logout", "POST",
+                                         urlencode({"back": "/opds/recent"}),
+                                         {**_t_h, "Origin": _T_ORIGIN})
+    check("T10 退出 → 303 跳回 back + 清 cookie（Max-Age=0）",
+          lambda: (_t_lst == 303 and _t_lloc == "/opds/recent" and "Max-Age=0" in _t_lck,
+                   "status=%s loc=%s cookie=%s" % (_t_lst, _t_lloc, _t_lck)))
+    _t_lr, _, _, _t_lrloc = _t_http("/opds/logout", "POST",
+                                    urlencode({"back": "/opds/read?page=2"}),
+                                    {**_t_h, "Origin": _T_ORIGIN})
+    check("T10b 从「已读完」页退出 → 落点回首页（否则访客身份打开管理页必 403）",
+          lambda: (_t_lr == 303 and _t_lrloc == "/", "Location=%s" % _t_lrloc))
+    _t_lx, _, _, _ = _t_http("/opds/logout", "POST", urlencode({"back": "/"}),
+                             {"Origin": "https://evil.example.com"})
+    check("T11 跨站退出 → 403（退出走 POST，不会被页面里塞个 <img> 触发成莫名掉线）",
+          lambda: (_t_lx == 403, "status=%s" % _t_lx))
+
+    SESS.login_throttle.clear()
+    _t_or, _, _, _t_orloc = _t_http("/opds/login", "POST",
+                                    urlencode({"user": "ran", "pass": "147258",
+                                               "back": "//evil.example.com/x"}),
+                                    {"Origin": _T_ORIGIN})
+    check("T12 登录的 back 指向外站 → 回落到本站路径（堵开放重定向）",
+          lambda: (_t_or == 303 and _t_orloc.startswith("/") and "evil" not in _t_orloc,
+                   "Location=%s" % _t_orloc))
+
+    SESS.login_throttle.clear()
+    _t_ss, _, _t_sck, _ = _t_http("/opds/login", "POST",
+                                  urlencode({"user": "ran", "pass": "147258", "back": "/"}),
+                                  {"Origin": _T_ORIGIN, "X-Forwarded-Proto": "https"})
+    check("T13 走 HTTPS（隧道）登录 → cookie 带 Secure",
+          lambda: (_t_ss == 303 and "Secure" in _t_sck and SESS.verify(_t_token_of(_t_sck)),
+                   "cookie=%s" % _t_sck))
+
+    SESS.login_throttle.clear()
+    _t_codes = [_t_http("/opds/login", "POST", urlencode({"user": "ran", "pass": "bad"}),
+                        {"Origin": _T_ORIGIN})[0] for _ in range(9)]
+    _t_lockg, _t_lockb, _, _ = _t_http("/opds/login")
+    check("T14 连错口令触发节流：第 9 次起 429，登录页给出还要等多久",
+          lambda: (_t_codes[:8] == [401] * 8 and _t_codes[8] == 429
+                   and _t_lockg == 200 and "再试" in _t_lockb,
+                   "前 8 次=%s 第 9 次=%s" % (_t_codes[:8], _t_codes[8])))
+    SESS.login_throttle.clear()
+    _t_after, _, _t_ack, _ = _t_http("/opds/login", "POST",
+                                     urlencode({"user": "ran", "pass": "147258"}),
+                                     {"Origin": _T_ORIGIN})
+    check("T15 节流解除后能正常登录（不会把自己永久锁在外面）",
+          lambda: (_t_after == 303 and SESS.verify(_t_token_of(_t_ack)), "status=%s" % _t_after))
+
+    # 登录态对 OPDS 阅读器同样有效（不是只有网页才认 cookie）
+    _t_feed, _t_fb, _, _ = _t_http("/", headers={**_t_h, "Accept": "application/atom+xml"})
+    check("T16 带 cookie 的 OPDS feed 也含「已读完」导航（阅读器不必再配 Basic）",
+          lambda: (_t_feed == 200 and "已读完" in _t_fb, "status=%s" % _t_feed))
+
+
+# ---------- T3. 「已读完」遇新卷自动摘除（与新增卷检测联动） ----------
+def _t_autoremove():
+    if UPD is None:
+        return True, "跳过（updates 模块不可用）"
+    _t_reset()
+    UPD.observe(_s_fake())                                # 先建基线
+    FIN.mark_finished("已完结/书A", True)
+    FIN.mark_finished("已完结/书B", True)
+    before = sorted(FIN.load_finished())
+    pend = UPD.observe(_s_fake(extra_a=[_S_A2]))          # 书A 多了一卷
+    after = sorted(FIN.load_finished())
+    return (before == ["已完结/书A", "已完结/书B"] and "已完结/书A" in pend
+            and after == ["已完结/书B"],
+            "加卷前 %s → 加卷后 %s（只摘被加卷的那一本）" % (before, after))
+
+
+def _t_autoremove_idempotent():
+    if UPD is None:
+        return True, "跳过（updates 模块不可用）"
+    _t_reset()
+    UPD.observe(_s_fake())
+    FIN.mark_finished("已完结/书A", True)
+    p1 = UPD.observe(_s_fake(extra_a=[_S_A2]))
+    p2 = UPD.observe(_s_fake(extra_a=[_S_A2]))
+    p3 = UPD.observe(_s_fake(extra_a=[_S_A2]))
+    return (FIN.load_finished() == set() and p1 == p2 == p3
+            and "已完结/书A" in p3,
+            "反复 observe 不报错、不重复摘、待读提示保持")
+
+
+def _t_autoremove_remark():
+    """摘掉之后管理员重新标记 → 只要没有新卷就不该再被摘掉。"""
+    if UPD is None:
+        return True, "跳过（updates 模块不可用）"
+    _t_reset()
+    UPD.observe(_s_fake())
+    FIN.mark_finished("已完结/书A", True)
+    UPD.observe(_s_fake(extra_a=[_S_A2]))
+    FIN.mark_finished("已完结/书A", True)                  # 含新卷一起读完了，重新标记
+    UPD.observe(_s_fake(extra_a=[_S_A2]))
+    UPD.observe(_s_fake(extra_a=[_S_A2]))
+    return ("已完结/书A" in FIN.load_finished(), "没有新卷就不会被再摘一次")
+
+
+def _t_autoremove_no_touch_others():
+    """没读完的书、以及只是改了名的卷，都不该碰「已读完」清单。"""
+    if UPD is None:
+        return True, "跳过（updates 模块不可用）"
+    _t_reset()
+    UPD.observe(_s_fake())
+    FIN.mark_finished("已完结/书C", True)
+    renamed = _s_fake()
+    renamed["已完结"]["书A"] = [_s_vol("已完结/书A/01 - 规整后.epub", 1000)]
+    UPD.observe(renamed)                                   # 同大小改名 → 不算新卷
+    return (FIN.load_finished() == {"已完结/书C"}, "改名不触发摘除，其余标记不受影响")
+
+
+def _t_readlist_http():
+    """端到端：登录后「已读完」列表里有这本书 → 加一卷 → 列表里自动少掉它。"""
+    if UPD is None:
+        return True, "跳过（updates 模块不可用）"
+    _t_reset()
+    card_href = "/opds/book/" + quote("已完结/书A", safe="/")
+    fake = {"已完结": {"书A": [_s_vol("已完结/书A/01.epub", 100)]}, "未完结": {}}
+    orig = FEED.get_library
+    FEED.get_library = lambda *a, **k: fake
+    try:
+        UPD.observe(fake)
+        FIN.mark_finished("已完结/书A", True)
+        h = {"Cookie": "%s=%s" % (SESS.COOKIE_NAME, SESS.issue())}
+        st1, b1, _, _ = _t_http("/opds/read", headers=h)
+        fake["已完结"]["书A"].append(_s_vol("已完结/书A/02.epub", 200))
+        UPD.observe(fake)
+        st2, b2, _, _ = _t_http("/opds/read", headers=h)
+    finally:
+        FEED.get_library = orig
+    return (st1 == 200 and card_href in b1 and 'data-total="1"' in b1
+            and st2 == 200 and card_href not in b2 and "还没有标记任何作品" in b2,
+            "列表 %s → %s" % ("有该书" if card_href in b1 else "无",
+                              "仍有该书" if card_href in b2 else "已自动移除"))
+
+
+for _lbl, _fn in [
+    ("已读完的书出现新卷 → 自动从清单摘除，其余标记不受影响", _t_autoremove),
+    ("自动摘除是幂等的：反复检测不会报错也不会反复改清单", _t_autoremove_idempotent),
+    ("重新标记「已读完」后，没有新卷就不再被摘掉", _t_autoremove_remark),
+    ("改名不算新卷 → 不会误摘「已读完」", _t_autoremove_no_touch_others),
+]:
+    _tcheck(_lbl, _fn)
+
+_thcheck("HTTP 端到端：登录后「已读完」列表在加卷后自动少掉那一本", _t_readlist_http)
+
+if _t_srv is not None:
+    try:
+        _t_srv.shutdown()
+        _t_srv.server_close()
+    except Exception:                                     # noqa: BLE001
+        pass
+SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = _t_saved_auth
+if SESS is not None:
+    SESS.forget_key()
 
 # ============================== 汇总 ==============================
 print("\n" + "=" * 70)

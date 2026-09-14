@@ -15,10 +15,14 @@
     .venv/Scripts/python.exe tests/ui_probe.py            # 默认 8099 端口
 
 依赖：playwright（python 包）+ 系统 Edge。没装 playwright 时脚本会提示并跳过（退出码 0）。
-产物：.autosync/probe/*.png（compare.png = 未读圆圈；compare_updates.png = 新增卷提示）
+产物：.autosync/probe/*.png
+      compare.png          = 未读圆圈的显隐
+      compare_updates.png  = 新增卷提示
+      compare_login.png    = 管理员登录流程（未登录 → 登录页 → 口令错 → 登录成功 → 退出）
 写入：① 临时 OPDS 会真的 POST 几次「已读完」标记再撤销；
       ② 新增卷提示那一段会往 updates.json **塞一条人造待读提示**（指向真实存在的卷号，
          免得真往书库里加文件被监控提交推送出去），截完图立刻还原。
+      ③ 登录流程那一段另起一个**带口令**的 OPDS 进程（8099+1），全程只读、不点标记。
       finished.json / updates.json 都先快照、finally 里强制还原。
 """
 import os
@@ -32,12 +36,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 PORT = int(os.environ.get("PROBE_PORT", "8099"))
+# 登录流程要一个**配了口令**的服务：和主探针那个免密进程分开起，免得互相干扰
+PORT_LOGIN = int(os.environ.get("PROBE_LOGIN_PORT", str(PORT + 1)))
+LOGIN_USER, LOGIN_PASS = "probe", "probe-pass-1"
 OUT = os.path.join(ROOT, ".autosync", "probe")
 FIN = os.path.join(ROOT, ".autosync", "finished.json")
 UPD_FILE = os.path.join(ROOT, ".autosync", "updates.json")
 CAT = "已完结"
 URL_CAT = f"http://127.0.0.1:{PORT}/opds/catalog/{quote(CAT)}"
 URL_READ = f"http://127.0.0.1:{PORT}/opds/read"
+URL_L_CAT = f"http://127.0.0.1:{PORT_LOGIN}/opds/catalog/{quote(CAT)}"
+URL_L_READ = f"http://127.0.0.1:{PORT_LOGIN}/opds/read"
 
 fails = []
 STATS = {}                      # 拼对比图时要用的真实数字（别在图里写「N 张」这种占位）
@@ -229,6 +238,128 @@ def run_probe():
         pg2.screenshot(path=os.path.join(OUT, "g4_read_after.png"),
                        clip={"x": 0, "y": 60, "width": 880, "height": 300})
         br.close()
+
+
+def probe_login():
+    """登录流程的真实浏览器验证 + 截图。
+
+    为什么要单独起一个**配了口令**的服务：主探针那个是免密进程（本机即管理员），
+    根本没有登录页可走。这里要验的恰恰是「未登录也能正常看书 → 登录后才多出管理入口」
+    这条主线，所以必须让服务端真的要求登录。
+
+    全程只读：只看入口有没有出现，不点任何标记按钮，不碰 finished.json。
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        br = p.chromium.launch(channel="msedge", headless=True)
+        pg = br.new_page(viewport={"width": 880, "height": 620}, device_scale_factor=1)
+        wait_up(pg, URL_L_CAT)
+        pg.wait_for_timeout(600)
+
+        # A. 未登录 = 访客：能正常看书，只是没有管理入口
+        check("L1 未登录也能正常浏览（不是登录墙）", pg.locator(".card").count() > 0, True)
+        check("L2 未登录：顶栏只有「登录」", pg.locator("a.hacc").inner_text().strip(), "登录")
+        check("L3 未登录：书卡上没有标记按钮", pg.locator(".card .mk").count(), 0)
+        check("L4 未登录：顶栏没有管理标签页",
+              pg.locator(".tab", has_text="已读完").count(), 0)
+        pg.screenshot(path=os.path.join(OUT, "l1_guest.png"),
+                      clip={"x": 0, "y": 0, "width": 880, "height": 300})
+
+        # B. 进登录页
+        pg.locator("a.hacc").click()
+        pg.wait_for_load_state()
+        pg.wait_for_timeout(400)
+        check("L5 点「登录」进入登录页", "/opds/login" in pg.url, True)
+        check("L6 登录页有用户名/口令两个输入框",
+              pg.locator("#lg-u").count() + pg.locator("#lg-p").count(), 2)
+        pg.screenshot(path=os.path.join(OUT, "l2_login.png"))
+
+        # C. 口令输错 → 停在登录页并给出提示，仍不是管理员
+        pg.fill("#lg-u", LOGIN_USER)
+        pg.fill("#lg-p", "definitely-wrong")
+        pg.click(".lgcard button[type=submit]")
+        pg.wait_for_load_state()
+        pg.wait_for_timeout(400)
+        check("L7 口令错：页面明确提示（不是静默失败）",
+              "不对" in pg.locator("body").inner_text(), True)
+        check("L8 口令错：没有下发登录态（顶栏仍是登录页，没有管理入口）",
+              pg.locator(".tab", has_text="已读完").count(), 0)
+        pg.screenshot(path=os.path.join(OUT, "l3_bad.png"))
+
+        # D. 口令正确 → 跳回书库，管理入口出现
+        pg.fill("#lg-u", LOGIN_USER)
+        pg.fill("#lg-p", LOGIN_PASS)
+        pg.click(".lgcard button[type=submit]")
+        pg.wait_for_load_state()
+        pg.wait_for_timeout(800)
+        check("L9 口令对：登录后回到书库（不是停在登录页）",
+              pg.locator(".card").count() > 0, True)
+        check("L10 登录后：顶栏多出管理标签页",
+              pg.locator(".tab", has_text="已读完").count(), 1)
+        check("L11 登录后：书卡上出现标记按钮", pg.locator(".card .mk").count() > 0, True)
+        check("L12 登录后：顶栏入口变成「退出」",
+              pg.locator("form.hacc button").inner_text().strip(), "退出")
+        pg.screenshot(path=os.path.join(OUT, "l4_admin.png"),
+                      clip={"x": 0, "y": 0, "width": 880, "height": 300})
+
+        # E. 管理页此时能打开
+        pg.goto(URL_L_READ, timeout=8000)
+        pg.wait_for_timeout(500)
+        check("L13 登录后能打开「已读完」清单页",
+              pg.locator("h1").first.inner_text().strip(), "已读完")
+
+        # F. 退出 → 回到访客态；且不会把人丢进 403（管理页退出时落点回首页）
+        pg.locator("form.hacc button").click()
+        pg.wait_for_load_state()
+        pg.wait_for_timeout(600)
+        check("L14 退出后落点不是 403 错误页",
+              pg.locator("h1").first.inner_text().strip() != "403", True)
+        check("L15 退出后又变回访客（标记按钮消失）",
+              pg.locator(".card .mk").count(), 0)
+        check("L16 退出后顶栏回到「登录」",
+              pg.locator("a.hacc").inner_text().strip(), "登录")
+        pg.screenshot(path=os.path.join(OUT, "l5_after_logout.png"),
+                      clip={"x": 0, "y": 0, "width": 880, "height": 300})
+        br.close()
+
+
+def compose_login():
+    """把登录流程的关键画面拼成一张对比图。"""
+    from playwright.sync_api import sync_playwright
+
+    blocks = [("① 未登录访问：书库照常打开，顶栏只有「登录」，封面左上角没有标记圆圈"
+               "（不登录也能浏览、搜索、下载、订阅）", "l1_guest.png"),
+              ("② 点「登录」：一个普通的登录页，不是浏览器弹出的系统认证框", "l2_login.png"),
+              ("③ 口令输错：页面原地给出提示（服务端 401 + 文案，不下发登录态）", "l3_bad.png"),
+              ("④ 口令正确：跳回刚才那页，顶栏多出管理标签页、封面出现标记圆圈、"
+               "右上角变成「退出」", "l4_admin.png"),
+              ("⑤ 点「退出」：落点回首页而不是 403，入口与标记圆圈一并消失", "l5_after_logout.png")]
+    html = ("""<!doctype html><meta charset="utf-8"><style>
+ body{margin:0;padding:26px;background:#f5f2ed;color:#22282f;
+      font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+ h1{font-size:19px;margin:0 0 4px} .sub{color:#6b7280;font-size:13px;margin-bottom:18px}
+ .box{background:#fff;border:1px solid #e3ded6;border-radius:12px;padding:12px;
+      width:856px;margin-bottom:18px}
+ .box img{width:832px;display:block;border-radius:8px;border:1px solid #eee}
+ .box p{font-size:13px;margin:10px 2px 2px;line-height:1.6}
+</style>
+<h1>管理员登录 —— 真实浏览器渲染结果</h1>
+<div class="sub">登录本身不改变书库内容，只决定「看不看得到管理入口」：
+未登录是访客（照常看书），登录后多出「已读完」标签与封面上的标记圆圈。
+截图来自一个**真的要求口令**的临时 OPDS 进程。</div>"""
+            + "".join(f'<div class="box"><img src="{f}"><p>{t}</p></div>' for t, f in blocks))
+    p_html = os.path.join(OUT, "_login.html")
+    with open(p_html, "w", encoding="utf-8") as f:
+        f.write(html)
+    with sync_playwright() as p:
+        br = p.chromium.launch(channel="msedge", headless=True)
+        pg = br.new_page(viewport={"width": 908, "height": 1200}, device_scale_factor=1)
+        pg.goto("file:///" + p_html.replace("\\", "/"), timeout=8000)
+        pg.wait_for_timeout(700)
+        pg.screenshot(path=os.path.join(OUT, "compare_login.png"), full_page=True)
+        br.close()
+    os.remove(p_html)
 
 
 def compose():
@@ -440,17 +571,26 @@ def main():
         [sys.executable, "-m", "lightnovel", "opds", "--port", str(PORT),
          "--bind", "127.0.0.1", "--no-qr"],
         cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 登录探针要一个真的要求口令的服务：单独起一个进程（免密那个当不了登录页的试验台）
+    env_login = dict(env, LN_OPDS_USER=LOGIN_USER, LN_OPDS_PASS=LOGIN_PASS)
+    proc_login = subprocess.Popen(
+        [sys.executable, "-m", "lightnovel", "opds", "--port", str(PORT_LOGIN),
+         "--bind", "127.0.0.1", "--no-qr"],
+        cwd=ROOT, env=env_login, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         run_probe()
         compose()
         probe_updates()
         compose_updates()
+        probe_login()
+        compose_login()
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        for pr in (proc, proc_login):
+            pr.terminate()
+            try:
+                pr.wait(timeout=5)
+            except Exception:
+                pr.kill()
         if had_fin:                       # 强制还原，别把探针的标记留在真实清单里
             shutil.copy2(fin_bak, FIN)
             os.remove(fin_bak)
@@ -459,7 +599,7 @@ def main():
 
     print("-" * 60)
     print(f"  失败 {len(fails)} 项" + (f"：{fails}" if fails else "（全部通过）"))
-    print(f"  产物：{os.path.join(OUT, 'compare.png')} / compare_updates.png")
+    print(f"  产物：{os.path.join(OUT, 'compare.png')} / compare_updates.png / compare_login.png")
     return 1 if fails else 0
 
 

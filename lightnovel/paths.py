@@ -38,6 +38,9 @@ FINISHED_FILE   = os.path.join(LOG_DIR, "finished.json")
 # 新增卷提示：书库快照 + 「有新卷、还没点进去看」的作品（键同样 = 分类/书名）。
 # 同样落在 .autosync/，不会被同步到 GitHub / F 盘。
 UPDATES_FILE    = os.path.join(LOG_DIR, "updates.json")
+# 管理员会话（登录 cookie）的签名密钥：32 字节随机数，首次用到时自动生成。
+# 落在这里而不是写死在源码里 —— 本包会同步进公开仓库，密钥必须留在本机。
+SESSION_KEY_FILE = os.path.join(LOG_DIR, "session.key")
 # 单实例锁的路径由 lightnovel.sync.monitor.lock_path() 现算（跟着 LOG_DIR 走），
 # 面板也从那里取，保证「监控写哪儿、面板就读哪儿」只有一个真源。
 

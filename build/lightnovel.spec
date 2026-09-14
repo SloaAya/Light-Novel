@@ -26,6 +26,11 @@ HIDDEN = [
     "lightnovel.opds.library",
     "lightnovel.opds.feeds",
     "lightnovel.opds.server",
+    # 运行时状态类模块：目前都是 server/feeds 里的静态 import，静态分析能自己找到；
+    # 显式列出来是为了「哪天改成函数内延迟导入也不会漏」（包体只大几 KB）。
+    "lightnovel.opds.finished",
+    "lightnovel.opds.updates",
+    "lightnovel.opds.session",
     "lightnovel.sync",
     "lightnovel.sync.gitops",
     "lightnovel.sync.mirror",
