@@ -1643,6 +1643,410 @@ if _r_srv is not None:
     except Exception:
         pass
 
+# ==================== S. 新增卷提示 ====================
+section("S. 新增卷提示（置顶 + 封面角标 + 详情页点名 + 看过即恢复）")
+
+_UPD_ERR = ""
+try:
+    from lightnovel.opds import updates as UPD
+except Exception as _exc:                            # noqa: BLE001
+    UPD = None
+    _UPD_ERR = "%s: %s" % (type(_exc).__name__, _exc)
+
+_S_TMP = os.path.join(TMP_ROOT, "updates")
+os.makedirs(_S_TMP, exist_ok=True)
+_S_FILE = os.path.join(_S_TMP, "updates.json")
+
+
+def _scheck(label, fn):
+    if UPD is None:
+        _rskip(label, "updates 模块不可用：%s" % _UPD_ERR)
+    else:
+        check(label, fn)
+
+
+def _s_reset():
+    """把状态文件指到临时目录并清空（绝不碰真实 .autosync/updates.json）。"""
+    UPD.UPDATES_FILE = _S_FILE
+    if os.path.exists(_S_FILE):
+        os.remove(_S_FILE)
+    return _S_FILE
+
+
+def _s_vol(rel, size):
+    return {"rel": rel, "size": size, "mtime": 1700000000.0,
+            "title": rel.rsplit("/", 1)[-1][:-5], "subdir": ""}
+
+
+def _s_fake(extra_a=(), extra_c=()):
+    """假书库：书A 无子目录、书C 两个子目录。
+
+    刻意让「有更新」的书在字母序里**不是**第一个（书A < 书C），这样才能验出置顶。
+    """
+    return {"已完结": {
+        "书A": [_s_vol("已完结/书A/01.epub", 1000)] + list(extra_a),
+        "书C": [_s_vol("已完结/书C/主线/01.epub", 11),
+                _s_vol("已完结/书C/外传/01.epub", 13)] + list(extra_c),
+    }, "未完结": {}}
+
+
+_S_A2 = _s_vol("已完结/书A/02.epub", 2000)
+_S_C2 = _s_vol("已完结/书C/外传/02.epub", 14)
+_S_C3 = _s_vol("已完结/书C/外传/03.epub", 15)
+
+
+def _s_baseline():
+    _s_reset()
+    first = UPD.observe(_s_fake())
+    second = UPD.observe(_s_fake())
+    return (first == {} and second == {} and os.path.exists(_S_FILE),
+            "首次/再次都不提示，但基线已落盘")
+
+
+def _s_new_vol():
+    _s_reset()
+    UPD.observe(_s_fake())
+    pend = UPD.observe(_s_fake(extra_a=[_S_A2]))
+    m1 = os.stat(_S_FILE).st_mtime_ns
+    again = UPD.observe(_s_fake(extra_a=[_S_A2]))       # 没变化 → 不该再写盘
+    return (list(pend) == ["已完结/书A"]
+            and pend["已完结/书A"]["vols"] == ["已完结/书A/02.epub"]
+            and again == pend and m1 == os.stat(_S_FILE).st_mtime_ns,
+            "只点名书A 的第 2 卷；重复检测不写盘")
+
+
+def _s_rename_not_new():
+    _s_reset()
+    UPD.observe(_s_fake())
+    # 把 01.epub 改名（大小不变）—— 本库经常批量规整文件名，不能算「新增」
+    renamed = _s_fake()
+    renamed["已完结"]["书A"] = [_s_vol("已完结/书A/01 - 规整后.epub", 1000)]
+    return (UPD.observe(renamed) == {}, "同大小改名不算新增")
+
+
+def _s_size_change_is_new():
+    _s_reset()
+    UPD.observe(_s_fake())
+    # 同路径但大小变了（重新下载/换版本）：路径没变 → 不算新增，不打扰
+    grown = _s_fake()
+    grown["已完结"]["书A"] = [_s_vol("已完结/书A/01.epub", 9999)]
+    return (UPD.observe(grown) == {}, "同名不同大小按「内容变了」处理，不报新增")
+
+
+def _s_del_then_prune():
+    _s_reset()
+    UPD.observe(_s_fake())
+    UPD.observe(_s_fake(extra_a=[_S_A2]))
+    gone = UPD.observe(_s_fake())                        # 新卷又被删了
+    return (gone == {} and "已完结/书A" not in UPD.load_pending(),
+            "新卷被删 → 提示自动收回（不留点不开的死条目）")
+
+
+def _s_new_book_quiet():
+    _s_reset()
+    UPD.observe(_s_fake())
+    lib = _s_fake()
+    lib["已完结"]["书Z"] = [_s_vol("已完结/书Z/01.epub", 777)]
+    return (UPD.observe(lib) == {}, "整本新作品不提示（批量导入不刷屏）")
+
+
+def _s_deleted_book_quiet():
+    _s_reset()
+    UPD.observe(_s_fake())                               # 先建基线（此时还没有第 2 卷）
+    p1 = UPD.observe(_s_fake(extra_a=[_S_A2]))           # 再加卷 → 应当提示
+    lib = _s_fake(extra_a=[_S_A2])
+    del lib["已完结"]["书A"]                              # 整本删掉
+    p2 = UPD.observe(lib)
+    return (list(p1) == ["已完结/书A"] and p2 == {}, "整本删除时提示一并消失")
+
+
+def _s_corrupt():
+    _s_reset()
+    with open(_S_FILE, "w", encoding="utf-8") as f:
+        f.write("{ 这不是 JSON")
+    p = UPD.observe(_s_fake())                           # 不能抛，且当成「重建基线」
+    return (p == {} and UPD.load_pending() == {}, "文件损坏 → 当空处理并重建基线")
+
+
+def _s_atomic():
+    _s_reset()
+    UPD.observe(_s_fake())
+    UPD.observe(_s_fake(extra_a=[_S_A2], extra_c=[_S_C2]))
+    left = [f for f in os.listdir(_S_TMP) if f.endswith(".tmp")]
+    with open(_S_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    return (not left and data["version"] == 1 and len(data["pending"]) == 2,
+            "无 .tmp 残留，两份待读提示都落盘")
+
+
+def _s_order_keys():
+    reset = UPD.order_keys(["已完结/书A", "已完结/书B", "已完结/书C"], {})
+    hot = UPD.order_keys(["已完结/书A", "已完结/书B", "已完结/书C"],
+                         {"已完结/书C": {"at": "2026-09-14 10:00:00", "vols": ["x"]}})
+    both = UPD.order_keys(["已完结/书A", "已完结/书B", "已完结/书C"],
+                          {"已完结/书A": {"at": "2026-09-14 09:00:00", "vols": ["x"]},
+                           "已完结/书C": {"at": "2026-09-14 10:00:00", "vols": ["x"]}})
+    return (reset == ["已完结/书A", "已完结/书B", "已完结/书C"]
+            and hot == ["已完结/书C", "已完结/书A", "已完结/书B"]
+            and both == ["已完结/书C", "已完结/书A", "已完结/书B"],
+            "无更新时原序；有更新置顶；多本按时间新→旧，其余保字母序")
+
+
+def _s_clear():
+    _s_reset()
+    UPD.observe(_s_fake())
+    UPD.observe(_s_fake(extra_a=[_S_A2], extra_c=[_S_C2]))
+    bad = UPD.clear("../../etc/passwd")
+    one = UPD.clear("已完结/书A")
+    rest = sorted(UPD.load_pending())
+    all_n = UPD.clear()
+    return (bad == 0 and one == 1 and rest == ["已完结/书C"] and all_n == 1
+            and UPD.load_pending() == {},
+            "非法键不落盘(0)；单键清 1 条；全清返回剩余条数")
+
+
+def _s_counts():
+    _s_reset()
+    UPD.observe(_s_fake())
+    UPD.observe(_s_fake(extra_a=[_S_A2]))
+    c = UPD.counts()
+    return (c.get("已完结") == 1 and c.get("未完结") == 0, "按分类计数：%s" % c)
+
+
+def _s_pending_for():
+    _s_reset()
+    UPD.observe(_s_fake())
+    UPD.observe(_s_fake(extra_c=[_S_C2]))
+    return (UPD.pending_for("已完结/书C") is not None
+            and UPD.pending_for("已完结/书A") is None
+            and UPD.pending_for("不存在的分类/x") is None
+            and UPD.pending_for("../x") is None,
+            "命中/未命中/非法键三态都对")
+
+
+for _lbl, _fn in [
+    ("首次运行只建基线，不把整库标成「有更新」", _s_baseline),
+    ("往已存在的书里加卷 → 只点名那一卷，且重复检测不写盘", _s_new_vol),
+    ("同大小改名不算新增（本库常做的文件名规整不该刷屏）", _s_rename_not_new),
+    ("同名但大小变了 → 不报新增（内容替换不是新卷）", _s_size_change_is_new),
+    ("新增的那卷又被删掉 → 提示自动收回", _s_del_then_prune),
+    ("整本新作品不提示（批量导入不刷屏）", _s_new_book_quiet),
+    ("整本作品被删除 → 提示一并消失", _s_deleted_book_quiet),
+    ("状态文件损坏 → 当空处理并重建基线（服务照跑）", _s_corrupt),
+    ("原子写：无 .tmp 残留、结构完整", _s_atomic),
+    ("排序：有更新的置顶，其余保持字母序（分页前排序）", _s_order_keys),
+    ("清除：单键 / 全部 / 非法键", _s_clear),
+    ("按分类统计有更新的作品数", _s_counts),
+    ("pending_for：命中 / 未命中 / 非法键", _s_pending_for),
+]:
+    _scheck(_lbl, _fn)
+
+
+# ---------- S9. 渲染层（卡片角标 / 工具条权限 / CSS 顺序） ----------
+def _s_card_markup():
+    _old = UPD.load_pending
+    try:
+        UPD.load_pending = lambda: {}
+        up = FEED._book_card("/x", "r.epub", "书A", "3 卷", upd=2)
+        plain = FEED._book_card("/x", "r.epub", "书B", "1 卷")
+    finally:
+        UPD.load_pending = _old
+    return ('class="card upd"' in up and '<span class="upd">有更新 +2</span>' in up
+            and "有更新 +2 卷" in up and '<div class="ph">' in up
+            and up.index('class="upd"') > up.index("</a>") - 200
+            and 'class="card"' in plain and "有更新" not in plain,
+            "有更新的卡带角标+描边类+副标题；普通卡干净")
+
+
+def _s_bar_gate():
+    pend = {"已完结/书A": {"at": "2026-09-14 10:00:00", "vols": ["x"]}}
+    admin = FEED._upd_bar(pend, "/opds/catalog/已完结", True)
+    guest = FEED._upd_bar(pend, "/opds/catalog/已完结", False)
+    none = FEED._upd_bar({}, "/", True)
+    return ("/opds/updates/clear" in admin and "1 部作品有更新" in admin
+            and "/opds/updates/clear" not in guest and "1 部作品有更新" in guest
+            and none == "",
+            "清空按钮只在管理员页面出现；访客只看到文字；无更新时不渲染")
+
+
+def _s_css_order():
+    css = FEED.SITE_CSS
+    i_hover = css.index(".card:hover .ph")
+    i_upd = css.index(".card.upd .ph")
+    i_updh = css.index(".card.upd:hover .ph")
+    return (i_hover < i_upd < i_updh
+            and "position:absolute" in css[css.index(".card .ph .upd"):][:200]
+            and ".group-head .gnew" in css and ".vol .meta .s .vnew" in css
+            and "prefers-color-scheme:dark" in css and "--new:" in css,
+            "描边规则排在 hover 之后（否则悬停丢描边）；角标是绝对定位；含深色模式变量")
+
+
+def _s_css_no_leak():
+    """CSS 对**所有人**下发，注释里的字样会漏进访客源码。
+
+    新增卷提示本身是公开信息（访客也该知道哪本有新卷），所以这里不禁止「有更新」这类词；
+    真正必须守住的是**管理员专有**的那部分：清空按钮、/opds/updates/clear 路由
+    绝不能出现在 CSS / 访客 HTML 里。
+    """
+    css = FEED.SITE_CSS
+    return ("/opds/updates/clear" not in css and "标为已读" not in css,
+            "CSS 里不含管理员专有的路由与按钮文案")
+
+
+_scheck("书卡：有更新的带角标/描边类/副标题，普通卡不受影响", _s_card_markup)
+_scheck("工具条：清空按钮仅管理员可见", _s_bar_gate)
+_scheck("CSS：角标与描边规则齐备且顺序正确", _s_css_order)
+_scheck("CSS 不泄露管理员专有路由/文案", _s_css_no_leak)
+
+
+# ---------- S10. HTTP 端到端：加卷 → 置顶 → 点进去 → 恢复 ----------
+def _s_order_of(body):
+    from urllib.parse import unquote as _uq
+    return [_uq(x) for x in re.findall(r'<a class="cardlink" href="/opds/book/([^"]+)"', body)]
+
+
+def _s_group_open(body, name):
+    """某个子目录分组在页面里是不是「默认展开」状态。
+
+    不能直接用 ``body.index("外传")`` 判断顺序 —— 顶部的「本次新增」区块里
+    也会写子目录名（那正是它的职责），所以得先定位到那个分组的 ``<section>`` 标签本身。
+    """
+    try:
+        i = body.index('<span class="gnm">%s</span>' % name)
+    except ValueError:
+        return False
+    start = body.rindex('<section class="group', 0, i)
+    return " open" in body[start:body.index(">", start)]
+
+
+_s_state = {"lib": _s_fake()}
+_s_orig_get = FEED.get_library
+_s_srv = None
+_s_port = 0
+if UPD is not None:
+    _s_reset()
+    FEED.get_library = lambda *a, **k: _s_state["lib"]      # observe() 内部走 library.get_library
+    LIB.get_library = FEED.get_library
+    try:
+        _s_srv = SRV.make_server(port=0, bind="0.0.0.0")
+        _s_port = _s_srv.server_address[1]
+        threading.Thread(target=_s_srv.serve_forever, daemon=True).start()
+    except Exception as _exc:                              # noqa: BLE001
+        _s_srv = None
+        _s_err = "%s: %s" % (type(_exc).__name__, _exc)
+
+
+def _shcheck(label, fn):
+    if _s_srv is None:
+        _rskip(label, "无法起测试服务（%s）" % ("updates 不可用" if UPD is None else "端口不可用"))
+    else:
+        check(label, fn)
+
+
+if _s_srv is not None:
+    _su = "/opds/catalog/" + quote("已完结", safe="")
+    _s_st0, _s_b0, _ = _http(_s_port, _su)                 # 第一发：只建基线
+    check("S10a 首次打开列表：建立基线，没有任何角标",
+          lambda: (_s_st0 == 200 and _s_order_of(_s_b0) == ["已完结/书A", "已完结/书C"]
+                   and 'class="upd"' not in _s_b0,
+                   "顺序=%s" % _s_order_of(_s_b0)))
+
+    _s_state["lib"] = _s_fake(extra_c=[_S_C2])             # 书C 的外传多了一卷
+    _s_st1, _s_b1, _ = _http(_s_port, _su)
+    _ord1 = _s_order_of(_s_b1)
+    check("S10b 加卷后：该书置顶 + 封面出现「有更新」",
+          lambda: (_s_st1 == 200 and _ord1 == ["已完结/书C", "已完结/书A"]
+                   and "有更新 +1" in _s_b1 and "部作品有更新" in _s_b1,
+                   "顺序=%s" % _ord1))
+
+    _s_sth, _s_bh, _ = _http(_s_port, "/")
+    check("S10c 首页分类卡也带出「N 部有更新」",
+          lambda: ("1 部有更新" in _s_bh, "首页"))
+
+    _s_det = "/opds/book/" + quote("已完结/书C", safe="")
+    _s_st2, _s_b2, _ = _http(_s_port, _s_det)
+    check("S10d 详情页点名「哪个子目录的哪一卷」是新的",
+          lambda: (_s_st2 == 200 and "本次新增 1 卷" in _s_b2
+                   and "外传" in _s_b2 and "有更新 +1" in _s_b2
+                   and 'class="vnew"' in _s_b2,
+                   "status=%s" % _s_st2))
+    check("S10e 有新卷的分组默认展开（否则等于没提示）",
+          lambda: (_s_group_open(_s_b2, "外传") and _s_group_open(_s_b2, "主线"),
+                   "外传=%s 主线=%s" % (_s_group_open(_s_b2, "外传"), _s_group_open(_s_b2, "主线"))))
+    check("S10f 管理员点进去 = 看过了，提示立刻收掉",
+          lambda: (UPD.load_pending() == {}, "pending=%s" % UPD.load_pending()))
+
+    _s_st3, _s_b3, _ = _http(_s_port, _su)
+    _ord3 = _s_order_of(_s_b3)
+    check("S10g 回到列表：该书回到原来的位置，角标消失",
+          lambda: (_ord3 == ["已完结/书A", "已完结/书C"] and 'class="upd"' not in _s_b3
+                   and "部作品有更新" not in _s_b3,
+                   "顺序=%s" % _ord3))
+
+    # 再来一轮，专门验证「访客翻书不会消掉管理员的提醒」
+    _s_state["lib"] = _s_fake(extra_c=[_S_C2, _S_C3])
+    _http(_s_port, _su)
+    _s_pend0 = UPD.load_pending()
+    if _r_lan and _r_lan != "127.0.0.1":
+        _s_gst, _s_gb, _ = _http(_s_port, _s_det, host=_r_lan)
+        check("S10h 访客打开详情页：看得到新增内容，但不会清掉管理员的提示",
+              lambda: (_s_gst == 200 and "本次新增 1 卷" in _s_gb
+                       and UPD.load_pending() == _s_pend0,
+                       "访客看完 pending 仍是 %s" % sorted(UPD.load_pending())))
+        _s_gc, _s_gcb, _ = _http(_s_port, _su, host=_r_lan)
+        check("S10i 访客列表页：有角标但没有清空按钮",
+              lambda: ("有更新 +1" in _s_gcb and "/opds/updates/clear" not in _s_gcb,
+                       "status=%s" % _s_gc))
+        _s_gpost, _, _ = _http(_s_port, "/opds/updates/clear", host=_r_lan, method="POST",
+                               body=urlencode({"back": _su}),
+                               headers={"Origin": "http://%s:%d" % (_r_lan, _s_port)})
+        check("S10j 访客 POST 清空 → 403 且提示还在",
+              lambda: (_s_gpost == 403 and UPD.load_pending() != {},
+                       "status=%s pending=%s" % (_s_gpost, sorted(UPD.load_pending()))))
+    else:
+        _rskip("S10h~j 访客相关", "本机没有非回环 IP，无法模拟访客来源")
+
+    _s_xst, _, _ = _http(_s_port, "/opds/updates/clear", method="POST",
+                         body=urlencode({"back": _su}),
+                         headers={"Origin": "https://evil.example.com"})
+    check("S10k 跨站 Origin → 403（CSRF 兜底），提示未被清掉",
+          lambda: (_s_xst == 403 and UPD.load_pending() != {}, "status=%s" % _s_xst))
+
+    _s_bst, _, _s_bloc = _http(_s_port, "/opds/updates/clear", method="POST",
+                               body=urlencode({"back": "//evil.example.com/x"}))
+    check("S10l back 指向外站 → 回落到本站路径（堵开放重定向）",
+          lambda: (_s_bst == 303 and _s_bloc.startswith("/") and "evil" not in _s_bloc,
+                   "Location=%s" % _s_bloc))
+
+    _s_ist, _, _ = _http(_s_port, "/opds/updates/clear", method="POST",
+                         body=urlencode({"key": "../../etc/passwd"}))
+    check("S10m 非法键 → 400", lambda: (_s_ist == 400, "status=%s" % _s_ist))
+
+    _s_cst, _, _ = _http(_s_port, "/opds/updates/clear", method="POST",
+                         body=urlencode({"back": _su}))
+    check("S10n 管理员清空 → 303 且提示清空",
+          lambda: (_s_cst == 303 and UPD.load_pending() == {},
+                   "status=%s pending=%s" % (_s_cst, sorted(UPD.load_pending()))))
+
+    _s_st4, _s_b4, _ = _http(_s_port, _su)
+    check("S10o 清空后再看列表：顺序与角标全部复原",
+          lambda: (_s_order_of(_s_b4) == ["已完结/书A", "已完结/书C"]
+                   and 'class="upd"' not in _s_b4, "顺序=%s" % _s_order_of(_s_b4)))
+
+    _s_fst, _s_fb, _ = _http(_s_port, _su, accept="application/atom+xml")
+    check("S10p XML feed 用同一套排序（阅读器里也是置顶的）",
+          lambda: (_s_fst == 200 and _s_fb.index("书A") < _s_fb.index("书C"), "status=%s" % _s_fst))
+
+if _s_srv is not None:
+    try:
+        _s_srv.shutdown()
+        _s_srv.server_close()
+    except Exception:
+        pass
+if UPD is not None:
+    FEED.get_library = _s_orig_get                     # 还原，别影响后续任何读取
+    LIB.get_library = _s_orig_get
+
 # ============================== 汇总 ==============================
 print("\n" + "=" * 70)
 _p = [r for r in RESULTS if r[2]]

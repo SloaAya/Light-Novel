@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
-"""UI 探针：用真实 Edge（Playwright，复用系统浏览器，不额外下载）验证 OPDS 页面的
-「未读圆圈」显隐，并把关键状态拼成一张对比图。
+"""UI 探针：用真实 Edge（Playwright，复用系统浏览器，不额外下载）核对 OPDS 页面的
+实际渲染，并把关键状态拼成对比图。
 
-为什么要它：源码断言（smoke_test 的 R4b）只能证明 CSS 文本写对了，
-证明不了浏览器**真的**按它渲染 —— 这次就是靠它才看清
-「POST→303 整页重载后浏览器不会立刻重算 :hover」这个真实行为。
+为什么要它：源码断言（smoke_test 里的正则/结构断言）只能证明「HTML/CSS 文本写对了」，
+证明不了浏览器**真的**按它渲染、人眼**真的**看得见 —— 这次就是靠它才看清两点：
+  1) 26px 的小圆圈在整页截图里肉眼几乎看不见（得放大 4 倍才看得清）；
+  2) POST→303 整页重载后浏览器不会立刻重算 :hover，指针停在按钮上圆圈也会短暂消失。
 
 跑法：
     .venv/Scripts/python.exe tests/ui_probe.py            # 默认 8099 端口
 
 依赖：playwright（python 包）+ 系统 Edge。没装 playwright 时脚本会提示并跳过（退出码 0）。
-产物：.autosync/probe/*.png（含 compare.png 对比图）
-写入：临时 OPDS 会真的 POST 一次标记再撤销；finished.json 先快照、finally 里强制还原。
+产物：.autosync/probe/*.png（compare.png = 未读圆圈；compare_updates.png = 新增卷提示）
+写入：① 临时 OPDS 会真的 POST 一次「已读完」标记再撤销；
+      ② 新增卷提示那一段会往 updates.json **塞一条人造待读提示**（指向真实存在的卷号，
+         免得真往书库里加文件被监控提交推送出去），截完图立刻还原。
+      finished.json / updates.json 都先快照、finally 里强制还原。
 """
 import os
 import shutil
@@ -26,6 +30,7 @@ sys.path.insert(0, ROOT)
 PORT = int(os.environ.get("PROBE_PORT", "8099"))
 OUT = os.path.join(ROOT, ".autosync", "probe")
 FIN = os.path.join(ROOT, ".autosync", "finished.json")
+UPD_FILE = os.path.join(ROOT, ".autosync", "updates.json")
 CAT = "已完结"
 URL_CAT = f"http://127.0.0.1:{PORT}/opds/catalog/{quote(CAT)}"
 URL_READ = f"http://127.0.0.1:{PORT}/opds/read"
@@ -79,7 +84,6 @@ def run_probe():
             raise RuntimeError("没有标记按钮，无法继续")
 
         card, mk = cards.first, cards.first.locator(".mk")
-        back = card.evaluate("el => el.querySelector('.cardlink').getAttribute('href')")
 
         def zoom(name):
             """把按钮左上角附近 100x100 区域放大成图。"""
@@ -214,11 +218,148 @@ def compose():
     os.remove(p_html)
 
 
+# ------------------------- 新增卷提示（人造状态） -------------------------
+def _pick_book_with_subdirs():
+    """挑一部**真实存在**、子目录最多的作品当演示对象（「主线正传/安可系列/外传…」那种结构）。
+
+    子目录多才看得出「点名是哪一册」的价值：新卷常常落在默认折叠的靠后分组里。
+    """
+    from lightnovel.opds import library as lib
+    data = lib.get_library()
+    best = None
+    for cat, books in data.items():
+        for book, vols in books.items():
+            withsub = [v for v in vols if "/" in v["rel"][len(f"{cat}/{book}/"):]]
+            n_sub = len({v["rel"][len(f"{cat}/{book}/"):].rsplit("/", 1)[0] for v in withsub})
+            if withsub and (best is None or n_sub > best[4]):
+                best = (cat, book, vols, withsub, n_sub)
+    if best:
+        return best[:4]
+    for cat, books in data.items():                  # 一个子目录都没有时就退到第一部作品
+        for book, vols in books.items():
+            return cat, book, vols, vols
+    return None
+
+
+def probe_updates():
+    """给「新增卷提示」截图：置顶后的列表页 + 详情页点名哪一卷。
+
+    状态是人造的：`updates.json` 里塞一条指向**真实存在的卷**的待读提示。
+    不真往书库加文件 —— 那个目录被监控盯着，加一个文件就会被提交并推上 GitHub。
+    """
+    import json
+
+    from playwright.sync_api import sync_playwright
+
+    from lightnovel.opds import updates as upd
+
+    had = os.path.exists(UPD_FILE)
+    bak = UPD_FILE + ".probe-bak"
+    if had:
+        shutil.copy2(UPD_FILE, bak)
+    try:
+        upd.observe()                                   # 先写一份与真实书库一致的基线
+        picked = _pick_book_with_subdirs()
+        if not picked:
+            print("      · 书库为空，跳过新增卷提示截图")
+            return
+        cat, book, vols, withsub = picked
+        key = f"{cat}/{book}"
+        new_rel = withsub[-1]["rel"]                    # 拿真实存在的一卷「冒充」新卷
+        with open(UPD_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+        state["pending"] = {key: {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "vols": [new_rel]}}
+        with open(UPD_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
+        print(f"      · 演示对象：{key} → {new_rel}")
+
+        with sync_playwright() as p:
+            br = p.chromium.launch(channel="msedge", headless=True)
+            pg = br.new_page(viewport={"width": 980, "height": 1400}, device_scale_factor=1)
+            for _ in range(40):
+                try:
+                    if pg.goto(URL_CAT, timeout=2000).status == 200:
+                        break
+                except Exception:
+                    time.sleep(0.3)
+            pg.wait_for_timeout(700)
+            pg.screenshot(path=os.path.join(OUT, "u1_list.png"),
+                          clip={"x": 0, "y": 100, "width": 980, "height": 480})
+            card = pg.locator(".card").first
+            badge = (card.locator(".upd").inner_text() if card.locator(".upd").count() else "无")
+            print(f"      · 列表首张卡：{card.locator('.t').inner_text()} / 角标 {badge}")
+
+            pg.goto(f"http://127.0.0.1:{PORT}/opds/book/" + quote(key, safe=""), timeout=8000)
+            pg.wait_for_timeout(800)
+            body = pg.locator("body").inner_text()
+            left = upd.load_pending()
+            print(f"      · 详情页含「本次新增」：{'本次新增' in body}；"
+                  f"访问后提示已被收走：{not left}")
+            # 分两张截：① 顶部「本次新增」区块 ② 那个有新卷的分组（它可能排在很后面，挤一张图看不清）
+            box = pg.locator(".updbox").bounding_box()
+            print(f"      · 新增区块位置：y={box['y']:.0f} h={box['height']:.0f}")
+            pg.screenshot(path=os.path.join(OUT, "u2_detail.png"), full_page=True,
+                          clip={"x": 0, "y": max(0, box["y"] - 26),
+                                "width": 980, "height": box["height"] + 52})
+            hot = pg.locator(".group").filter(has=pg.locator(".gnew")).first
+            if hot.count():
+                hb = hot.bounding_box()
+                print(f"      · 有新卷的分组位置：y={hb['y']:.0f} h={hb['height']:.0f}")
+                pg.screenshot(path=os.path.join(OUT, "u3_group.png"), full_page=True,
+                              clip={"x": 0, "y": max(0, hb["y"] - 14),
+                                    "width": 980, "height": hb["height"] + 18})
+                print(f"      · 有新卷的分组：{hot.locator('.gnm').inner_text()} "
+                      f"{hot.locator('.gnew').inner_text()}")
+            br.close()
+    finally:
+        if had:
+            shutil.copy2(bak, UPD_FILE)
+            os.remove(bak)
+        elif os.path.exists(UPD_FILE):
+            os.remove(UPD_FILE)
+
+
+def compose_updates():
+    """把列表页 / 详情页两张截图拼成一张对比图。"""
+    from playwright.sync_api import sync_playwright
+
+    blocks = [("① 进列表页：这本书被排到第一位，封面左下角压了一条「有更新」并描了暖色边；"
+               "工具条右侧还有「N 部作品有更新」与一键清空", "u1_list.png"),
+              ("② 点进去：顶部「本次新增」区块直接点名是哪一卷（含所属子目录），"
+               "并可当场下载", "u2_detail.png"),
+              ("③ 同一个页面往下看：那个有新卷的分组挂着「有更新 +1」并自动展开，"
+               "卷行带「新」标 —— 新卷常常落在默认折叠的靠后分组里，不这样等于没提示",
+               "u3_group.png")]
+    html = ("""<!doctype html><meta charset="utf-8"><style>
+ body{margin:0;padding:26px;background:#f5f2ed;color:#22282f;
+      font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+ h1{font-size:19px;margin:0 0 4px} .sub{color:#6b7280;font-size:13px;margin-bottom:18px}
+ .box{background:#fff;border:1px solid #e3ded6;border-radius:12px;padding:12px;
+      width:956px;margin-bottom:18px}
+ .box img{width:932px;display:block;border-radius:8px;border:1px solid #eee}
+ .box p{font-size:13px;margin:10px 2px 2px;line-height:1.6}
+</style>
+<h1>「新增卷」提示 —— 真实浏览器渲染结果</h1>
+<div class="sub">书里多了一卷之后：列表页置顶 + 封面角标 → 点进去点名是哪一册 → 回到列表恢复原位。
+（截图用的是真实书库与真实卷号，状态为演示用的人造数据）</div>"""
+            + "".join(f'<div class="box"><img src="{f}"><p>{t}</p></div>' for t, f in blocks))
+    p_html = os.path.join(OUT, "_updates.html")
+    with open(p_html, "w", encoding="utf-8") as f:
+        f.write(html)
+    with sync_playwright() as p:
+        br = p.chromium.launch(channel="msedge", headless=True)
+        pg = br.new_page(viewport={"width": 1008, "height": 1200}, device_scale_factor=1)
+        pg.goto("file:///" + p_html.replace("\\", "/"), timeout=8000)
+        pg.wait_for_timeout(700)
+        pg.screenshot(path=os.path.join(OUT, "compare_updates.png"), full_page=True)
+        br.close()
+    os.remove(p_html)
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
+    import importlib.util
+    if importlib.util.find_spec("playwright") is None:
         print("未安装 playwright，跳过 UI 探针（pip install playwright 即可，复用系统 Edge）。")
         return 0
 
@@ -236,6 +377,8 @@ def main():
     try:
         run_probe()
         compose()
+        probe_updates()
+        compose_updates()
     finally:
         proc.terminate()
         try:
@@ -250,7 +393,7 @@ def main():
 
     print("-" * 60)
     print(f"  失败 {len(fails)} 项" + (f"：{fails}" if fails else "（全部通过）"))
-    print(f"  产物：{os.path.join(OUT, 'compare.png')}")
+    print(f"  产物：{os.path.join(OUT, 'compare.png')} / compare_updates.png")
     return 1 if fails else 0
 
 
