@@ -12,6 +12,7 @@ dependencies = []          # 运行时零第三方依赖；二维码为可选增
 [project.optional-dependencies]
 qr = ["segno"]             # 控制台二维码（缺失则自动跳过，不影响服务）
 build = ["pyinstaller>=6"]
+uitest = ["playwright"]    # tests/ui_probe.py：真实浏览器验证页面显隐（复用系统 Edge，不下载浏览器）
 
 [project.scripts]
 lightnovel = "lightnovel.cli:main"

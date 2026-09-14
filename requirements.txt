@@ -4,3 +4,8 @@
 #
 # 打包 exe 时需要（仅构建机）：
 pyinstaller>=6
+#
+# UI 探针（可选，仅开发时）：tests/ui_probe.py 用真实浏览器核对页面显隐行为。
+#   python tests/ui_probe.py；无需 playwright install —— 脚本走 channel="msedge"
+#   复用系统 Edge。没装 playwright 时脚本会自己跳过。
+playwright
