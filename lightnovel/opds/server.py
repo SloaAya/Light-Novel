@@ -378,8 +378,30 @@ def start_background(port=PORT, bind=BIND):
 
 
 # ---------------------------- 公网隧道 ----------------------------
+def _app_dirs():
+    """本程序自身可能所在的目录（打包分发后 cloudflared 会与 exe 放一起）。
+
+    依次为：exe 同级目录（frozen）、本模块所在目录、项目根。
+    """
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(os.path.dirname(os.path.abspath(sys.executable)))
+    here = os.path.dirname(os.path.abspath(__file__))            # lightnovel/opds
+    cands.append(here)
+    cands.append(os.path.dirname(os.path.dirname(here)))          # 项目根
+    out = []
+    for d in cands:
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
 def find_cloudflared():
-    """按 PATH -> 环境变量 CLOUDFLARED_BIN -> 常见安装位置 -> 用户工具目录 的顺序查找。"""
+    """查找 cloudflared 可执行文件。
+
+    顺序：PATH -> 环境变量 CLOUDFLARED_BIN -> **与本程序同级的目录**（打包分发时随
+    exe 一起放，放到哪都能被找到）-> 常见安装位置 -> 用户工具目录。
+    """
     for name in ("cloudflared", "cloudflared.exe"):
         found = shutil.which(name)
         if found:
@@ -387,16 +409,21 @@ def find_cloudflared():
     env_bin = os.environ.get("CLOUDFLARED_BIN", "")
     if env_bin and os.path.isfile(env_bin):
         return env_bin
+
+    cands = []
+    for base in _app_dirs():
+        cands.append(os.path.join(base, "cloudflared.exe"))
+        cands.append(os.path.join(base, "cloudflared", "cloudflared.exe"))
     home = os.path.expanduser("~")
-    cands = [
+    cands += [
         os.path.join(home, ".workbuddy", "bin", "cloudflared.exe"),
-        r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
-        r"C:\Program Files\cloudflared\cloudflared.exe",
         os.path.join(home, "cloudflared", "cloudflared.exe"),
         os.path.join(home, "scoop", "shims", "cloudflared.exe"),
+        "C:/Program Files (x86)/cloudflared/cloudflared.exe",
+        "C:/Program Files/cloudflared/cloudflared.exe",
     ]
     for c in cands:
-        if os.path.isfile(c):
+        if c and os.path.isfile(c):
             return c
     return None
 

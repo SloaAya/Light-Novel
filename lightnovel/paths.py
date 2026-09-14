@@ -10,12 +10,16 @@
 约定：
   * 顶层常量都可被替换（测试按模块属性打桩），故不要在本模块里做副作用。
   * 口令只从环境变量读取，绝不写死 —— 本包会同步进 GitHub 仓库。
+  * 「根目录」可用环境变量覆盖，方便把打包好的 exe 分发到别的机器 / 盘符：
+      LN_ROOT      书库根目录（默认 D:\\Light-Novel）
+      LN_F_ROOT    F 盘镜像根目录（默认 F:\\LightNovel）
+    脚本与启动器都不需要改，设一次环境变量即可整机迁移。
 """
 
 import os
 
 # ============================ 根目录与书库 ============================
-TARGET_DIR      = r"D:\Light-Novel"
+TARGET_DIR      = os.environ.get("LN_ROOT") or r"D:\Light-Novel"
 LIGHT_NOVEL_DIR = os.path.join(TARGET_DIR, "轻小说")
 
 CATEGORY_DONE    = "已完结"
@@ -94,7 +98,7 @@ TARGET_SUBDIR = os.path.join("轻小说", CATEGORY_ONGOING, BOOK_NAME)
 PAT_TOKEN = ""
 
 # ======================== F 盘网络云盘镜像（CloudDrive2）========================
-F_TARGET_ROOT = r"F:\LightNovel"
+F_TARGET_ROOT = os.environ.get("LN_F_ROOT") or r"F:\LightNovel"
 F_CATEGORY_DIRS = {
     CATEGORY_DONE:    os.path.join(F_TARGET_ROOT, CATEGORY_DONE),
     CATEGORY_ONGOING: os.path.join(F_TARGET_ROOT, CATEGORY_ONGOING),
