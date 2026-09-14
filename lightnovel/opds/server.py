@@ -323,6 +323,20 @@ class OPDSHandler(BaseHTTPRequestHandler):
             return {}
         return parse_qs(raw, keep_blank_values=True)
 
+    def _wants_json(self):
+        """前端用 ``fetch`` 提交时打了 ``X-Requested-With: fetch``，就回 JSON 而不是 303。
+
+        为什么认这个头而不是 ``Accept``：跨站 ``fetch`` 带自定义请求头会先触发 CORS 预检，
+        我们不应答 OPTIONS —— 预检不通过，跨站脚本根本发不出这个请求，等于白捡一层 CSRF 兜底。
+        不带这个头的（原生表单提交、curl、旧浏览器）一律走原来的 303，功能一条不少。
+        """
+        return (self.headers.get("X-Requested-With", "") or "").strip().lower() == "fetch"
+
+    def _send_json(self, obj, code=200):
+        """给 fetch 用的最小 JSON 响应（不缓存，避免拿到上一次的标记结果）。"""
+        self._send(code, json.dumps(obj, ensure_ascii=False),
+                   "application/json; charset=utf-8")
+
     def _same_origin(self):
         """只受理同站表单（CSRF 兜底）。
 
@@ -378,6 +392,11 @@ class OPDSHandler(BaseHTTPRequestHandler):
                     return
                 on = toggle_finished(key)
                 log.info("「已读完」标记 %s → %s", key, "已读完" if on else "未读完")
+                if self._wants_json():
+                    # 原地生效：前端拿到最终状态自己回写 DOM，不跳转、不丢滚动位置。
+                    # 回的是「服务端算出来的状态」而不是「前端猜的」，两边不会漂。
+                    self._send_json({"ok": True, "key": key, "finished": on})
+                    return
                 self._redirect(self._local_back(form.get("back", ["/"])[0], "/opds/read"))
                 return
             if path == "/opds/updates/clear":
@@ -397,6 +416,9 @@ class OPDSHandler(BaseHTTPRequestHandler):
                     return
                 n = upd.clear(normalize_key(raw) if raw else None)
                 log.info("清除新增卷提示：%s（%d 部）", raw or "全部", n)
+                if self._wants_json():
+                    self._send_json({"ok": True, "cleared": n, "key": raw})
+                    return
                 self._redirect(self._local_back(form.get("back", ["/"])[0], "/"))
                 return
             self._notfound(path)

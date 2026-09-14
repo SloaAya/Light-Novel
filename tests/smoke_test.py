@@ -1501,6 +1501,216 @@ def _r_read_hint():
 _rcheck("空态/说明文案与交互一致（悬停后点；触屏常驻）", _r_read_hint)
 _reset_fin(_rp)
 
+
+# ---------- R4c. 原地标记：JS 增强层（点了不刷新页面） ----------
+# 分工：增强层**只管显示**（就地改 DOM），状态永远由服务端算 —— 所以这些断言全是
+# 「结构/契约」检查，不含任何「前端逻辑对不对」的模拟（那种断言跑不真浏览器）。
+def _mk_admin_only():
+    """增强层只在管理员页面注入。访客没有标记按钮，脚本也无事可做；
+    更关键的是脚本里带着「已读完」字样，注进去就等于漏进访客的源码。"""
+    admin = FEED._html_page("t", "<p>x</p>", is_admin=True)
+    guest = FEED._html_page("t", "<p>x</p>", is_admin=False)
+    return ("X-Requested-With" in admin and 'addEventListener("submit"' in admin
+            and "X-Requested-With" not in guest and "addEventListener" not in guest
+            and "已读完" not in guest,
+            "管理员页面含增强层；访客页面连脚本都不出现")
+
+
+_rcheck("增强层只发给管理员（访客页面不含脚本、更不含功能字样）", _mk_admin_only)
+
+
+def _mk_no_route():
+    """脚本里不写死管理员路由，用表单自己的 ``action``。
+    少一处会漂的常量，也让「访客页面不含 /opds/read」这条断言不怕脚本被误注入。"""
+    js = FEED.MARK_JS
+    return ("/opds/read" not in js and "f.action" in js,
+            "脚本里没有 /opds/read 字样，走 f.action")
+
+
+_rcheck("脚本不写死管理员路由（走表单自带的 action）", _mk_no_route)
+
+
+def _mk_fallbacks():
+    """三条兜底缺一不可 —— 缺哪条都会让某一类用户点不动按钮：
+    ① 没有 fetch/FormData/URLSearchParams 就不拦，交给原生提交；
+    ② 提交失败（网络断、认证过期）回退 ``f.submit()``；
+    ③ 服务端只吃 urlencoded，所以必须走 URLSearchParams 而不是 FormData 本身
+       （FormData 默认发 multipart，服务端解析不了 → 静默 400）。"""
+    js = FEED.MARK_JS
+    return (all(t in js for t in
+                ("window.fetch", "window.FormData", "URLSearchParams",
+                 "f.submit()", "credentials")),
+            "老浏览器放行 + 失败回退 + urlencoded 编码 + 带上凭据")
+
+
+_rcheck("增强层三条兜底齐全（无 fetch 放行 / 失败回退原生提交 / 只发 urlencoded）", _mk_fallbacks)
+
+
+def _mk_server_truth():
+    """前端只照抄服务端回的状态，不自己记账 —— 两边不会漂。
+    ``r.json()`` + 读 ``d.finished`` 两条就是「照抄」的全部证据。"""
+    js = FEED.MARK_JS
+    return ("r.json()" in js and "d.finished" in js and "!r.ok" in js,
+            "非 2xx 抛错走回退；2xx 才读 finished")
+
+
+_rcheck("状态由服务端算、前端照抄（不回写本地推算值）", _mk_server_truth)
+
+
+def _mk_script_balanced():
+    """整页只注入一次、闭合正常。拼接漏个括号会把后面的 HTML 全吞掉，
+    而且这种错在浏览器里表现为「页面莫名少了半截」，很难查 —— 所以在测试里钉住。"""
+    on = FEED._html_page("t", "<p>x</p>", is_admin=True)
+    off = FEED._html_page("t", "<p>x</p>", is_admin=False)
+    return (on.count("<script>") == 1 and on.count("</script>") == 1
+            and off.count("<script>") == 1 and off.count("</script>") == 1
+            and on.endswith("</body></html>") and off.endswith("</body></html>")
+            and "grpAll" in off,
+            "两种身份各一处 <script>，分组折叠脚本对访客照旧")
+
+
+_rcheck("脚本注入一次且闭合正常（漏括号会静默吞掉半页）", _mk_script_balanced)
+
+
+def _mk_js_parses():
+    """把整段内联脚本抠出来交给 node 做语法检查。
+
+    为什么非要有这一步：脚本是拼字符串拼出来的，写错一个赋值目标（比如
+    ``mk.title = mk.getAttribute("aria-label") = tip``）不会让 Python 报错、
+    正则断言也看不出来 —— 只有浏览器执行到那一行才炸，而那时**请求已经发出去了**，
+    用户看到的是「点了没反应」。node --check 能抓到这类早期错误（Early Error），
+    所以把它钉在测试里，省得下次再靠开浏览器才发现。
+    没有 node 就跳过（不假装通过，也不让整轮挂掉）。
+    """
+    if not FEED.MARK_JS.strip():
+        return False, "增强层是空的"
+    node = shutil.which("node")
+    if not node:
+        return True, "跳过：本机没有 node，无法做脚本语法检查"
+    html = FEED._html_page("t", "<p>x</p>", is_admin=True)
+    m = re.search(r"<script>(.*)</script>", html, re.S)
+    if not m:
+        return False, "页面里抠不到 <script>"
+    fd, tmp = tempfile.mkstemp(suffix=".js", prefix="ln_markjs_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(m.group(1))
+        r = subprocess.run([node, "--check", tmp], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=60)
+        return (r.returncode == 0,
+                "node --check 通过（%d 字节）" % len(m.group(1)) if r.returncode == 0
+                else "语法/早期错误：%s" % (r.stderr or "").strip().splitlines()[-3:])
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+_rcheck("内联脚本通过 node 语法检查（拼字符串最容易漏这种错）", _mk_js_parses)
+
+
+def _mk_no_double_submit():
+    """回写失败**不能**再 submit 一次。
+
+    真实踩到的坑：fetch 拿到了 200、状态已经写进服务端，随后本地改 DOM 抛了个
+    ReferenceError，被同一个 catch 接住 → ``f.submit()`` 又一次 POST → 状态被翻回去，
+    用户看到「点了没反应」，而服务器日志里是两条记录。
+    正确分工：请求没送达才重提交；送达后出错就重取本页。这两句必须在代码里。
+    """
+    js = FEED.MARK_JS
+    # 数「语句级」的调用（行首缩进 + f.submit()），免得把注释里提到的那次也算进来
+    n_submit = len(re.findall(r"^\s*f\.submit\(\)", js, re.M))
+    return ("console.warn(\"本地回写失败" in js and "console.warn(\"提交没送达" in js
+            and n_submit == 1
+            and js.index("本地回写失败") < js.index("提交没送达")
+            and js.index("提交没送达") < js.index("f.submit();"),
+            "两条失败路径分开处理，f.submit() 只剩一处（%d）" % n_submit)
+
+
+_rcheck("回写失败不重提交（否则状态被翻回去，表现为「点了没用」）", _mk_no_double_submit)
+
+
+def _mk_readlist_attr():
+    """「已读完」列表的卡带 ``data-list=read`` → 取消标记后卡片自己消失；
+    目录页的卡**不带** → 取消后必须留在原地（否则一取消书就跑了）。"""
+    _reset_fin(_rp)
+    lib = LIB.get_library(force=True)
+    cat = "已完结" if "已完结" in lib else list(lib)[0]
+    book = sorted(lib.get(cat, {}))[0]
+    FIN.mark_finished("%s/%s" % (cat, book), True)
+    rd = FEED.read_html(1)
+    cat_html = FEED.catalog_html(cat, 1, is_admin=True)
+    _reset_fin(_rp)
+    return ('data-list="read"' in rd and 'data-list="read"' not in cat_html
+            and rd.count('data-list="read"') == 1,
+            "仅「已读完」列表页带该标记")
+
+
+_rcheck("只有「已读完」列表的卡带 data-list=read（取消即消失；目录页取消要留住）",
+        _mk_readlist_attr)
+
+
+def _mk_read_meta():
+    """给 JS 记账用的三件套：data-total（分页时不能数当前页的卡）、readcnt（计数）、
+    readempty 空态模板。没有作品时直接渲染空态、不发模板 —— 免得空模板和空态文案同时出现。"""
+    _reset_fin(_rp)
+    lib = LIB.get_library(force=True)
+    cat = "已完结" if "已完结" in lib else list(lib)[0]
+    book = sorted(lib.get(cat, {}))[0]
+    FIN.mark_finished("%s/%s" % (cat, book), True)
+    one = FEED.read_html(1)
+    _reset_fin(_rp)
+    zero = FEED.read_html(1)
+    return ('data-total="1"' in one and 'id="readcnt"' in one
+            and '<template id="readempty">' in one and "1 部作品" in one
+            and '<template id="readempty">' not in zero
+            and "还没有标记任何作品" in zero,
+            "有作品时发模板+计数；空清单直接渲染空态")
+
+
+_rcheck("已读完列表带 data-total / readcnt / 空态模板（计数不被分页带偏）", _mk_read_meta)
+
+
+def _mk_hero_ids():
+    """详情页的两个「原地改点」：状态行 id=finstate、按钮表单 class=mkbig。
+    访客页面两者都没有（那两段 HTML 本来就只在管理员分支里拼）。"""
+    _reset_fin(_rp)
+    lib = LIB.get_library(force=True)
+    cat = "已完结" if "已完结" in lib else list(lib)[0]
+    book = sorted(lib.get(cat, {}))[0]
+    rel = "%s/%s" % (cat, book)
+    FIN.mark_finished(rel, True)
+    on = FEED.book_html(rel, 1, is_admin=True)
+    off = FEED.book_html(rel, 1, is_admin=False)
+    _reset_fin(_rp)
+    return ('<b id="finstate" style="color:#1a7f37">已读完</b>' in on
+            and 'class="mkbig"' in on
+            and "finstate" not in off and "mkbig" not in off,
+            "管理员详情页两个锚点齐全，访客页面都没有")
+
+
+_rcheck("详情页锚点：状态行 id=finstate + 按钮 form.mkbig（访客无）", _mk_hero_ids)
+
+
+def _mk_untouched():
+    """增强层不该顺手改掉既有契约：书卡副标题里那个常驻的 ``<span class="fin">``
+    必须保持原样 —— 它是「圆圈收起了状态也不丢」的承载，改结构会连带丢信息。"""
+    _reset_fin(_rp)
+    lib = LIB.get_library(force=True)
+    cat = "已完结" if "已完结" in lib else list(lib)[0]
+    book = sorted(lib.get(cat, {}))[0]
+    FIN.mark_finished("%s/%s" % (cat, book), True)
+    on = FEED.catalog_html(cat, 1, is_admin=True)
+    _reset_fin(_rp)
+    return ('<span class="fin">已读完</span>' in on
+            and "URLSearchParams" not in on.split("</main>")[0],
+            "副标题结构未动；增强层只在 </main> 之后的脚本里")
+
+
+_rcheck("不改既有契约：副标题结构原样，增强层只在正文之后的脚本里", _mk_untouched)
+
+
 # ---------- R5. HTTP 层：真的打请求（含来源判定） ----------
 _r_lan = LIB.local_ip() if LIB else ""
 
@@ -1520,6 +1730,24 @@ def _http(port, path, host=None, method="GET", body=None, headers=None, accept=N
     resp = conn.getresponse()
     text = resp.read().decode("utf-8", "replace")
     out = (resp.status, text, resp.getheader("Location"))
+    conn.close()
+    return out
+
+
+def _post_json(port, path, body, headers=None):
+    """原地（AJAX）路径专用：要单独看 Content-Type，也会多带一个头。
+
+    默认带上 ``X-Requested-With: fetch`` —— 服务端据此回 JSON 而不是 303。
+    """
+    import http.client as _hc
+    conn = _hc.HTTPConnection("127.0.0.1", port, timeout=15)
+    hdrs = {"Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "fetch"}
+    hdrs.update(headers or {})
+    conn.request("POST", path, body=body, headers=hdrs)
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8", "replace")
+    out = (resp.status, text, resp.getheader("Content-Type"), resp.getheader("Location"))
     conn.close()
     return out
 
@@ -1611,6 +1839,40 @@ if _r_lib_ok:
                         body=urlencode({"key": "不存在的分类/x"}))
     check("HTTP 非法键 / 未知分类 → 400",
           lambda: (_ist == 400 and _ist2 == 400, "status=%s / %s" % (_ist, _ist2)))
+
+    # 原地标记（增强层）：同一个 POST，带 X-Requested-With 就回 JSON 而不 303 跳转
+    _reset_fin(os.path.join(_R_TMP, "http_finished.json"))
+
+    _jst, _jbody, _jct, _jloc = _post_json(_r_port, "/opds/read/toggle", _r_form)
+    _jd = {}
+    try:
+        _jd = json.loads(_jbody)
+    except Exception:                                 # noqa: BLE001
+        pass
+    check("HTTP 原地标记 → 200 + JSON（不再 303 跳转，浏览器就不会白屏重载）",
+          lambda: (_jst == 200 and _jloc is None
+                   and (_jct or "").startswith("application/json")
+                   and _jd.get("ok") is True and _jd.get("finished") is True
+                   and FIN.load_finished() == {_r_key2},
+                   "status=%s ctype=%s loc=%s json=%s" % (_jst, _jct, _jloc, _jd)))
+    _j2st, _j2body, _, _ = _post_json(_r_port, "/opds/read/toggle", _r_form)
+    _j2d = json.loads(_j2body) if _j2body.startswith("{") else {}
+    check("HTTP 原地标记再来一次 → finished 翻回 false（前端只需照抄这个值）",
+          lambda: (_j2st == 200 and _j2d.get("finished") is False
+                   and FIN.load_finished() == set(),
+                   "status=%s json=%s" % (_j2st, _j2d)))
+    _j3st, _, _, _ = _post_json(_r_port, "/opds/read/toggle", _r_form,
+                                {"Origin": "https://evil.example.com"})
+    check("HTTP 原地标记也过同站判定 → 跨站 Origin 照样 403",
+          lambda: (_j3st == 403 and FIN.load_finished() == set(),
+                   "status=%s 清单未被动" % _j3st))
+    _j4st, _, _, _ = _post_json(_r_port, "/opds/read/toggle", urlencode({"key": "../../etc/passwd"}))
+    check("HTTP 原地标记的入参校验不放松 → 非法键 400",
+          lambda: (_j4st == 400, "status=%s" % _j4st))
+    _j5st, _, _ = _http(_r_port, "/opds/read/toggle", method="POST", body=_r_form)
+    check("HTTP 不带该头的提交仍走老路 → 303（curl / 无 JS 的浏览器不受影响）",
+          lambda: (_j5st == 303, "status=%s" % _j5st))
+    _reset_fin(os.path.join(_R_TMP, "http_finished.json"))
 
     # 两级口令下的 HTTP 行为
     SRV.AUTH_USER, SRV.AUTH_PASS = "ranqing", "s3cret"
@@ -2021,6 +2283,23 @@ if _s_srv is not None:
     _s_ist, _, _ = _http(_s_port, "/opds/updates/clear", method="POST",
                          body=urlencode({"key": "../../etc/passwd"}))
     check("S10m 非法键 → 400", lambda: (_s_ist == 400, "status=%s" % _s_ist))
+
+    # 原地清空：带头 → 回 JSON 不跳转（前端拿它当成功信号，再只换 <main> 内容重排）
+    _s_state["lib"] = _s_fake(extra_a=[_S_A2], extra_c=[_S_C2, _S_C3])
+    _http(_s_port, _su)                                    # 重新检测出新卷（书A 的第 2 卷）
+    _s_qst, _s_qb, _s_qct, _s_qloc = _post_json(_s_port, "/opds/updates/clear",
+                                                urlencode({"back": _su}))
+    _s_qd = {}
+    try:
+        _s_qd = json.loads(_s_qb)
+    except Exception:                                     # noqa: BLE001
+        pass
+    check("S10m2 原地清空 → 200 + JSON 条数（不再 303，列表由服务端重排）",
+          lambda: (_s_qst == 200 and _s_qloc is None
+                   and (_s_qct or "").startswith("application/json")
+                   and _s_qd.get("ok") is True and _s_qd.get("cleared") == 1
+                   and UPD.load_pending() == {},
+                   "status=%s ctype=%s json=%s" % (_s_qst, _s_qct, _s_qd)))
 
     _s_cst, _, _ = _http(_s_port, "/opds/updates/clear", method="POST",
                          body=urlencode({"back": _su}))
