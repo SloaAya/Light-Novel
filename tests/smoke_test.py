@@ -1421,6 +1421,86 @@ _rcheck("入口显隐：非管理员响应里不含任何形如 /opds/read 的�
                  and "/opds/read" not in FEED.recent_html(1, is_admin=False),
                  "分类/搜索/最近更新页逐个核对"))
 
+
+# ---------- R4b. 未读圆圈的显隐（静息不显示，悬停/选中才出现，且无残留） ----------
+def _mk_css():
+    """抠出与「未读圆圈」显隐相关的 CSS 规则。
+
+    先去掉注释再断言 —— 注释里写着「刻意不用 visibility:hidden」，直接用原文匹配
+    会把注释文字当成声明，断言就变假阳性了。
+    """
+    css = re.sub(r"/\*.*?\*/", "", FEED.SITE_CSS, flags=re.S)
+    base = re.search(r"\.mk\{([^}]*)\}", css)
+    rev = re.search(r"([^{}\n]*\.card:hover \.mk[^{}\n]*)\{([^}]*)\}", css)
+    touch = re.search(r"@media\s*\(hover:none\)\s*\{(\.mk\{[^}]*\})\}", css)
+    return {
+        "css": css,
+        "base": base.group(1) if base else "",
+        "rev_sel": rev.group(1) if rev else "",
+        "rev": rev.group(2) if rev else "",
+        "touch": touch.group(1) if touch else "",
+    }
+
+
+_mkc = _mk_css() if FIN is not None else {"css": "", "base": "", "rev_sel": "", "rev": "", "touch": ""}
+
+_rcheck("静息态不显示圆圈：opacity:0 + pointer-events:none（既不显形，也不吞掉封面点击）",
+        lambda: ("opacity:0" in _mkc["base"] and "pointer-events:none" in _mkc["base"]
+                 and "opacity:1" not in _mkc["base"],
+                 "静息声明 = %s" % _mkc["base"].replace("\n", " ").strip()))
+_rcheck("用 opacity 而不是 visibility 隐藏（visibility:hidden 会让按钮无法 Tab 聚焦）",
+        lambda: ("visibility" not in _mkc["css"],
+                 "整份 SITE_CSS 去注释后无 visibility 声明"))
+_rcheck("显形条件三条齐全：卡片悬停 / 卡内有焦点 / 按钮自身聚焦",
+        lambda: (all(t in _mkc["rev_sel"] for t in (":hover", ":focus-within", ":focus-visible"))
+                 and "opacity:1" in _mkc["rev"] and "pointer-events:auto" in _mkc["rev"],
+                 "选择器 = %s" % _mkc["rev_sel"].strip()))
+_rcheck("三条显形条件合成同一条规则（避免某处漏写导致「选中后收不回去」的残留）",
+        lambda: (_mkc["rev_sel"].count(",") == 2 and _mkc["rev_sel"].strip().startswith(".card:hover"),
+                 "一条规则覆盖三个出口"))
+_rcheck("无残留：能设 opacity:1 的只有「显形」与「触屏兜底」两处，没有第三条把圆圈钉住",
+        lambda: (_mkc["css"].count("opacity:1") == 2
+                 and _mkc["css"].count("pointer-events:auto") == 2,
+                 "opacity:1 ×%d / pointer-events:auto ×%d"
+                 % (_mkc["css"].count("opacity:1"), _mkc["css"].count("pointer-events:auto"))))
+_rcheck("触屏兜底：无 hover 的设备保持常驻（否则手机上永远点不到标记）",
+        lambda: ("hover:none" in _mkc["css"] and ".mk" in _mkc["touch"]
+                 and "opacity:1" in _mkc["touch"],
+                 "触摸设备常驻 = %s" % _mkc["touch"].strip()))
+_rcheck("悬停时按钮仍是可点的（显形才接管指针，且悬停不动布局）",
+        lambda: ("position:absolute" in _mkc["css"] and ".mk:hover" in _mkc["css"],
+                 "绝对定位 + .mk:hover 只改背景/缩放"))
+
+
+def _r_fin_note():
+    """已读状态由书卡副标题的文字承载，不依赖那个圆圈常驻。"""
+    _reset_fin(_rp)
+    lib = LIB.get_library(force=True)
+    cat = "已完结" if "已完结" in lib else list(lib)[0]
+    book = sorted(lib.get(cat, {}))[0]
+    FIN.mark_finished("%s/%s" % (cat, book), True)
+    on = FEED.catalog_html(cat, 1, is_admin=True)
+    off = FEED.catalog_html(cat, 1, is_admin=False)
+    return ('<span class="fin">已读完</span>' in on
+            and '<span class="fin">已读完</span>' not in off,
+            "管理员书卡副标题里常驻绿色「已读完」，圆圈只负责操作")
+
+
+_rcheck("已读与否看得见：状态写在书卡副标题文字里（圆圈收起也不丢信息）", _r_fin_note)
+
+
+def _r_read_hint():
+    """空态提示要与新交互一致（别再写「点封面左上角」这种已经不对的话）。"""
+    _reset_fin(_rp)
+    html_txt = FEED.read_html(1)
+    return (("鼠标移到封面上" in html_txt or "鼠标移上封面" in html_txt)
+            and "圆圈会一直显示" in html_txt,
+            "提示已改为「悬停后点」，并说明触屏例外")
+
+
+_rcheck("空态/说明文案与交互一致（悬停后点；触屏常驻）", _r_read_hint)
+_reset_fin(_rp)
+
 # ---------- R5. HTTP 层：真的打请求（含来源判定） ----------
 _r_lan = LIB.local_ip() if LIB else ""
 

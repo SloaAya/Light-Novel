@@ -345,13 +345,22 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
 /* 标记控件 .mkform/.mk：只在管理员页面渲染（见 _mark_form）。这里刻意不写任何
    带功能名的注释 —— CSS 对所有人下发，注释里的字样会漏进访客的页面源码里。 */
 .mkform{position:absolute;left:6px;top:6px;margin:0;z-index:2;line-height:0}
+/* 静息态隐藏：opacity 归零 + 关掉指针事件 —— 不吞点击、不留残影。
+   刻意**不用** visibility:hidden：那会让按钮无法被 Tab 聚焦，键盘用户就永远见不到它；
+   只靠 opacity 才能做到「聚焦即显形」。 */
 .mk{width:26px;height:26px;padding:0;border-radius:50%;cursor:pointer;
   display:grid;place-items:center;font-size:13px;line-height:1;font-family:inherit;
   border:1px solid rgba(255,255,255,.55);background:rgba(15,20,26,.55);color:#fff;
-  backdrop-filter:blur(6px);transition:background .12s,transform .12s,border-color .12s}
+  backdrop-filter:blur(6px);opacity:0;pointer-events:none;
+  transition:opacity .14s ease,background .12s,transform .12s,border-color .12s}
+/* 显形条件合成一条规则：悬停整张卡 / 卡内有焦点（Tab 进来、或手点过）/ 按钮自身聚焦。
+   三者写在一起，是为了避免「几处各写一遍 → 某个出口忘了收回」造成圆圈残留。 */
+.card:hover .mk,.card:focus-within .mk,.mk:focus-visible{opacity:1;pointer-events:auto}
 .mk:hover{transform:scale(1.08);background:rgba(15,20,26,.75)}
 .mk.on{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
 .mk.on:hover{background:var(--accent2)}
+/* 触屏设备没有 hover：若也藏起来，手机上就永远点不到标记 —— 这类设备保持常驻。 */
+@media (hover:none){.mk{opacity:1;pointer-events:auto}}
 .actions form{display:inline;margin:0}
 .actions button.dl{font-family:inherit;cursor:pointer;border:0}
 .dl.ok{background:#1f883d;color:#fff;border:1px solid #1f883d}
@@ -925,7 +934,8 @@ def read_html(page=1):
         listing = f'<div class="grid">{cards}</div>'
     else:
         listing = ('<div class="empty">还没有标记任何作品。<br>'
-                   '去「已完结 / 未完结」里点封面左上角的 &#9675; 即可标记为已读完。</div>')
+                   '去「已完结 / 未完结」把鼠标移到封面上，点左上角出现的 &#9675; 即可标记为已读完。'
+                   '<br><span style="font-size:12px">（触屏设备没有悬停，圆圈会一直显示，直接点即可）</span></div>')
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span><span>已读完</span></div>'
         '<div class="bar">'
@@ -933,7 +943,7 @@ def read_html(page=1):
         '<span class="spacer"></span>'
         f'<span class="sub" style="margin:0">{total} 部作品</span>'
         "</div>"
-        f'<p class="sub">点封面左上角的 &#10003; 可取消标记。'
+        f'<p class="sub">鼠标移上封面后，点左上角的 &#10003; 可取消标记。'
         f'（这份清单只保存在本机 <code>.autosync/finished.json</code>，不同步到书库/仓库）</p>'
         + listing
         + _pager_html(page, _next_link(extra), _prev_link(extra))
