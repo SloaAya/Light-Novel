@@ -985,6 +985,18 @@ def _ui_check(label, fn):
         check(label, fn)
 
 
+def _strip_comments(src):
+    """去掉整行注释：注释里会「提到」Consolas 来说明为什么不用它，别当成真的字体设置。"""
+    return "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+
+
+def _panel_body(name):
+    """取 ``Panel.<name>`` 的函数体源码（到下一个同缩进的 def 为止）。"""
+    i = _uisrc.index("def %s(" % name)
+    j = _uisrc.find("\n    def ", i + 1)
+    return _uisrc[i:j if j != -1 else len(_uisrc)]
+
+
 _ui_check("日志行解析：INFO -> (时间, info, 正文)",
           lambda: (UI.parse_log_line("[2026-09-14 20:18:52] INFO: 检测到已存在的 Git 仓库。")
                    == ("20:18:52", "info", "检测到已存在的 Git 仓库。"), str(
@@ -999,19 +1011,102 @@ _ui_check("日志行解析：CRITICAL 归入错误色，未知级别不冒充",
 _ui_check("日志行解析：裸输出（git 回显/二维码）不丢内容，仍走同一栅格",
           lambda: (UI.parse_log_line("  M lightnovel/ui.py") == (None, "", "  M lightnovel/ui.py"),
                    "裸行原样返回，调用方缩进到正文列"))
-_ui_check("三列栅格不变式：任何行型的正文都从第 MSG_COL 列开始",
-          lambda: (all(len("".join(p[0] for p in UI.row_parts(ts, chip, "msg", "x")[:2])) + UI.COL_GAP
-                       == UI.MSG_COL
+def _tkcheck(label, fn):
+    """需要真实 Tk 运行时的断言：拿不到显示环境就标记为「跳过」，不算失败。
+
+    本机（沙箱）能建隐藏窗口，但别的解释器/CI 未必有显示，所以只降级不红。
+    """
+    if UI is None:
+        check(label, lambda: (True, "跳过（本解释器无 tkinter）"))
+        return
+    try:
+        ok, det = fn()
+    except Exception as exc:
+        check(label, lambda: (True, "跳过（无法创建 Tk 运行环境：%s）" % type(exc).__name__))
+        return
+    check(label, lambda: (ok, det))
+
+
+def _log_fonts():
+    """复制面板 UI 默认字体（TkDefaultFont）派生出 regular / bold 两个字体对象。"""
+    from tkinter import font as _tkfont
+    reg = _tkfont.nametofont("TkDefaultFont").copy()
+    reg.configure(size=UI.LOG_FONT_SIZE)
+    bd = reg.copy()
+    bd.configure(weight="bold")
+    return reg, bd
+
+
+_ui_check("三列栅格不变式：任何行型都恰好两个制表位，正文列落点与内容无关",
+          lambda: (all([p[0] for p in UI.row_parts(ts, chip, "msg", "正文")].count("\t") == 2
+                       and [p[1] for p in UI.row_parts(ts, chip, "msg", "正文")
+                            if p[0] == "\t"] == ["msg", "msg"]
+                       and UI.row_parts(ts, chip, "msg", "正文")[4][0] == "正文"
                        for ts, chip in (("20:18:52", "INFO"), (None, ""), (None, "ERROR"),
                                         ("20:18:52", ""), (None, "OK"))),
-                   "MSG_COL=%d (=%d+%d+%d+%d+%d)" % (UI.MSG_COL, 1, UI.COL_TIME, 1, UI.COL_CHIP,
-                                                     UI.COL_GAP)))
+                   "两个制表位都归属 msg 标签 -> 全行共用一套 tab stop"))
+
+
+def _grid_probe():
+    """像素制表位自洽：正文列 = 级别列 + 最宽级别名 + 列间距。"""
+    import tkinter as _tk
+    root = _tk.Tk()
+    root.withdraw()
+    try:
+        reg, bd = _log_fonts()
+        t_time, t_msg = UI.grid_tabs(reg, bd)
+        widest = max(bd.measure(n) for n in UI._CHIP_NAMES)
+        ok = (t_msg > t_time > UI.COL_GUTTER
+              and t_time == UI.COL_GUTTER + reg.measure("00:00:00") + UI.COL_GAP
+              and t_msg - t_time == widest + UI.COL_GAP)
+        return ok, "时间列=%d 正文列=%d（级别列宽=%d）" % (t_time, t_msg, widest)
+    finally:
+        root.destroy()
+
+
+_tkcheck("像素制表位自洽：正文列 = 行首留白 + 时间列宽 + 间距 + 最宽级别名 + 间距",
+         _grid_probe)
+
+
+def _panel_probe():
+    """真建一个面板：断言 Text 的制表位/挂起缩进与 grid_tabs 一致，所有标签同款。"""
+    from tkinter import font as _tkf
+    p = UI.Panel()
+    try:
+        p.update_idletasks()
+        t_time, t_msg = p._log_tabs
+        tabs = [int(x) for x in re.findall(r"\d+", str(p.log.cget("tabs")))]
+        l1_all = {int(p.log.tag_cget(n, "lmargin1")) for n in UI.LOG_TAGS}
+        l2_all = {int(p.log.tag_cget(n, "lmargin2")) for n in UI.LOG_TAGS}
+        fam_ui = _tkf.nametofont("TkDefaultFont").actual("family")
+        fam_log = p._log_fonts[0].actual("family")
+        size_log = int(p._log_fonts[0].actual("size"))
+        ok = (tabs == [t_time, t_msg] and l1_all == {UI.COL_GUTTER}
+              and l2_all == {t_msg} and fam_log == fam_ui and size_log == UI.LOG_FONT_SIZE)
+        return ok, "tabs=%s lmargin1=%s lmargin2=%s 字族=%r(=UI) 字号=%d" % (
+            tabs, sorted(l1_all), sorted(l2_all), fam_log, size_log)
+    finally:
+        p.destroy()
+
+
+_tkcheck("真实面板：Text 制表位/挂起缩进与 grid_tabs 一致，全部标签同款同列",
+         _panel_probe)
+_tkcheck("真实面板：日志字体族 == 面板 UI 默认字族、字号 == LOG_FONT_SIZE（无回退混排）",
+         _panel_probe)
 _ui_check("全文只有一套字体与字号（标签差异只在字重与颜色）",
-          lambda: (len({(n, w) for n, (_, _, w) in UI.LOG_TAGS.items()
-                        if w not in ("normal", "bold")}) == 0
-                   and "font=(LOG_FAMILY, LOG_SIZE)" in _uisrc
-                   and "(LOG_FAMILY, LOG_SIZE, _weight)" in _uisrc,
-                   "%s %d，%d 个标签只差字重/颜色" % (UI.LOG_FAMILY, UI.LOG_SIZE, len(UI.LOG_TAGS))))
+          lambda: (isinstance(UI.LOG_FONT_SIZE, int)
+                   and len({(n, w) for n, (_, _, w) in UI.LOG_TAGS.items()
+                            if w not in ("normal", "bold")}) == 0
+                   and 'tkfont.nametofont("TkDefaultFont").copy()' in _uisrc
+                   and "font=regular" in _uisrc
+                   and 'font": bold if _weight == "bold" else regular' in _uisrc,
+                   "LOG_FONT_SIZE=%d，%d 个标签只差字重/颜色" % (UI.LOG_FONT_SIZE, len(UI.LOG_TAGS))))
+_ui_check("不指定西文等宽字体（Consolas 无汉字字形，会把中文丢给系统回退成第二套字体）",
+          lambda: (not re.search(r"(Consolas|Cascadia|Courier|monospace)",
+                                 _strip_comments(_panel_body("_build_log")))
+                   and not re.search(r"\.configure\(\s*family\s*=", _uisrc)
+                   and "LOG_FAMILY" not in _uisrc and "LOG_SIZE" not in _uisrc,
+                   "日志字体族跟随面板 UI，中英同族"))
 _ui_check("只有语义色块带底色，正文一律无底色（避免颜色打架）",
           lambda: ({n for n, (_, bg, _) in UI.LOG_TAGS.items() if bg}
                    == {"hdr", "info", "dbg", "warn", "err", "ok", "stop"},
@@ -1022,11 +1117,14 @@ _ui_check("行距只在 Text 组件级设定一次（保证全篇行距一致）
                    and "spacing" not in _uisrc[_uisrc.index("_opts = {\"foreground\": _fg"):
                                                _uisrc.index("_opts = {\"foreground\": _fg") + 200],
                    "spacing 统一在 Text(...)，标签里不再各设一套"))
-_txt_call = _uisrc[_uisrc.index("self.log = tk.Text("):_uisrc.index("self.log.tag_configure")]
+_a = _uisrc.index("self.log = tk.Text(")
+_b = _uisrc.index("highlightthickness=0)", _a) + len("highlightthickness=0)")
+_txt_call = _strip_comments(_uisrc[_a:_b])       # 只取 Text(...) 构造器本身
 _ui_check("长行折行 + 挂起缩进（旧版 wrap=none 会直接切掉右半边）",
           lambda: ('wrap="word"' in _txt_call and 'wrap="none"' not in _txt_call
-                   and '"lmargin2": 6 + msg_x' in _uisrc,
-                   "续行由 lmargin2 顶到正文列，不再截断"))
+                   and '"lmargin2": tab_msg' in _uisrc and '"lmargin1": COL_GUTTER' in _uisrc
+                   and "lmargin" not in _txt_call,
+                   "续行由 lmargin2 顶到正文列；lmargin* 是标签专属选项，不能传 Text 构造器"))
 _ui_check("面板自己的话也走同一栅格（不存在另一套左边界）",
           lambda: ("self._row(time.strftime(\"%H:%M:%S\"), \"\", tag, text)" in _uisrc
                    and "self._insert((text + \"\\n\", tag))" not in _uisrc,
