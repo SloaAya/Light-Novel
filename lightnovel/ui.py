@@ -37,17 +37,21 @@ TITLE = "Light-Novel 书库控制面板"
 
 # ============================ 日志区版式约束 ============================
 # 目标：简洁舒适、层次分明。做法是「版式统一 + 语义配色」而不是花哨装饰 ——
-#   1. 字体 / 字号 / 行距全文只有一个取值（等宽字体才能把三列对齐）；
-#   2. 每行都是同一套三列栅格：``时间 | 级别色块 | 正文``，正文起点固定在第 19 列；
-#   3. 只有「级别 / 结果」用色块，其余一律文字色，避免颜色打架；
+#   1. 字体族**跟随面板 UI 字体**（不指定西文字体），字号全文一个取值；
+#   2. 每行都是同一套三列栅格：``时间 | 级别 | 正文``，落点由像素制表位确定；
+#   3. 只有「级别 / 结果」用颜色，其余一律文字色，避免颜色打架；
 #   4. 一个任务 = 一个块：块前留白 + 标题条（全局唯一底色）+ 命令回显，块尾收一行结果。
-LOG_FAMILY = "Consolas"     # 唯一字体（等宽，列才对得齐）
-LOG_SIZE   = 10             # 唯一字号
-COL_TIME   = 8              # ``HH:MM:SS`` 占 8 字符
-COL_GAP    = 2              # 列间距
-COL_LVLN   = 5              # 级别名宽度（ERROR 是 5 字符，其余按 5 补齐）
-COL_CHIP   = 1 + COL_LVLN + 1                              # 色块 = 左空格 + 级别名 + 右空格
-MSG_COL    = 1 + COL_TIME + 1 + COL_CHIP + COL_GAP         # 正文列起点 = 第 19 列
+#
+# ⚠ 为什么**不**指定 Consolas 之类的西文等宽字体：日志是中英混排，而 Consolas 没有
+#   汉字字形，中文会被系统「字体链接」回退成另一套字形 —— 同一行两种字体，一眼就能
+#   看出来（用户反馈的「字体依旧不一致」就是这个）。改成复制 ``TkDefaultFont``
+#   （= 面板其它控件用的那套），日志与界面同族，也就不存在回退。
+#   代价是字体不再等宽，所以三列对齐改由 :func:`grid_tabs` 算出的**像素制表位**保证。
+LOG_FONT_SIZE = 10          # 唯一字号（字体族跟随 TkDefaultFont）
+COL_GUTTER    = 8           # 行首留白（像素）
+COL_GAP       = 12          # 列间距（像素）
+# 所有级别 / 结果名，用来量出「级别列」要留多宽（取最宽的那个）
+_CHIP_NAMES = ("DEBUG", "ERROR", "FAIL", "INFO", "OK", "STOP", "WARN")
 
 _FG_TEXT = "#24292F"        # 正文
 _FG_TS   = "#8C959F"        # 时间戳（弱化，退到背景层）
@@ -102,16 +106,30 @@ def parse_log_line(line):
     return m.group(2), show[1], m.group(4).rstrip()
 
 
-def row_parts(ts, chip, tag, text, tail=None):
-    """构造一行日志的三个列片段：``时间 ┊ 级别色块 ┊ 正文``（+ 弱化尾注）。
+def grid_tabs(regular, bold):
+    """算出三列栅格的**像素**制表位：``(时间列, 正文列)``。
 
-    全篇唯一的「行构造入口」，所以「正文列固定在第 ``MSG_COL`` 列」这条版式约束是
-    可断言的事实，而不是散落在各调用点的巧合：``len(prefix) == MSG_COL``。
-    任何一处想加前缀，都得改这里 —— 版式就不会被悄悄改歪。
+    为什么是像素制表位、而不是「按字符数补空格」：日志用面板 UI 字体（比例字体），
+    每个字符宽度不等，补空格根本对不齐；制表位与字体宽窄无关，且 ``lmargin2`` 用
+    同一个值就能让折行的续行也顶到正文列。级别列宽度取所有级别名里最宽的那个。
     """
-    return [(" %-*s " % (COL_TIME, ts or ""), "ts"),
-            (" %-*s " % (COL_LVLN, chip), tag),
-            (" " * COL_GAP + text, "msg"),
+    time_tab = COL_GUTTER + regular.measure("00:00:00") + COL_GAP
+    chip_w = max(bold.measure(n) for n in _CHIP_NAMES)
+    return time_tab, time_tab + chip_w + COL_GAP
+
+
+def row_parts(ts, chip, tag, text, tail=None):
+    """构造一行日志的列片段：``时间 → 制表 → 级别 → 制表 → 正文``（+ 弱化尾注）。
+
+    全篇唯一的「行构造入口」：三列的落点由 :func:`grid_tabs` 统一算出来，所以不管
+    字体是比例还是等宽、级别名几个字符，正文都落在同一列。任何一处想加前缀，都得改
+    这里 —— 版式不会被别的调用点悄悄改歪。
+    """
+    return [(ts or "", "ts"),
+            ("\t", "msg"),
+            ((" %s " % chip) if chip else "", tag),
+            ("\t", "msg"),
+            (text, "msg"),
             (tail or "", "dim"),
             ("\n", "msg")]
 
@@ -251,22 +269,30 @@ class Panel(tk.Tk):
 
         wrap = ttk.Frame(box)
         wrap.pack(fill="both", expand=True, padx=6, pady=6)
+        # 字体：复制面板自己的 UI 字体（TkDefaultFont）改字号 —— 与控件同族、中英都覆盖，
+        # 不会像 Consolas 那样把汉字丢给系统回退成另一套字形。
+        regular = tkfont.nametofont("TkDefaultFont").copy()
+        regular.configure(size=LOG_FONT_SIZE)
+        bold = regular.copy()
+        bold.configure(weight="bold")
+        self._log_fonts = (regular, bold)      # 留引用，Tk 字体对象被 GC 会退化
+        tab_time, tab_msg = grid_tabs(regular, bold)
+        self._log_tabs = (tab_time, tab_msg)   # 供排查用
         # spacing1/2/3 = 行距（段前 / 折行间 / 段后），是 Text 组件级选项，所以全篇一致；
-        # 挂起缩进 lmargin1/lmargin2 只能配在标签上（见下面），保证折行的续行也落在
-        # 正文列上：长句不再跑回左边贴边，也不再有「右侧被切掉」的问题（旧版是
-        # wrap="none"，超长行直接看不到后半截）。
-        font = tkfont.Font(family=LOG_FAMILY, size=LOG_SIZE)
-        self._log_font = font           # 留个引用，Tk 字体对象被 GC 掉会退化
-        msg_x = font.measure("0") * MSG_COL
+        # 制表位 tabs 与挂起缩进 lmargin1/lmargin2 是**标签专属**选项（Text 组件不接受
+        # lmargin*，写进构造器会 TclError: unknown option "-lmargin1"），所以下面每个标签
+        # 都配同一套值 —— 这是「三列对齐 + 折行续行对齐」的唯一来源，任何行型都不例外。
         self.log = tk.Text(wrap, height=18, wrap="word", background=_BG_LOG,
                            foreground=_FG_TEXT, insertbackground=_FG_TEXT,
-                           font=(LOG_FAMILY, LOG_SIZE), relief="solid", borderwidth=1,
+                           font=regular, relief="solid", borderwidth=1,
                            padx=10, pady=8, spacing1=2, spacing2=3, spacing3=4,
+                           tabs=(tab_time, tab_msg),
                            selectbackground=_BG_INFO, selectforeground=_FG_TEXT,
                            highlightthickness=0)
         for _name, (_fg, _bg, _weight) in LOG_TAGS.items():
-            _opts = {"foreground": _fg, "font": (LOG_FAMILY, LOG_SIZE, _weight),
-                     "lmargin1": 6, "lmargin2": 6 + msg_x}
+            _opts = {"foreground": _fg, "font": bold if _weight == "bold" else regular,
+                     "tabs": (tab_time, tab_msg),
+                     "lmargin1": COL_GUTTER, "lmargin2": tab_msg}
             if _bg:
                 _opts["background"] = _bg
             self.log.tag_configure(_name, **_opts)
@@ -282,8 +308,9 @@ class Panel(tk.Tk):
 
     # ------------------------------------------------------------ 日志
     # 版式原则见文件头「日志区版式约束」：所有行共用一套栅格
-    #     时间(1+8+1) ┊ 级别色块(1+5+1) ┊ 正文(2)  ->  正文固定从第 MSG_COL 列起
-    # 折行的续行由 lmargin2 顶到同一列，所以「对齐」不依赖内容长度。
+    #     时间 → [制表] → 级别 → [制表] → 正文
+    # 制表位与挂起缩进由 grid_tabs() 统一算（像素制表位，与字体宽窄无关），
+    # 折行的续行由 lmargin2 顶到同一列，所以「对齐」不依赖内容长度、也不依赖等宽字体。
     def _insert(self, *parts):
         """追加一行。``parts`` 是多个 ``(文本, 标签)`` 片段，标签为空则用正文样式。"""
         self.log.configure(state="normal")
@@ -306,11 +333,10 @@ class Panel(tk.Tk):
     def _log_block(self, label, cmd_line=None):
         """块首（标题层）：留白 + 时间 + 粗体标题条 + 可选命令回显。"""
         self._blank()
-        self._insert((" %-*s " % (COL_TIME, time.strftime("%H:%M:%S")), "ts"),
-                     (" " * (COL_CHIP + COL_GAP), "msg"),   # 级别列留空 -> 标题与正文同列
-                     ("▌ %s\n" % label, "hdr"))
+        self._insert(("%s\t\t" % time.strftime("%H:%M:%S"), "ts"),
+                     ("▌ %s\n" % label, "hdr"))     # 两个制表位跳过级别列 -> 标题与正文同列
         if cmd_line:
-            self._insert((" " * MSG_COL, "msg"), ("$ " + cmd_line + "\n", "dim"))
+            self._insert(("\t\t$ %s\n" % cmd_line, "dim"))
 
     def _row(self, ts, chip, tag, text, tail=None):
         """一行正文条目：时间 ┊ 色块 ┊ 正文（+ 弱化尾注），三列固定对齐。"""
