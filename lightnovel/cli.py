@@ -41,6 +41,26 @@ _COMMANDS = ("ui", "opds", "sync", "sync-lightnovel", "opds-server",
              "mirror", "tunnel-setup", "tunnel", "tunnel-setup-wizard")
 
 
+def _pipe_utf8():
+    """stdout / stderr 是**管道**时强制 UTF-8。
+
+    控制面板用 ``PIPE`` 抓子进程输出、并按 UTF-8 解码；而 Python 对管道默认走系统
+    locale（简体中文 Windows = cp936/GBK）→ 子进程每句中文都解不出来，日志里整片
+    变成 ``◆``。真实控制台（``isatty()``）**不动**：cmd 的代码页是 cp936，硬改成
+    UTF-8 反而花屏。
+
+    为什么写在进程内、而不是给子进程设 ``PYTHONIOENCODING``：实测 PyInstaller 打出来
+    的 exe **不认**那个环境变量（管道里吐的仍是 GBK），只有进程内 reconfigure 对
+    「源码运行」和「exe 运行」两种方式同时有效。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass          # 不支持 reconfigure / 已关闭的流：保持原样，别影响主流程
+
+
 def _dispatch(cmd, argv):
     """把 argv 转成目标模块 main() 期望的 sys.argv 后调用。"""
     if cmd == "ui":
@@ -85,6 +105,7 @@ def _dispatch(cmd, argv):
 
 
 def main(argv=None):
+    _pipe_utf8()          # 必须在任何输出之前：管道下钉死 UTF-8（面板按 UTF-8 解码）
     argv = list(sys.argv[1:] if argv is None else argv)
 
     if not argv:

@@ -217,6 +217,8 @@ class Panel(tk.Tk):
         flags = _NEW_CONSOLE if console else _NO_WINDOW
         self._log("$ %s" % " ".join(args))
         try:
+            # 管道里钉死 UTF-8 是子进程自己做的（lightnovel.cli._pipe_utf8）：
+            # 给子进程设 PYTHONIOENCODING 对 PyInstaller 打出来的 exe 无效，实测过。
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding="utf-8", errors="replace",
                                     creationflags=flags, cwd=P.TARGET_DIR)
@@ -282,7 +284,11 @@ class Panel(tk.Tk):
                 self._log("已强制结束 %s" % owners)
                 self.after(600, self._refresh)
             return
-        messagebox.showinfo(TITLE, "该服务不是由本面板启动，未做处理。")
+        pid = self._monitor_pid()
+        messagebox.showinfo(TITLE,
+                            "目录监控不是由本面板启动的%s，未做处理。\n\n"
+                            "请到启动它的那个控制台窗口按 Ctrl+C 停止。"
+                            % ("（PID %s）" % pid if pid else "（或已经退出）"))
 
     @staticmethod
     def _port_owners(port):
@@ -305,9 +311,18 @@ class Panel(tk.Tk):
         live = _port_open(self.port)
         self._set("opds", live, ("运行中（端口 %d）" % self.port) if live else "已停止")
 
+        # 目录监控：优先看锁文件；锁还没写但**本面板亲自拉起的进程还活着**也算运行中。
+        # 之所以不能只看锁：锁是在初始同步（全量 F 盘镜像 + git 推送，实测两分钟起步）
+        # 完成之后才写的，只认锁会让状态灯白白红两分钟，看起来就像「根本没启动」。
         pid = self._monitor_pid()
+        booting = False
+        if not pid:
+            proc = self.procs.get("monitor")
+            if proc is not None and proc.poll() is None:
+                pid, booting = proc.pid, True
         if pid:
-            self._set("monitor", True, "运行中（PID %d）" % pid)
+            self._set("monitor", True,
+                      "运行中（PID %d%s）" % (pid, "，初始同步中" if booting else ""))
         else:
             self._set("monitor", False, "已停止")
 
@@ -333,13 +348,16 @@ class Panel(tk.Tk):
 
     @staticmethod
     def _monitor_pid():
-        """读锁文件并确认那个 PID 还活着（只读探测，不会杀进程）。"""
+        """读锁文件并确认那个 PID 还活着（只读探测，不会杀进程）。
+
+        锁路径从 ``sync.monitor.lock_path()`` 取，而不是另写一份文件名 ——
+        避免「监控写 A、面板读 B」。"""
         try:
-            from .sync.monitor import _pid_alive
+            from .sync.monitor import _pid_alive, lock_path
         except Exception:
             return None
         try:
-            with open(P.LOCK_FILE, "r", encoding="utf-8") as f:
+            with open(lock_path(), "r", encoding="utf-8") as f:
                 pid = int((f.read() or "0").strip())
         except (OSError, ValueError):
             return None

@@ -33,7 +33,8 @@ LOG_FILE        = os.path.join(LOG_DIR, "sync.log")
 OPDS_LOG_FILE   = os.path.join(LOG_DIR, "opds.log")
 COVER_CACHE_DIR = os.path.join(LOG_DIR, "covers")
 META_CACHE_FILE = os.path.join(LOG_DIR, "meta_cache.json")
-LOCK_FILE       = os.path.join(LOG_DIR, "monitor.lock")
+# 单实例锁的路径由 lightnovel.sync.monitor.lock_path() 现算（跟着 LOG_DIR 走），
+# 面板也从那里取，保证「监控写哪儿、面板就读哪儿」只有一个真源。
 
 # ============================ OPDS 书源服务 ============================
 # 端口与监听地址可用环境变量覆盖：LN_OPDS_PORT / LN_OPDS_BIND
