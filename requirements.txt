@@ -1,0 +1,6 @@
+# 运行时依赖：无。
+#   * 二维码（可选）：segno 或 qrcode，未安装会自动跳过打印二维码。
+#   * 图形控制面板用标准库 tkinter（部分精简版 Python 不含，需安装 python3-tk）。
+#
+# 打包 exe 时需要（仅构建机）：
+pyinstaller>=6

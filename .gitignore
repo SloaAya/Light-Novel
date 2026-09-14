@@ -3,6 +3,13 @@
 .workbuddy/
 __pycache__/
 .verysync/
+
+# ---- Python 运行环境与构建产物 ----
+.venv/
+dist/
+build/pyi-work/
+*.pyc
+
 # 系统垃圾文件（Windows/macOS 自动生成，不进仓库）
 desktop.ini
 Desktop.ini
