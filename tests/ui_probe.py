@@ -5,14 +5,18 @@
 为什么要它：源码断言（smoke_test 里的正则/结构断言）只能证明「HTML/CSS 文本写对了」，
 证明不了浏览器**真的**按它渲染、人眼**真的**看得见 —— 这次就是靠它才看清两点：
   1) 26px 的小圆圈在整页截图里肉眼几乎看不见（得放大 4 倍才看得清）；
-  2) POST→303 整页重载后浏览器不会立刻重算 :hover，指针停在按钮上圆圈也会短暂消失。
+  2) 点上标记按钮后**整页重载**：滚动位置丢失、画面闪一下，而且重载瞬间浏览器不会
+     重算 :hover，指针明明停在按钮上、圆圈却短暂消失。
+
+第 2 点后来改成了原地提交（fetch + 就改 DOM）。所以这里除了「看得见」，还专门验证
+「点完没重载」：在 window 上埋一个标记，重载会把它抹掉 —— 这比看截图可靠得多。
 
 跑法：
     .venv/Scripts/python.exe tests/ui_probe.py            # 默认 8099 端口
 
 依赖：playwright（python 包）+ 系统 Edge。没装 playwright 时脚本会提示并跳过（退出码 0）。
 产物：.autosync/probe/*.png（compare.png = 未读圆圈；compare_updates.png = 新增卷提示）
-写入：① 临时 OPDS 会真的 POST 一次「已读完」标记再撤销；
+写入：① 临时 OPDS 会真的 POST 几次「已读完」标记再撤销；
       ② 新增卷提示那一段会往 updates.json **塞一条人造待读提示**（指向真实存在的卷号，
          免得真往书库里加文件被监控提交推送出去），截完图立刻还原。
       finished.json / updates.json 都先快照、finally 里强制还原。
@@ -36,6 +40,7 @@ URL_CAT = f"http://127.0.0.1:{PORT}/opds/catalog/{quote(CAT)}"
 URL_READ = f"http://127.0.0.1:{PORT}/opds/read"
 
 fails = []
+STATS = {}                      # 拼对比图时要用的真实数字（别在图里写「N 张」这种占位）
 
 
 def check(name, got, want):
@@ -84,12 +89,23 @@ def run_probe():
             raise RuntimeError("没有标记按钮，无法继续")
 
         card, mk = cards.first, cards.first.locator(".mk")
+        sub0 = card.locator(".s").inner_text().strip()
+        print(f"      · 目标卡：{card.locator('.t').inner_text()} / 副标题 {sub0!r}")
 
         def zoom(name):
             """把按钮左上角附近 100x100 区域放大成图。"""
             b = mk.bounding_box()
             pg.screenshot(path=os.path.join(OUT, name),
                           clip={"x": b["x"] - 18, "y": b["y"] - 18, "width": 104, "height": 104})
+
+        def no_reload(before, label):
+            """页面有没有被重载：window 上的标记在重载后会消失（新 document）。
+
+            比截图像素比对可靠：内容区高度会变、懒加载图片会闪，逐像素比会全是假阳性。
+            """
+            alive = pg.evaluate("window.__probeMark === 1 && window.__probeMemo === "
+                                + repr(before))
+            check(label, alive, True)
 
         # A. 静息态
         pg.mouse.move(4, 4)
@@ -114,20 +130,23 @@ def run_probe():
         check("C 聚焦即显形 opacity", px(mk)[0], "1")
         zoom("z3_focus.png")
 
-        # D. 真实点击 → 标记已读完（整页重载），再悬停看 .on 的着色态
-        pg.mouse.move(4, 4)
+        # D. 真实点击 → 原地标记（不刷新页面）。埋标记：重载会把它抹掉。
+        pg.evaluate("window.scrollTo(0, 90)")
+        pg.wait_for_timeout(300)
         card.hover()
+        y0 = pg.evaluate("Math.round(window.scrollY)")
+        pg.evaluate("window.__probeMark = 1; window.__probeMemo = 'd';")
+        pg.wait_for_timeout(200)
         mk.click()
-        pg.wait_for_timeout(900)
-        check("D 点击后 class（重载后）", mk.get_attribute("class"), "mk on")
-        check("D 卡片副标题出现「已读完」",
-              card.locator(".s .fin").inner_text().strip(), "已读完")
-        # 重载瞬间浏览器不会自己重算 :hover（Chrome/Edge 已知行为）——见下方 C1 诊断
-        check("D 重载瞬间 opacity（浏览器尚未重算 hover）", px(mk)[0], "0")
-        b = mk.bounding_box()
-        pg.mouse.move(b["x"] + b["width"] / 2 + 2, b["y"] + b["height"] / 2 + 2)
-        pg.wait_for_timeout(400)
-        check("D' 指针微动（仍在按钮上）→ 恢复显示", px(mk)[0], "1")
+        pg.wait_for_timeout(700)
+        no_reload("d", "D 点击后页面**没有重载**（window 标记还在）")
+        check("D 滚动位置没被重置（重载会跳回顶部）",
+              pg.evaluate("Math.round(window.scrollY)"), y0)
+        check("D 点击后 class（原地改，无需等重载）", mk.get_attribute("class"), "mk on")
+        check("D 副标题就地加上「已读完」",
+              card.locator(".s").inner_text().strip(), sub0 + " · 已读完")
+        # 没有重载 → 浏览器不用重算 :hover，圆圈不会「点完就消失」（旧行为的那个怪象）
+        check("D 点击后圆圈仍可见（旧版这里会瞬间消失）", px(mk)[0], "1")
         zoom("z4_marked.png")
 
         # E. 撤掉悬停 + 强制失焦 → 必须回到隐藏，不留残影
@@ -137,12 +156,16 @@ def run_probe():
         check("E 失焦+移开 opacity 回到", px(mk)[0], "0")
         check("E 失焦+移开 pointer-events 回到", px(mk)[1], "none")
 
-        # F. 撤销标记，把书库还原
+        # F. 撤销标记（同样不重载），把书库还原；副标题要回到原样、不留孤零零的「·」
+        pg.evaluate("window.__probeMemo = 'f';")
         card.hover()
         mk.click()
-        pg.wait_for_timeout(900)
+        pg.wait_for_timeout(700)
+        no_reload("f", "F 取消后页面**没有重载**")
         check("F 取消后 class", mk.get_attribute("class"), "mk")
         check("F 取消后副标题「已读完」消失", card.locator(".s .fin").count(), 0)
+        check("F 副标题回到原样（分隔符没有残留）",
+              card.locator(".s").inner_text().strip(), sub0)
 
         # G. 整页网格图（1x，看整体有没有圆圈残留）
         pg2 = br.new_page(viewport=px_view, device_scale_factor=1)
@@ -167,7 +190,43 @@ def run_probe():
             check("H 空态提到触屏例外", "触屏" in body, True)
         else:
             print("      · 清单非空 → 空态文案断言跳过（空态文案由 smoke_test 覆盖）")
+        pg2.screenshot(path=os.path.join(OUT, "g5_read.png"),
+                       clip={"x": 0, "y": 60, "width": 880, "height": 300})
+
+        # I. 「已读完」清单页：取消标记 → 卡片就地消失 + 计数减 1，且仍然不重载
+        pg2.goto(URL_CAT, timeout=6000)
+        pg2.wait_for_timeout(500)
+        first = pg2.locator(".card").first
+        book = first.locator(".t").inner_text()
+        first.hover()
+        pg2.wait_for_timeout(250)
+        first.locator(".mk").click()                 # 先标一部，保证清单非空
+        pg2.wait_for_timeout(600)
+        pg2.goto(URL_READ, timeout=6000)
+        pg2.wait_for_timeout(500)
+        n0 = pg2.locator(".card").count()
+        total0 = int(pg2.locator(".grid").get_attribute("data-total"))
+        print(f"      · 清单：本页 {n0} 张 / 合计 {total0} 部（刚标上的是「{book}」）")
+        STATS.update(read_n0=n0, read_total0=total0, read_book=book)
+        pg2.mouse.move(4, 4)                         # 静息态截图：不把悬停圆圈拍进去
+        pg2.wait_for_timeout(300)
         pg2.screenshot(path=os.path.join(OUT, "g3_read.png"),
+                       clip={"x": 0, "y": 60, "width": 880, "height": 300})
+        pg2.evaluate("window.__probeMark = 1; window.__probeMemo = 'i';")
+        tgt = pg2.locator(".card").first
+        tgt.hover()
+        pg2.wait_for_timeout(250)
+        tgt.locator(".mk").click()
+        pg2.wait_for_timeout(800)
+        check("I 取消后卡片就地消失（这份清单里不该留着「未读完」的书）",
+              pg2.locator(".card").count(), n0 - 1)
+        check("I 计数同步减 1（用的是服务端下发的总数，不是数当前页的卡）",
+              pg2.locator("#readcnt").inner_text().strip(), f"{total0 - 1} 部作品")
+        check("I 仍然没有重载",
+              pg2.evaluate("window.__probeMark === 1 && window.__probeMemo === 'i'"), True)
+        pg2.mouse.move(4, 4)
+        pg2.wait_for_timeout(300)
+        pg2.screenshot(path=os.path.join(OUT, "g4_read_after.png"),
                        clip={"x": 0, "y": 60, "width": 880, "height": 300})
         br.close()
 
@@ -179,14 +238,20 @@ def compose():
     items = [("静息（鼠标不在卡上）", "z1_rest.png", "圆圈不可见 —— 不再常驻"),
              ("悬停整张卡", "z2_hover.png", "圆圈淡入（opacity 0 → 1）"),
              ("键盘 Tab 聚焦", "z3_focus.png", "聚焦即显形 —— 所以没用 visibility:hidden"),
-             ("已标记（悬停时）", "z4_marked.png", "○ 变实心 ✓，副标题同步写「已读完」")]
+             ("已标记（悬停时）", "z4_marked.png",
+              "○ 变实心 ✓，副标题同步写「已读完」；原地生效，页面没有重载")]
     cells = "".join(
         f'<figure><img src="{f}"><figcaption><b>{t}</b><span>{d}</span></figcaption></figure>'
         for t, f, d in items)
     grid = "".join(
         f'<figure class="wide"><img src="{f}"><figcaption><b>{t}</b></figcaption></figure>'
         for t, f in [("整页网格 · 静息：全站一个圆圈都没有", "g1_grid_rest.png"),
-                     ("整页网格 · 悬停第一本：只有它冒出圆圈", "g2_grid_hover.png")])
+                     ("整页网格 · 悬停第一本：只有它冒出圆圈", "g2_grid_hover.png"),
+                     (f"「已读完」清单 · 取消前：本页 {STATS.get('read_n0', '?')} 张卡、"
+                      f"计数 {STATS.get('read_total0', '?')} 部", "g3_read.png"),
+                     (f"「已读完」清单 · 取消后：那一张就地消失、计数减到 "
+                      f"{STATS.get('read_total0', '?') - 1 if STATS.get('read_total0') else '?'} 部，"
+                      f"页面没有重载（滚动位置也没动）", "g4_read_after.png")])
     html = f"""<!doctype html><meta charset="utf-8">
 <style>
  body{{margin:0;padding:26px;background:#f5f2ed;color:#22282f;
@@ -200,8 +265,9 @@ def compose():
  figcaption b{{display:block;font-size:13px}} figcaption span{{color:#6b7280}}
  .wide b{{font-size:13px}}
 </style>
-<h1>「未读圆圈」显隐 —— 真实浏览器渲染结果</h1>
-<div class="sub">同一本书的封面左上角，四种状态；图片为 4 倍放大。</div>
+<h1>「未读圆圈」显隐 + 原地标记 —— 真实浏览器渲染结果</h1>
+<div class="sub">同一本书的封面左上角，四种状态（4 倍放大）。点标记**不再刷新页面**：
+探针在 window 上埋了标记，点击后它仍然在、滚动位置也没被重置 —— 这几条是断言，不只是截图。</div>
 <div class="row">{cells}</div>
 {grid}
 """

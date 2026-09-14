@@ -540,6 +540,159 @@ FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox
            "%3Cpath d='M17.5 8h5.5v16h-5.5z' fill='white' opacity='.6'/%3E%3C/svg%3E")
 
 
+# 「已读完」原地生效的增强层 —— **只发给管理员**（见 _html_page）。
+# 访客页面连这段脚本都没有：他没有标记按钮，脚本无事可做，而脚本里的「已读完」字样
+# 会漏进访客的页面源码里 —— 项目里有专门的断言在盯这件事（CSS 同理）。
+#
+# 设计要点：
+#   ① 拦 submit 而不是 click —— 键盘回车、辅助设备触发的提交走的是同一条路；
+#   ② 服务端回的是**它自己算出来的**最终状态，前端只负责照抄，两边不会漂；
+#   ③ 两条失败路径要分开处理，别混成一个 catch：
+#      「请求没送达」→ 退回原生 submit（此时状态还没变，重提交是安全的）；
+#      「送达了但本地回写出错」→ 重取本页重画，**绝不能**再 submit 一次
+#      （那会把刚写下的状态翻回去，用户看到的就是「点了没用」）；
+#   ④ 旧浏览器没有 fetch / FormData → 压根不拦，直接原生提交；
+#   ⑤ 「清空有更新」会改变排序（有新卷的书要回到原位），本地补不动 →
+#      重新取当前页 HTML，只换 <main> 的内容：服务端算顺序，滚动位置不动、不白屏。
+MARK_JS = """
+(function(){
+  var GLYPH_ON = "\\u2713", GLYPH_OFF = "\\u25CB";
+  var TIP_ON = "已读完，点击取消标记", TIP_OFF = "标记为已读完";
+  var FIN = "已读完";
+  var FIN_TOP = '<span class="fin">' + FIN + '</span> &middot; ';
+  var FIN_TAIL = ' &middot; <span class="fin">' + FIN + '</span>';
+
+  /* 去掉元素连带它前面的 " · " 分隔符，别在副标题里留下孤零零的点 */
+  function sepRemove(el){
+    var p = el.previousSibling;
+    if(p && p.nodeType === 3){ p.nodeValue = p.nodeValue.replace(/\\s*\\u00B7\\s*$/, ""); }
+    el.remove();
+  }
+
+  /* 副标题里的「已读完」跟着变：圆圈只负责操作，文字才是常驻的状态 */
+  function setFinNote(card, on){
+    var s = card.querySelector(".s");
+    if(!s){ return; }
+    var fin = s.querySelector(".fin"), newt = s.querySelector(".newt");
+    if(on){
+      if(fin){ return; }
+      if(newt){ newt.insertAdjacentHTML("beforebegin", FIN_TOP); }   /* 排在「有更新」前面 */
+      else { s.insertAdjacentHTML("beforeend", FIN_TAIL); }
+    } else if(fin){
+      sepRemove(fin);
+    }
+  }
+
+  /* 「已读完」列表里取消标记 → 这张卡自己就不该留着，顺手把计数减 1。
+     计数取自 data-total 而不是数当前页的卡：分页时两者不相等。 */
+  function dropFromRead(card){
+    var grid = card.parentNode;
+    card.style.transition = "opacity .16s ease";
+    card.style.opacity = "0";
+    setTimeout(function(){
+      card.remove();
+      var total = Math.max(0, (parseInt(grid.getAttribute("data-total"), 10) || 0) - 1);
+      grid.setAttribute("data-total", String(total));
+      var cnt = document.getElementById("readcnt");
+      if(cnt){ cnt.textContent = total + " 部作品"; }
+      if(grid.querySelector(".card")){ return; }
+      if(total > 0){
+        /* 本页空了但别处还有 → 回「已读完」第 1 页。地址取自顶栏那个当前选中的标签页，
+           脚本里不留写死的路由常量（换路由时不用改 JS，也不会把路由字样漏进别处）。 */
+        var tab = document.querySelector(".tabs a.on");
+        location.href = tab ? tab.getAttribute("href") : location.href;
+        return;
+      }
+      var tpl = document.getElementById("readempty");
+      if(tpl){ grid.outerHTML = tpl.innerHTML; }
+    }, 170);
+  }
+
+  function patchCard(f, on){
+    var card = f.closest(".card");
+    if(!card){ return; }
+    var mk = f.querySelector(".mk");
+    if(mk){
+      mk.classList.toggle("on", on);
+      mk.textContent = on ? GLYPH_ON : GLYPH_OFF;
+      var tip = on ? TIP_ON : TIP_OFF;
+      mk.title = tip;
+      mk.setAttribute("aria-label", tip);   /* 别写成 mk.title = mk.getAttribute(...) = tip：
+                                               赋值目标不能是函数调用，那是 ReferenceError */
+    }
+    setFinNote(card, on);
+    if(!on && f.getAttribute("data-list") === "read"){ dropFromRead(card); }
+  }
+
+  /* 详情页：按钮换成实心绿 + 阅读状态那一行同步（不重绘整页，分组的展开状态就不会被重置） */
+  function patchHero(f, on){
+    var b = f.querySelector("button");
+    if(b){
+      b.classList.toggle("ok", on);
+      b.classList.toggle("ghost", !on);
+      b.textContent = on ? GLYPH_ON + " 已读完（点击取消）" : "标记为已读完";
+    }
+    var st = document.getElementById("finstate");
+    if(st){
+      st.textContent = on ? FIN : "未读";
+      st.style.color = on ? "#1a7f37" : "";
+    }
+  }
+
+  /* 只换 <main> 内容：不刷新页面（滚动位置、历史记录、分组展开都还在），
+     顺序由服务端重新算 —— 前端不必知道「哪本书该排到第几位」。 */
+  function softReload(){
+    if(!window.fetch){ location.reload(); return; }
+    fetch(location.href, {credentials: "same-origin", headers: {"Accept": "text/html"}})
+      .then(function(r){ return r.text(); })
+      .then(function(h){
+        var src = new DOMParser().parseFromString(h, "text/html").querySelector("main");
+        var cur = document.querySelector("main");
+        if(src && cur){ cur.innerHTML = src.innerHTML; }
+      })
+      .catch(function(){ location.reload(); });
+  }
+
+  document.addEventListener("submit", function(e){
+    var f = e.target;
+    if(!f || !f.classList || f.getAttribute("data-busy") === "1"){ return; }
+    var kind = f.classList.contains("mkform") ? "card"
+             : f.classList.contains("mkbig")  ? "hero"
+             : f.classList.contains("barupd") ? "bar" : "";
+    if(!kind || !window.fetch || !window.FormData){ return; }   /* 不拦 → 原生提交兜底 */
+    e.preventDefault();
+    f.setAttribute("data-busy", "1");      /* 传完之前再点不重复提交（防连点来回翻） */
+    fetch(f.action, {
+      method: "POST",
+      body: new URLSearchParams(new FormData(f)),   /* 服务端只吃 urlencoded，别用 multipart */
+      credentials: "same-origin",
+      headers: {"X-Requested-With": "fetch"}        /* 跨站带这个头会先被 CORS 预检挡下 */
+    }).then(function(r){
+      if(!r.ok){ throw new Error("HTTP " + r.status); }
+      return r.json();
+    }).then(function(d){
+      f.removeAttribute("data-busy");
+      try{
+        if(kind === "bar"){ softReload(); return; }
+        if(kind === "card"){ patchCard(f, !!d.finished); }
+        else { patchHero(f, !!d.finished); }
+      }catch(err){
+        /* 提交**已经成功**了，只是本地回写出错（某个锚点被改名之类）。
+           这里绝不能走下面的 f.submit() —— 那会把刚写下的状态再翻回去（双提交）。
+           退回「重取本页」：以服务端为准重画，状态一定对。 */
+        console.warn("本地回写失败，改取服务端最新页面：", err);
+        softReload();
+      }
+    }).catch(function(err){
+      f.removeAttribute("data-busy");
+      console.warn("提交没送达，改用整页提交：", err);
+      f.submit();                          /* 只有「请求没到服务端」时重提交才是安全的 */
+    });
+  });
+})();
+"""
+
+
 def _html_page(title, body_inner, active="", extra_css="", is_admin=False):
     """整页外壳。``is_admin`` 是**渲染期开关**：非管理员时「已读完」入口这段 HTML
     根本不会被拼出来 —— 前端拿到的是「没有这个入口」的页面，而不是「用 CSS 藏起来」
@@ -559,6 +712,14 @@ def _html_page(title, body_inner, active="", extra_css="", is_admin=False):
     tab_html = "".join(
         '<a class="tab%s" href="%s">%s</a>' % (" on" if k == active else "", href, label)
         for k, href, label in tabs)
+    # grpAll：分组展开/折叠，访客也用得上，人人下发。
+    # MARK_JS：标记按钮的原地生效层 —— 只有管理员页面才有那个按钮，脚本也只在管理员
+    # 页面注入：既省流量，也不让「已读完」这类管理员专有字样出现在访客拿到的源码里。
+    script = ('<script>function grpAll(open){'
+              'document.querySelectorAll(".group").forEach(function(g){'
+              'g.classList.toggle("open",open)});}'
+              + (MARK_JS if is_admin else "")
+              + "</script>")
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
@@ -576,9 +737,7 @@ def _html_page(title, body_inner, active="", extra_css="", is_admin=False):
         "</div></header>"
         f'<main class="wrap">{body_inner}</main>'
         f'<footer>{html.escape(SERVER_TITLE)} · OPDS 书源 · 由 opds_server.py 自动维护</footer>'
-        '<script>function grpAll(open){'
-        'document.querySelectorAll(".group").forEach(function(g){'
-        'g.classList.toggle("open",open)});}</script>'
+        + script +
         "</body></html>"
     )
 
@@ -587,19 +746,26 @@ def _cover_url(rel):
     return "/cover/" + encode_path(rel)
 
 
-def _mark_form(key, back, finished):
-    """「标记 / 取消已读完」表单 —— 纯 HTML 表单 POST，不依赖 JS。
+def _mark_form(key, back, finished, readlist=False):
+    """「标记 / 取消已读完」表单 —— 纯 HTML 表单 POST。
 
-    用表单而不是 ``fetch()``：手机上 JS 被禁、阅读器内嵌浏览器兼容性参差都能用；
-    提交后服务端 303 跳回 ``back``，页面重绘时状态必然正确（不用前端自己记账）。
+    刻意**不依赖 JS**：手机上 JS 被禁、阅读器内嵌浏览器兼容性参差时，原生提交照样能用，
+    提交后服务端 303 跳回 ``back``，页面重绘时状态必然正确。
+    ``MARK_JS`` 只是叠加在这上面的增强层：能跑 fetch 就地改 DOM（不跳转、不丢滚动位置），
+    跑不动就原样 submit —— 两条路径共用同一套服务端逻辑，不存在「只有 JS 才对」的状态。
     只有管理员渲染到这里（``is_admin`` 为真时才调用）。
+
+    ``readlist=True``：这张卡出现在「已读完」列表里 —— JS 取消标记后可以直接把卡拿掉
+    （那份清单里出现「未读完」的书本身就是自相矛盾的）。目录页没有这个标记，
+    因为那里的卡取消后必须留在原地。
     """
     on = " on" if finished else ""
     tip = "已读完，点击取消标记" if finished else "标记为已读完"
     glyph = "&#10003;" if finished else "&#9675;"
     esc = lambda s: html.escape(s, quote=True)          # noqa: E731
+    list_attr = ' data-list="read"' if readlist else ""
     return (
-        '<form class="mkform" method="post" action="/opds/read/toggle">'
+        f'<form class="mkform" method="post" action="/opds/read/toggle"{list_attr}>'
         f'<input type="hidden" name="key" value="{esc(key)}">'
         f'<input type="hidden" name="back" value="{esc(back)}">'
         f'<button class="mk{on}" type="submit" title="{tip}" aria-label="{tip}">{glyph}</button>'
@@ -607,7 +773,7 @@ def _mark_form(key, back, finished):
 
 
 def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
-               finished=False, fin_note="", upd=0):
+               finished=False, fin_note="", upd=0, readlist=False):
     """一张书卡。
 
     * ``key`` 非空（= 管理员视角）时封面左上角挂「标记已读完」按钮；
@@ -615,7 +781,7 @@ def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
       副标题里点明新增几卷（角标只写数字，副标题给完整说法）。
     """
     badge_html = f'<span class="badge">{html.escape(badge)}</span>' if badge else ""
-    mark = _mark_form(key, back, finished) if key else ""
+    mark = _mark_form(key, back, finished, readlist=readlist) if key else ""
     sub_html = html.escape(sub) + (f' · <span class="fin">{html.escape(fin_note)}</span>'
                                   if fin_note else "")
     if upd:
@@ -847,9 +1013,10 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
         f'<div class="meta-line">作者 <b>{html.escape(author)}</b></div>' if author else "")
     meta_lines += f'<div class="meta-line">分类 <b>{html.escape(cat)}</b> · 卷数 <b>{len(vols)}</b> · 体积 <b>{human_size(total_size)}</b></div>'
     if is_admin:                       # 访客拿到的详情页里连「阅读状态」这一行都没有
-        meta_lines += ('<div class="meta-line">阅读状态 <b style="color:#1a7f37">已读完</b></div>'
+        # id="finstate"：给 MARK_JS 就地改文字用（点一下不必整页重绘）
+        meta_lines += ('<div class="meta-line">阅读状态 <b id="finstate" style="color:#1a7f37">已读完</b></div>'
                        if finished else
-                       '<div class="meta-line">阅读状态 <b>未读</b></div>')
+                       '<div class="meta-line">阅读状态 <b id="finstate">未读</b></div>')
 
     desc_html = f'<div class="desc">{html.escape(desc)}</div>' if desc else ""
 
@@ -861,7 +1028,7 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
     mark_btn = ""
     if is_admin:
         mark_btn = (
-            '<form method="post" action="/opds/read/toggle">'
+            '<form class="mkbig" method="post" action="/opds/read/toggle">'
             f'<input type="hidden" name="key" value="{html.escape(key, quote=True)}">'
             f'<input type="hidden" name="back" value="/opds/book/{html.escape(encode_path(rel), quote=True)}">'
             f'<button class="dl big{" ok" if finished else " ghost"}" type="submit">'
@@ -1060,21 +1227,26 @@ def read_html(page=1):
         _book_card("/opds/book/" + encode_path(key),
                    _primary_vol(vols, cat, book)["rel"], book,
                    f"{cat} · {len(vols)} 卷", badge=f"{len(vols)} 卷",
-                   key=key, back=back, finished=True, fin_note="已读完")
+                   key=key, back=back, finished=True, fin_note="已读完",
+                   readlist=True)
         for key, cat, book, vols in chunk)
     total = len(items)
+    empty_html = ('<div class="empty">还没有标记任何作品。<br>'
+                  '去「已完结 / 未完结」把鼠标移到封面上，点左上角出现的 &#9675; 即可标记为已读完。'
+                  '<br><span style="font-size:12px">（触屏设备没有悬停，圆圈会一直显示，直接点即可）</span></div>')
     if total:
-        listing = f'<div class="grid">{cards}</div>'
+        # data-total 给 MARK_JS 记账：取消标记后卡片消失，计数要减 1 而不是重数当前页的卡
+        # （分页时当前页的卡数 ≠ 总数）。空态挂在 <template> 里，等最后一张卡也没了才用得上。
+        listing = (f'<div class="grid" data-total="{total}">{cards}</div>'
+                   f'<template id="readempty">{empty_html}</template>')
     else:
-        listing = ('<div class="empty">还没有标记任何作品。<br>'
-                   '去「已完结 / 未完结」把鼠标移到封面上，点左上角出现的 &#9675; 即可标记为已读完。'
-                   '<br><span style="font-size:12px">（触屏设备没有悬停，圆圈会一直显示，直接点即可）</span></div>')
+        listing = empty_html
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span><span>已读完</span></div>'
         '<div class="bar">'
         '<h1 style="margin:0">已读完</h1>'
         '<span class="spacer"></span>'
-        f'<span class="sub" style="margin:0">{total} 部作品</span>'
+        f'<span class="sub" id="readcnt" style="margin:0">{total} 部作品</span>'
         "</div>"
         f'<p class="sub">鼠标移上封面后，点左上角的 &#10003; 可取消标记。'
         f'（这份清单只保存在本机 <code>.autosync/finished.json</code>，不同步到书库/仓库）</p>'
