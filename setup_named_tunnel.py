@@ -27,7 +27,6 @@ Cloudflare 固定域名隧道（named tunnel）配置向导
 import os
 import re
 import sys
-import json
 import argparse
 import subprocess
 from pathlib import Path
@@ -88,7 +87,7 @@ def step_login(exe):
         return True
     print("  即将打开浏览器，请在网页里登录 Cloudflare 并选择要使用的域名。")
     input("  准备好后按回车继续…")
-    r = run_cf(["tunnel", "login"], interactive=True, exe=exe)
+    run_cf(["tunnel", "login"], interactive=True, exe=exe)
     if not (CF_DIR / "cert.pem").is_file():
         print("  ✗ 未生成 cert.pem，登录可能失败或被取消。请重跑本向导。")
         return False

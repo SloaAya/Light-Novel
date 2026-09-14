@@ -403,16 +403,6 @@ def git_commit(message):
     return True
 
 
-def git_commit_push(message):
-    """提交工作树变更（有变更才提交），随后无论如何都尝试推送（含历史未推送提交）。"""
-    if not git_commit(message):
-        return False
-    ok = push_with_retry()
-    if not ok:
-        log.warning("提交/推送未完全成功，请检查网络 / 凭据后重试。")
-    return ok
-
-
 def remove_remote_extras():
     """以本地（D:\\Light-Novel）为准：删除 GitHub 上多出来的文件（远程有、本地没有的文件）。
 
@@ -1128,13 +1118,6 @@ li.cf code{{background:#fff7ed}}
         log.warning("生成镜像看板失败：%s", exc)
 
 
-def mirror_dir(src, dst, dry_run=False, allow_delete=True):
-    """兼容旧接口：把 src 增量镜像到 dst（默认含删除传播）。返回复制文件数。"""
-    plan = plan_mirror(src, dst)
-    res = apply_mirror(plan, dry_run=dry_run, allow_delete=allow_delete)
-    return len(res["added"]) + len(res["updated"])
-
-
 def _purge_excluded_files(dst):
     """删除 dst 目录树下已存在的系统垃圾文件（历史上被镜像过去的），返回删除数。
     删除失败会记录警告（不再静默吞掉），便于发现权限 / 网络盘挂载问题。"""
@@ -1337,16 +1320,74 @@ def detect_changes(prev, cur):
 
 
 # ---------------------------- 单实例锁 ----------------------------
+def _pid_alive(pid):
+    """判断 pid 是否指向一个仍在运行的进程。
+
+    ⚠ 绝不能用 `os.kill(pid, 0)` 做探测：Windows 上 CPython 会走
+    `OpenProcess(PROCESS_ALL_ACCESS)` + `TerminateProcess(handle, 0)` —— 那是**终止**
+    而不是探测（实测目标进程 exit code = 3221225794）。后果是启动第二个实例会把正在
+    运行的监控实例杀掉。改用只读方式：
+      - Windows：`OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject(h, 0)`
+                 返回 WAIT_TIMEOUT 表示仍在运行；不需要也不请求终止权限。
+      - 其他平台：`os.kill(pid, 0)` 是标准且安全的「信号 0 探测」。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except ImportError:
+            return False
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        except OSError:
+            return False
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False        # 打不开 = 进程不存在（或权限不足，按已死处理以便接管）
+        try:
+            rc = k32.WaitForSingleObject(handle, 0)
+            return rc == WAIT_TIMEOUT
+        finally:
+            k32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True             # 进程存在，只是没权限给它发信号
+    except OSError:
+        return False
+
+
 def acquire_lock():
     lock = os.path.join(LOG_DIR, "monitor.lock")
+    pid = None
     try:
         with open(lock, "r", encoding="utf-8") as fh:
             pid = int(fh.read().strip())
-        os.kill(pid, 0)  # 进程仍在运行则抛异常
-        log.warning("已有监控进程 pid=%d 在运行，本实例退出。", pid)
-        return False
-    except (OSError, ValueError, FileNotFoundError):
-        pass  # 锁文件不存在或进程已死 -> 可获取
+    except (OSError, ValueError):
+        pid = None               # 锁文件不存在或内容损坏 -> 可直接获取
+    if pid is not None:
+        if _pid_alive(pid):
+            log.warning("已有监控进程 pid=%d 在运行，本实例退出。", pid)
+            return False
+        log.info("发现失效的锁文件（pid=%d 已退出），直接接管。", pid)
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(lock, "w", encoding="utf-8") as fh:
         fh.write(str(os.getpid()))
