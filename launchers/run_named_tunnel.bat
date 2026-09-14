@@ -1,5 +1,5 @@
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0.."
 set "PY="
 where python >nul 2>&1 && set "PY=python"
 if not defined PY (where py >nul 2>&1 && set "PY=py")
@@ -20,4 +20,4 @@ echo.
 echo The console window will auto-hide once the tunnel is connected.
 echo To stop the service, run stop_opds.bat
 echo.
-"%PY%" "%~dp0opds_server.py" --tunnel named --no-qr --hide-window
+"%PY%" -m lightnovel opds --tunnel named --no-qr --hide-window

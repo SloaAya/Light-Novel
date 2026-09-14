@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightnovel"
+version = "2.0.0"
+description = "个人轻小说库工具：OPDS 1.2 书源 + GitHub 同步 + F 盘网盘镜像 + 图形控制面板"
+requires-python = ">=3.8"
+dependencies = []          # 运行时零第三方依赖；二维码为可选增强（见下）
+
+[project.optional-dependencies]
+qr = ["segno"]             # 控制台二维码（缺失则自动跳过，不影响服务）
+build = ["pyinstaller>=6"]
+
+[project.scripts]
+lightnovel = "lightnovel.cli:main"
+
+[tool.setuptools]
+packages = ["lightnovel", "lightnovel.opds", "lightnovel.sync"]
+
+[tool.setuptools.package-dir]
+"" = "."

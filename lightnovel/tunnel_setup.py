@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Cloudflare 固定域名隧道（named tunnel）配置向导
-================================================
+"""Cloudflare 固定域名隧道（named tunnel）配置向导。
+
 把 OPDS 书源绑定到一个**固定不变**的公网域名，例如 https://ln.你的域名.com/
 
 前置条件（缺一不可）：
@@ -10,26 +9,28 @@ Cloudflare 固定域名隧道（named tunnel）配置向导
   2. 本机有桌面环境（向导会打开浏览器让你登录 Cloudflare 账号授权）
 
 向导会依次完成：
-  ① cloudflared tunnel login    —— 浏览器授权，生成 ~/.cloudflared/cert.pem
-  ② cloudflared tunnel create   —— 创建隧道，生成凭证 json
-  ③ 写入 config.yml             —— 域名 -> http://127.0.0.1:<端口> 的回源规则
-  ④ cloudflared tunnel route dns —— 在 Cloudflare 自动添加 CNAME 记录
+  ① cloudflared tunnel login      —— 浏览器授权，生成 ~/.cloudflared/cert.pem
+  ② cloudflared tunnel create     —— 创建隧道，生成凭证 json
+  ③ 写入 config.yml               —— 域名 -> http://127.0.0.1:<端口> 的回源规则
+  ④ cloudflared tunnel route dns  —— 在 Cloudflare 自动添加 CNAME 记录
 
 完成后启动服务：
-    python opds_server.py --tunnel named
-或直接双击 run_named_tunnel.bat
+    python -m lightnovel opds --tunnel named
+或直接双击 launchers\\run_named_tunnel.bat
 
 用法：
-    python setup_named_tunnel.py                # 交互式引导
-    python setup_named_tunnel.py --name ln-opds # 指定隧道名
+    python -m lightnovel tunnel-setup                # 交互式引导
+    python -m lightnovel tunnel-setup --name ln-opds # 指定隧道名
 """
 
-import os
 import re
 import sys
 import argparse
 import subprocess
 from pathlib import Path
+
+from .paths import CF_CONFIG as _CF_CONFIG, NAMED_TUNNEL_NAME, PORT
+from .opds.server import find_cloudflared
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -37,29 +38,9 @@ try:
 except Exception:
     pass
 
-try:
-    import opds_server as O
-    CF_CONFIG = Path(O.CF_CONFIG)
-    DEFAULT_NAME = O.NAMED_TUNNEL_NAME
-    DEFAULT_PORT = O.PORT
-    find_cloudflared = O.find_cloudflared
-except Exception:  # 独立运行时的兜底
-    CF_CONFIG = Path.home() / ".cloudflared" / "config.yml"
-    DEFAULT_NAME = "ln-opds"
-    DEFAULT_PORT = int(os.environ.get("LN_OPDS_PORT", "8080"))
-
-    def find_cloudflared():
-        for n in ("cloudflared", "cloudflared.exe"):
-            p = __import__("shutil").which(n)
-            if p:
-                return p
-        cands = [Path.home() / ".workbuddy" / "bin" / "cloudflared.exe",
-                 r"C:\Program Files (x86)\cloudflared\cloudflared.exe"]
-        for c in cands:
-            if Path(c).is_file():
-                return str(c)
-        return None
-
+CF_CONFIG = Path(_CF_CONFIG)
+DEFAULT_NAME = NAMED_TUNNEL_NAME
+DEFAULT_PORT = PORT
 CF_DIR = CF_CONFIG.parent
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -126,7 +107,7 @@ def write_config(name, tid, hostname, port):
     CF_DIR.mkdir(parents=True, exist_ok=True)
     cred = CF_DIR / f"{tid}.json"
     cfg = (
-        f"# 由 setup_named_tunnel.py 自动生成\n"
+        f"# 由 lightnovel.tunnel_setup 自动生成\n"
         f"tunnel: {name}\n"
         f"credentials-file: {cred.as_posix()}\n"
         f"\n"
@@ -204,8 +185,8 @@ def main():
     print(f"  回源端口：     {args.port}")
     print("")
     print("  启动服务（固定域名）：")
-    print("     python opds_server.py --tunnel named")
-    print("  或双击 run_named_tunnel.bat")
+    print("     python -m lightnovel opds --tunnel named")
+    print("  或双击 launchers\run_named_tunnel.bat")
     print("")
     print("  手机阅读器里填：https://" + hostname + "/")
     print("  （DNS 首次生效可能需要几十秒到几分钟）")
