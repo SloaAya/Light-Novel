@@ -1242,7 +1242,6 @@ def _render_groups(groups, cat, book, page_chunk):
         in_page = [v for v in vols if v["rel"] in rels_in_page]
         if not in_page:  # 该组没卷在当前页，跳过
             continue
-        group_size = sum(v["size"] for v in vols)
         group_name = subdir if subdir else "正篇"
         if subdir:
             zip_url = "/zip/" + encode_path(f"{cat}/{book}/{subdir}")
@@ -1359,11 +1358,17 @@ class OPDSHandler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype, extra=None, head_only=False):
         if isinstance(body, str):
             body = body.encode("utf-8")
+        extra = extra or {}
+        # 同名响应头只能发一次：extra 里已提供的（如封面用的 Cache-Control）不再写默认值。
+        # 否则会发出两个 Cache-Control（no-cache + max-age=…），客户端按首个取值读到
+        # no-cache，期望的长缓存会静默失效，封面每次都要重新下载。
+        extra_keys = {k.lower() for k in extra}
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        for k, v in (extra or {}).items():
+        if "cache-control" not in extra_keys:
+            self.send_header("Cache-Control", "no-cache")
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         if not head_only and body:
@@ -1788,23 +1793,6 @@ def print_qr(url):
         return True
     except Exception:
         return False
-
-
-def make_qr_png(url, out_path, scale=8):
-    """生成二维码 PNG（需 segno 或 qrcode）；成功返回路径，否则 None。"""
-    try:
-        import segno
-        segno.make(url).save(out_path, scale=scale)
-        return out_path
-    except Exception:
-        pass
-    try:
-        import qrcode
-        img = qrcode.make(url)
-        img.save(out_path)
-        return out_path
-    except Exception:
-        return None
 
 
 EXTERNET_NOTE = """
