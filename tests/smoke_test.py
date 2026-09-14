@@ -27,6 +27,7 @@ import traceback
 from datetime import datetime
 from urllib import request as urlreq
 from urllib import error as urlerr
+from urllib.parse import quote, urlencode
 from xml.etree import ElementTree as ET
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1022,7 +1023,8 @@ def _tkcheck(label, fn):
     try:
         ok, det = fn()
     except Exception as exc:
-        check(label, lambda: (True, "跳过（无法创建 Tk 运行环境：%s）" % type(exc).__name__))
+        _why = type(exc).__name__
+        check(label, lambda: (True, "跳过（无法创建 Tk 运行环境：%s）" % _why))
         return
     check(label, lambda: (ok, det))
 
@@ -1138,6 +1140,428 @@ _ui_check("块与块之间留白且不重复留白（_blank 幂等）",
           lambda: ("def _blank(self):" in _uisrc and "if not self._last_blank:" in _uisrc
                    and "_last_blank = False" in _uisrc,
                    "待机时连点按钮不会刷出一堆空行"))
+
+# ==================== R. 「已读完」+ 管理员权限 ====================
+section("R. 「已读完」清单与管理员权限（入口显隐 + 服务端校验 + 持久化）")
+
+try:
+    from lightnovel.opds import finished as FIN
+    from lightnovel.opds import server as SRV
+    from lightnovel.opds import feeds as FEED
+    from lightnovel.opds import library as LIB
+    _R_ERR = ""
+except Exception as _exc:
+    FIN = SRV = FEED = LIB = None
+    _R_ERR = "%s: %s" % (type(_exc).__name__, _exc)
+
+# 全部落在临时目录，绝不碰真实 .autosync/finished.json
+_R_TMP = os.path.join(TMP_ROOT, "read")
+os.makedirs(_R_TMP, exist_ok=True)
+_FIN_DEFAULT = FIN.FINISHED_FILE if FIN is not None else ""   # 打桩前的真实默认路径
+
+
+def _rcheck(label, fn):
+    if FIN is None:
+        check(label, lambda: (True, "跳过（opds 模块不可用：%s）" % _R_ERR))
+    else:
+        check(label, fn)
+
+
+def _rskip(label, why):
+    check(label, lambda: (True, "跳过（%s）" % why))
+
+
+_r_key = {"mtime": None}
+
+
+def _reset_fin(path):
+    """把清单指到临时文件，并清空。"""
+    FIN.FINISHED_FILE = path
+    if os.path.exists(path):
+        os.remove(path)
+    return path
+
+
+# ---------- R1. 键校验（服务端唯一的入参闸门） ----------
+_rcheck("键校验：只放行「已知分类/非空书名」",
+        lambda: (FIN.normalize_key("已完结/GAMERS电玩咖") == "已完结/GAMERS电玩咖"
+                 and FIN.normalize_key("未完结/NO GAME NO LIFE") == "未完结/NO GAME NO LIFE"
+                 and FIN.normalize_key("已完结/ 书名 ") == "已完结/书名",
+                 "合法键规范化"))
+_rcheck("键校验：穿越 / 未知分类 / 段数不对 / 空值一律拒绝",
+        lambda: (all(FIN.normalize_key(bad) is None for bad in (
+            "../../etc/passwd", "已完结/../x", "不存在的分类/x", "已完结", "已完结/",
+            "", None, "已完结/a/b")),
+            "8 种非法输入全部拒绝"))
+_rcheck("键校验：首尾多余的 / 只是被归一化（读取手改过的文件时容错）",
+        lambda: (FIN.normalize_key("/已完结/x/") == "已完结/x",
+                 "%r" % (FIN.normalize_key("/已完结/x/"),)))
+_rcheck("键校验：反斜杠被归一化，不会被当成两段",
+        lambda: (FIN.normalize_key("已完结\\书名") == "已完结/书名",
+                 "%r" % (FIN.normalize_key("已完结\\书名"),)))
+
+# ---------- R2. 持久化：原子写 / 幂等 / 损坏容错 / 并发 ----------
+_rp = _reset_fin(os.path.join(_R_TMP, "finished.json"))
+
+
+def _r_toggle_roundtrip():
+    _reset_fin(_rp)
+    first = FIN.toggle_finished("已完结/A")
+    second = FIN.toggle_finished("已完结/A")
+    return (first is True and second is False and FIN.load_finished() == set(),
+            "toggle: %s -> %s -> 空" % (first, second))
+
+
+_rcheck("toggle 两次回到初始态（可反复点，不会累积脏数据）", _r_toggle_roundtrip)
+
+
+def _r_mark_idempotent():
+    _reset_fin(_rp)
+    FIN.mark_finished("已完结/A", True)
+    stat1 = os.stat(_rp).st_mtime_ns
+    FIN.mark_finished("已完结/A", True)          # 重复标记不该再写盘
+    stat2 = os.stat(_rp).st_mtime_ns
+    FIN.mark_finished("已完结/A", False)
+    return (FIN.load_finished() == set() and stat1 == stat2,
+            "重复标记未改 mtime（%s），取消后为空" % (stat1 == stat2))
+
+
+_rcheck("标记幂等：已是目标状态就不落盘（不惊动文件监控）", _r_mark_idempotent)
+
+
+def _r_atomic():
+    _reset_fin(_rp)
+    for i in range(5):
+        FIN.mark_finished("已完结/书%d" % i, True)
+    leftover = [f for f in os.listdir(_R_TMP) if f.endswith(".tmp")]
+    with open(_rp, encoding="utf-8") as fh:
+        data = json.load(fh)
+    return (not leftover and data["count"] == 5 and len(data["keys"]) == 5
+            and data["version"] == 1,
+            "临时文件残留=%s 条目=%d" % (leftover, data["count"]))
+
+
+_rcheck("原子写：落盘后无 .tmp 残留，JSON 结构含版本/计数", _r_atomic)
+
+
+def _r_corrupt():
+    with open(_rp, "w", encoding="utf-8") as fh:
+        fh.write("{ 这不是合法 JSON")
+    got = FIN.load_finished()
+    with open(_rp, "w", encoding="utf-8") as fh:
+        json.dump(["已完结/数组形式也认"], fh, ensure_ascii=False)
+    got2 = FIN.load_finished()
+    return (got == set() and got2 == {"已完结/数组形式也认"},
+            "损坏=空集合；裸数组也兼容")
+
+
+_rcheck("损坏/异形文件不抛异常（服务不会因为手改坏文件而起不来）", _r_corrupt)
+
+
+def _r_invalid_write():
+    _reset_fin(_rp)
+    ok1 = FIN.mark_finished("../x", True)
+    ok2 = FIN.toggle_finished("未知分类/x")
+    return (ok1 is False and ok2 is False and not os.path.exists(_rp),
+            "非法键不落盘（文件都没建）")
+
+
+_rcheck("非法键不产生写入（400 之后不留痕迹）", _r_invalid_write)
+
+
+def _r_concurrent():
+    _reset_fin(_rp)
+    errs = []
+
+    def worker():
+        try:
+            for _ in range(10):
+                FIN.toggle_finished("已完结/并发")
+        except Exception as exc:                 # noqa: BLE001
+            errs.append(repr(exc))
+
+    ts = [threading.Thread(target=worker) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    with open(_rp, encoding="utf-8") as fh:
+        data = json.load(fh)                     # 必须是完整合法 JSON
+    got = FIN.load_finished()
+    # 80 次 toggle 是偶数 -> 应为空；关键不是结果而是「文件没被写坏」
+    return (not errs and got == set() and data["count"] == 0,
+            "8 线程 ×10 次 toggle：errs=%s 结果=%s" % (errs, sorted(got)))
+
+
+_rcheck("并发安全：读-改-写全程持锁，文件不会被写坏（无丢更新/半截 JSON）",
+        _r_concurrent)
+_rcheck("清单落在 .autosync/（gitignore 内），不会被同步到仓库或 F 盘",
+        lambda: (os.path.dirname(_FIN_DEFAULT) == P.LOG_DIR
+                 and os.path.basename(_FIN_DEFAULT) == "finished.json"
+                 and os.path.basename(P.LOG_DIR) == ".autosync",
+                 "%s（默认值，测试期间打桩到临时目录）" % _FIN_DEFAULT))
+_rcheck("清单粒度是「作品」不是「卷」：键 = 分类/书名",
+        lambda: (FIN.normalize_key("已完结/A/01.epub") is None,
+                 "带卷名的键被拒 -> 只能按作品标记"))
+
+# ---------- R3. 角色判定（唯一入口 _role） ----------
+_r_saved_auth = (SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS)
+
+
+def _role_of(peer, user=None, pw=None):
+    """用桩对象跑真实的 _role()，不经过网络（判定逻辑是纯函数）。"""
+    import types
+    h = types.SimpleNamespace()
+    if user is None:
+        h.headers = {}
+    else:
+        h.headers = {"Authorization": "Basic " + base64.b64encode(
+            ("%s:%s" % (user, pw)).encode("utf-8")).decode("ascii")}
+    h.client_address = (peer, 4321)
+    h._basic_creds = types.MethodType(SRV.OPDSHandler._basic_creds, h)
+    h._is_loopback = types.MethodType(SRV.OPDSHandler._is_loopback, h)
+    h._same = SRV.OPDSHandler._same
+    return SRV.OPDSHandler._role(h)
+
+
+def _r_set_auth(admin=("", ""), guest=("", "")):
+    SRV.AUTH_USER, SRV.AUTH_PASS = admin
+    SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = guest
+
+
+def _r_role_noauth():
+    _r_set_auth()
+    return (_role_of("127.0.0.1") == "admin" and _role_of("127.0.0.5") == "admin"
+            and _role_of("::1") == "admin" and _role_of("192.168.31.9") == "guest"
+            and _role_of("100.64.0.7") == "guest",
+            "免密：回环=admin（含 127.x / ::1），其余=guest")
+
+
+_rcheck("判定①免密：本机=管理员，局域网/公网来源=访客", _r_role_noauth)
+
+
+def _r_role_withpass():
+    _r_set_auth(admin=("ranqing", "s3cret"))
+    return (_role_of("192.168.31.9") is None
+            and _role_of("192.168.31.9", "ranqing", "s3cret") == "admin"
+            and _role_of("192.168.31.9", "ranqing", "wrong") is None
+            and _role_of("192.168.31.9", "guest", "hello") is None,   # 没配访客档
+            "配管理员口令：匿名/错口令=拒绝，对=admin，访客档不存在=None")
+
+
+_rcheck("判定②配了管理员口令：凭据正确才放行，未配访客档时访客一律拒绝",
+        _r_role_withpass)
+
+
+def _r_role_two_tier():
+    _r_set_auth(admin=("ranqing", "s3cret"), guest=("guest", "hello"))
+    return (_role_of("10.0.0.2", "ranqing", "s3cret") == "admin"
+            and _role_of("10.0.0.2", "guest", "hello") == "guest"
+            and _role_of("10.0.0.2", "guest", "nope") is None
+            and _role_of("127.0.0.1") is None,        # 配了口令就不能靠来源白拿管理员
+            "两级口令：命中谁就是谁；回环不再自动升权")
+
+
+_rcheck("判定③两级口令：管理员/访客各归各位，回环地址不再自动升权",
+        _r_role_two_tier)
+
+
+def _r_role_partial_env():
+    # 只设用户名不设口令，属于「配置了一半」：仍按配了口令处理，避免半配时静默免密
+    _r_set_auth(admin=("only", ""))
+    return (_role_of("127.0.0.1") is None
+            and _role_of("8.8.8.8", "only", "") == "admin",
+            "半配置（只有用户名）也走口令分支，不会退化成免密")
+
+
+_rcheck("判定④只配了用户名没配口令：仍走口令分支（半配置不退化成免密）",
+        _r_role_partial_env)
+
+
+def _r_role_compare():
+    _r_set_auth(admin=("u", "p"))
+    # 同一前缀不同长度不应被短口令放行（compare_digest 语义）
+    return (_role_of("1.1.1.1", "u", "p2") is None
+            and _role_of("1.1.1.1", "u2", "p") is None
+            and _role_of("1.1.1.1", "u", "P") is None,
+            "口令大小写敏感、不做前缀匹配")
+
+
+_rcheck("判定⑤口令比较严格：大小写敏感、不接受前缀/变体", _r_role_compare)
+SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = _r_saved_auth
+
+# ---------- R4. 入口显隐（渲染期开关，不是 CSS 隐藏） ----------
+_rcheck("入口显隐：非管理员页面**根本不含**「已读完」与 /opds/read",
+        lambda: ("已读完" not in FEED._html_page("t", "<p>x</p>", is_admin=False)
+                 and "/opds/read" not in FEED._html_page("t", "<p>x</p>", is_admin=False),
+                 "管理员版才含：%s" % ("已读完" in FEED._html_page("t", "", is_admin=True))))
+_rcheck("入口显隐：CSS 本身也不含功能字样（CSS 对所有人下发，注释会漏进访客源码）",
+        lambda: ("已读完" not in FEED.SITE_CSS and "/opds/read" not in FEED.SITE_CSS,
+                 "SITE_CSS 长度 %d" % len(FEED.SITE_CSS)))
+_rcheck("入口显隐：首页（含快速入口卡）按身份分叉",
+        lambda: ("已读完" in FEED.root_html(is_admin=True)
+                 and "已读完" not in FEED.root_html(is_admin=False),
+                 "管理员首页多一张「已读完」卡"))
+_rcheck("入口显隐：分类页书卡只有管理员才带标记按钮",
+        lambda: ('"/opds/read/toggle"' in FEED.catalog_html("已完结", 1, is_admin=True)
+                 and "/opds/read" not in FEED.catalog_html("已完结", 1, is_admin=False),
+                 "访客书卡无表单 -> 没有可提交的入口"))
+_rcheck("入口显隐：详情页「阅读状态」行与按钮只有管理员才有",
+        lambda: ("阅读状态" in FEED.book_html("已完结/GAMERS电玩咖", 1, is_admin=True)
+                 and "阅读状态" not in FEED.book_html("已完结/GAMERS电玩咖", 1, is_admin=False),
+                 "访客详情页连状态行都不渲染"))
+_rcheck("入口显隐：OPDS 阅读器 feed 的导航项同样分叉",
+        lambda: ('href="/opds/read"' in FEED.feed_root(is_admin=True)
+                 and "/opds/read" not in FEED.feed_root(is_admin=False),
+                 "阅读器订阅到的目录结构随身份变化"))
+_rcheck("入口显隐：非管理员响应里不含任何形如 /opds/read 的子串（含 toggle）",
+        lambda: (all("/opds/read" not in FEED.catalog_html(c, 1, is_admin=False)
+                     for c in ("已完结", "未完结", "all"))
+                 and "/opds/read" not in FEED.search_html("a", 1, is_admin=False)
+                 and "/opds/read" not in FEED.recent_html(1, is_admin=False),
+                 "分类/搜索/最近更新页逐个核对"))
+
+# ---------- R5. HTTP 层：真的打请求（含来源判定） ----------
+_r_lan = LIB.local_ip() if LIB else ""
+
+
+def _http(port, path, host=None, method="GET", body=None, headers=None, accept=None):
+    import http.client as _hc
+    host = host or "127.0.0.1"
+    conn = _hc.HTTPConnection(host, port, timeout=15)
+    hdrs = dict(headers or {})
+    if host != "127.0.0.1":
+        hdrs["Host"] = "%s:%d" % (host, port)
+    if accept:
+        hdrs["Accept"] = accept
+    if body is not None:
+        hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+    conn.request(method, path, body=body, headers=hdrs)
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8", "replace")
+    out = (resp.status, text, resp.getheader("Location"))
+    conn.close()
+    return out
+
+
+_r_srv = None
+_r_port = 0
+try:
+    _reset_fin(os.path.join(_R_TMP, "http_finished.json"))
+    _r_srv = SRV.make_server(port=0, bind="0.0.0.0")
+    _r_port = _r_srv.server_address[1]
+    threading.Thread(target=_r_srv.serve_forever, daemon=True).start()
+except Exception as _exc:                        # noqa: BLE001
+    _r_srv = None
+    _r_err = "%s: %s" % (type(_exc).__name__, _exc)
+
+
+def _r_hcheck(label, fn):
+    if _r_srv is None or FIN is None:
+        _rskip(label, "无法起测试服务：%s" % (FIN is None and _R_ERR or "端口不可用"))
+    else:
+        check(label, fn)
+
+
+_r_lib_ok = FIN is not None and _r_srv is not None
+_r_cat, _r_book = "已完结", "GAMERS电玩咖"
+if _r_lib_ok:
+    _libdata = LIB.get_library(force=True)
+    _r_cat = "已完结" if "已完结" in _libdata else list(_libdata)[0]
+    _r_books = sorted(_libdata.get(_r_cat, {}))
+    if _r_books:
+        _r_book = _r_books[0]
+_r_q = quote(_r_cat, safe="") + "/" + quote(_r_book, safe="")
+_r_key2 = "%s/%s" % (_r_cat, _r_book)
+_r_form = urlencode({"key": _r_key2, "back": "/opds/catalog/" + quote(_r_cat, safe="")})
+
+if _r_lib_ok:
+    _st, _body, _ = _http(_r_port, "/")
+    check("HTTP 免密+本机 → 首页含「已读完」入口",
+          lambda: (_st == 200 and "已读完" in _body and "/opds/read" in _body,
+                   "status=%s" % _st))
+    if _r_lan and _r_lan != "127.0.0.1":
+        _gst, _gbody, _ = _http(_r_port, "/", host=_r_lan)
+        check("HTTP 免密+局域网来源 → 首页不含「已读完」（来源判定真的生效）",
+              lambda: (_gst == 200 and "已读完" not in _gbody and "/opds/read" not in _gbody,
+                       "status=%s 来自 %s" % (_gst, _r_lan)))
+        _gst2, _, _ = _http(_r_port, "/opds/read", host=_r_lan)
+        check("HTTP 访客 GET /opds/read → 403（不返回内容）",
+              lambda: (_gst2 == 403, "status=%s" % _gst2))
+        _gst3, _, _ = _http(_r_port, "/opds/read/toggle", host=_r_lan, method="POST",
+                            body=_r_form, headers={"Origin": "http://%s:%d" % (_r_lan, _r_port)})
+        check("HTTP 访客 POST 标记 → 403 且清单不变",
+              lambda: (_gst3 == 403 and FIN.load_finished() == set(),
+                       "status=%s 清单=%s" % (_gst3, sorted(FIN.load_finished()))))
+        _gst4, _gbody4, _ = _http(_r_port, "/", host=_r_lan, accept="application/atom+xml")
+        check("HTTP 访客 XML feed 也不含「已读完」导航",
+              lambda: (_gst4 == 200 and "已读完" not in _gbody4, "status=%s" % _gst4))
+        _gst5, _gbody5, _ = _http(_r_port, "/opds/catalog/" + quote(_r_cat, safe=""), host=_r_lan)
+        check("HTTP 访客分类页不含标记表单",
+              lambda: ('"/opds/read/toggle"' not in _gbody5, "status=%s" % _gst5))
+    else:
+        _rskip("HTTP 访客（局域网来源）各项", "本机没有非回环 IP，无法模拟访客来源")
+
+    _pst, _pbody, _ploc = _http(_r_port, "/opds/read/toggle", method="POST", body=_r_form,
+                                headers={"Origin": "http://127.0.0.1:%d" % _r_port})
+    check("HTTP 管理员 POST 标记 → 303 + 清单落盘",
+          lambda: (_pst == 303 and FIN.load_finished() == {_r_key2},
+                   "status=%s loc=%s 清单=%s" % (_pst, _ploc, sorted(FIN.load_finished()))))
+    _st2, _b2, _ = _http(_r_port, "/opds/read")
+    check("HTTP 管理员 /opds/read → 200 且出现该作品",
+          lambda: (_st2 == 200 and _r_book in _b2 and '"/opds/read/toggle"' in _b2,
+                   "status=%s" % _st2))
+    _st3, _b3, _ = _http(_r_port, "/opds/book/" + _r_q)
+    check("HTTP 管理员详情页 → 显示「已读完」状态与取消按钮",
+          lambda: (_st3 == 200 and "阅读状态" in _b3 and "已读完（点击取消）" in _b3,
+                   "status=%s" % _st3))
+    _cst, _, _ = _http(_r_port, "/opds/read/toggle", method="POST", body=_r_form,
+                       headers={"Origin": "https://evil.example.com"})
+    check("HTTP 跨站 Origin → 403（CSRF 兜底）",
+          lambda: (_cst == 403 and FIN.load_finished() == {_r_key2},
+                   "status=%s 清单未被跨站改动" % _cst))
+    _bst, _, _bloc = _http(_r_port, "/opds/read/toggle", method="POST",
+                           body=urlencode({"key": _r_key2, "back": "//evil.example.com/x"}))
+    check("HTTP back 指向外站 → 回落到本站路径（堵开放重定向）",
+          lambda: (_bst == 303 and _bloc.startswith("/") and "evil" not in _bloc,
+                   "Location=%s" % _bloc))
+    _ist, _, _ = _http(_r_port, "/opds/read/toggle", method="POST",
+                       body=urlencode({"key": "../../etc/passwd"}))
+    _ist2, _, _ = _http(_r_port, "/opds/read/toggle", method="POST",
+                        body=urlencode({"key": "不存在的分类/x"}))
+    check("HTTP 非法键 / 未知分类 → 400",
+          lambda: (_ist == 400 and _ist2 == 400, "status=%s / %s" % (_ist, _ist2)))
+
+    # 两级口令下的 HTTP 行为
+    SRV.AUTH_USER, SRV.AUTH_PASS = "ranqing", "s3cret"
+    SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = "guest", "hello"
+
+    def _basic(u, p):
+        return {"Authorization": "Basic " + base64.b64encode(
+            ("%s:%s" % (u, p)).encode("utf-8")).decode("ascii")}
+
+    _nst, _, _ = _http(_r_port, "/")
+    _wst, _, _ = _http(_r_port, "/", headers=_basic("ranqing", "nope"))
+    _ast, _ab, _ = _http(_r_port, "/", headers=_basic("ranqing", "s3cret"))
+    _vst, _vb, _ = _http(_r_port, "/", headers=_basic("guest", "hello"))
+    _vr, _, _ = _http(_r_port, "/opds/read", headers=_basic("guest", "hello"))
+    check("HTTP 配口令：匿名 401 / 错口令 401",
+          lambda: (_nst == 401 and _wst == 401, "匿名=%s 错口令=%s" % (_nst, _wst)))
+    check("HTTP 管理员口令（哪怕来自局域网）→ 含「已读完」入口，/opds/read 200",
+          lambda: ("已读完" in _ab and _ast == 200
+                   and _http(_r_port, "/opds/read", headers=_basic("ranqing", "s3cret"))[0] == 200,
+                   "首页=%s" % _ast))
+    check("HTTP 访客口令：能看书库但看不到入口，且 /opds/read 被 403",
+          lambda: (_vst == 200 and "已读完" not in _vb and _vr == 403,
+                   "首页=%s 列表=%s" % (_vst, _vr)))
+    SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = _r_saved_auth
+
+if _r_srv is not None:
+    try:
+        _r_srv.shutdown()
+        _r_srv.server_close()
+    except Exception:
+        pass
 
 # ============================== 汇总 ==============================
 print("\n" + "=" * 70)

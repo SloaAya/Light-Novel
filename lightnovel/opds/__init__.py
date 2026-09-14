@@ -8,12 +8,13 @@
 
 分层：
     library  路径工具 + 目录索引 + epub 封面提取 + 元数据 + zip 流式打包（纯数据）
+    finished 「已读完」清单的读写（纯数据，管理员专有状态）
     feeds    Atom feed（导航型 / 获取型）与 HTML 视图（纯渲染）
     server   HTTP Handler、服务启动、cloudflared 隧道、二维码、命令行入口
 
-依赖方向严格单向：``library → feeds → server``，不存在反向引用。
+依赖方向严格单向：``library / finished → feeds → server``，不存在反向引用。
 """
 
-from . import library, feeds, server  # noqa: F401
+from . import library, finished, feeds, server  # noqa: F401
 
-__all__ = ["library", "feeds", "server"]
+__all__ = ["library", "finished", "feeds", "server"]
