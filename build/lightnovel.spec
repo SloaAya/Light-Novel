@@ -31,6 +31,7 @@ HIDDEN = [
     "lightnovel.opds.finished",
     "lightnovel.opds.updates",
     "lightnovel.opds.session",
+    "lightnovel.opds.moon",
     "lightnovel.sync",
     "lightnovel.sync.gitops",
     "lightnovel.sync.mirror",

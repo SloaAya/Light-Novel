@@ -44,6 +44,23 @@ SESSION_KEY_FILE = os.path.join(LOG_DIR, "session.key")
 # 单实例锁的路径由 lightnovel.sync.monitor.lock_path() 现算（跟着 LOG_DIR 走），
 # 面板也从那里取，保证「监控写哪儿、面板就读哪儿」只有一个真源。
 
+# ==================== Moon+ Reader 阅读进度（只读桥接）====================
+# .Moon+ 目录通常落在网盘挂载盘上（本项目是 CloudDrive2 挂载的 F:），
+# 那里**每个小文件一次网络往返约 55 ms**（实测读 128 个 .po 要 6.7 s），
+# 所以进度一律「后台线程刷 + 本地缓存」，请求路径上只读内存，绝不现读网盘。
+MOON_ROOT   = os.environ.get("LN_MOON_ROOT", r"F:\Apps\Books\.Moon+")
+MOON_CACHE_DIR = os.path.join(LOG_DIR, "moon_cache")       # 本地缓存（gitignore 内）
+MOON_POS_FILE  = os.path.join(MOON_CACHE_DIR, "positions.json")
+MOON_TTL    = int(os.environ.get("LN_MOON_TTL", "300"))    # 后台刷新间隔（秒）
+# 单卷「读完」阈值：用 >=99 而不是 ==100 —— Moon+ 的百分比是估算值，
+# 实测存在 99.4% / 97.9% 这类「读到底但没到 100」的情况。
+MOON_DONE_PERCENT = float(os.environ.get("LN_MOON_DONE", "99"))
+# 关掉进度功能（网盘没挂载 / 不想要角标时用 LN_MOON_PROGRESS=0）：整层静默退化为无角标。
+MOON_ENABLED = os.environ.get("LN_MOON_PROGRESS", "1") != "0"
+# 进度角标对谁可见。默认**所有人**：这是阅读进度不是管理功能，
+# 且手机端通常以访客身份浏览（设 0 则只有管理员看得到）。
+MOON_PUBLIC  = os.environ.get("LN_MOON_PUBLIC", "1") != "0"
+
 # ============================ OPDS 书源服务 ============================
 # 端口与监听地址可用环境变量覆盖：LN_OPDS_PORT / LN_OPDS_BIND
 PORT      = int(os.environ.get("LN_OPDS_PORT", "8080"))
