@@ -48,6 +48,7 @@ from .library import (
     resolve_under,
 )
 from .finished import normalize_key, toggle_finished
+from . import moon
 from . import session
 from . import updates as upd
 from .feeds import (
@@ -331,12 +332,16 @@ class OPDSHandler(BaseHTTPRequestHandler):
 
             if path == "/opds/refresh":
                 get_library(force=True)
+                moon.wake()          # 顺带让后台线程立刻重读一次阅读进度（不阻塞本请求）
                 self._send(200, '{"ok":true}', "application/json; charset=utf-8", head_only=head_only)
                 return
 
             if path == "/opds/stats":
                 lib = get_library(force=True)
                 data = {c: {"books": len(b), "vols": sum(len(v) for v in b.values())} for c, b in lib.items()}
+                # 阅读器进度是「后台刷 + 本地缓存」，把它的健康状况一并暴露出来：
+                # unmatched 一旦变大就说明书库被改过名、关联断了（详见 .autosync/opds.log）。
+                data["_moon"] = moon.snapshot()
                 self._send(200, json.dumps(data, ensure_ascii=False), "application/json; charset=utf-8",
                            head_only=head_only)
                 return
@@ -941,6 +946,17 @@ def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False,
         log.warning("当前没有设置管理员口令：谁都不能登录，只有本机(127.0.0.1)来源算管理员。"
                     "要管理「已读完」请设置 LN_OPDS_USER / LN_OPDS_PASS 后重启；"
                     "书库浏览/下载对所有来源开放。")
+
+    # 阅读进度：起一个后台线程按 TTL 重读手机阅读器的位置数据。
+    # 那个目录在网盘挂载盘上（单文件读约 55 ms），**请求路径上绝不能现读** ——
+    # 线程首轮没跑完之前进度角标不渲染（宁可不显示，也不显示成 0%）。
+    if moon.ensure_worker():
+        snap = moon.snapshot()
+        log.info("阅读进度：后台刷新已启动（来源 %s，每 %d 秒一次，单卷读完阈值 %.0f%%）；"
+                 "首轮结果就绪前页面不显示进度角标。",
+                 snap["root"], snap["ttl"], snap["done_percent"])
+    elif not moon.enabled():
+        log.info("阅读进度：已关闭（LN_MOON_PROGRESS=0），页面不显示进度角标。")
 
     print("\n" + "=" * 62)
     print(f"  OPDS 书源已启动   端口 {port}")

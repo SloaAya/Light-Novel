@@ -31,6 +31,7 @@ from .library import (
     human_size,
 )
 from .finished import load_finished
+from . import moon as MOON
 from . import updates as upd
 
 # ---------------------------- Feed 生成 ----------------------------
@@ -368,6 +369,16 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
 /* 有更新的卡再描一道暖色边。放在上面 .card:hover .ph 之后，否则悬停时描边会被覆盖掉。 */
 .card.upd .ph{box-shadow:0 0 0 2px var(--new),var(--shadow)}
 .card.upd:hover .ph{box-shadow:0 0 0 2px var(--new),0 8px 18px rgba(16,22,26,.12)}
+/* 封面**右下角**的阅读进度角标（照手机阅读器的做法）。左上有标记按钮、右上是卷数、
+   左下是「有更新」条，右下是唯一还空着的角，四者互不打架。 */
+.card .ph .prog{position:absolute;right:6px;bottom:6px;min-width:34px;padding:3px 8px;
+  border-radius:20px;text-align:center;background:rgba(15,20,26,.78);color:#fff;
+  font-size:11px;font-weight:600;letter-spacing:.2px;backdrop-filter:blur(6px);
+  font-variant-numeric:tabular-nums}
+.card .ph .prog.pdone{background:rgba(26,127,55,.94)}
+/* 有「有更新」条时角标抬到条上面（那条是左右贯通的，压着会看不清数字） */
+.card.upd .ph .prog{bottom:25px}
+.card .s .pnt{color:var(--muted)}
 
 /* 标记控件 .mkform/.mk：只在管理员页面渲染（见 _mark_form）。这里刻意不写任何
    带功能名的注释 —— CSS 对所有人下发，注释里的字样会漏进访客的页面源码里。 */
@@ -446,6 +457,11 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
   padding:2px 8px;border-radius:20px;flex-shrink:0}
 .vol .meta .s .vnew{font-size:10.5px;font-weight:600;color:#fff;background:var(--new);
   padding:1px 6px;border-radius:20px;flex-shrink:0}
+/* 分卷行上的阅读进度药丸（来自手机阅读器的位置数据；属于「已读过」而非管理功能） */
+.vol .meta .s .vp{font-size:10.5px;font-weight:600;color:var(--accent);
+  background:var(--hover);padding:1px 7px;border-radius:20px;flex-shrink:0;
+  font-variant-numeric:tabular-nums}
+.vol .meta .s .vp.done{color:#1a7f37;background:rgba(26,127,55,.13)}
 .group-body{display:none;padding:12px 8px 6px;border:1px solid var(--border);border-top:0;
   border-radius:0 0 12px 12px;background:var(--bg)}
 .group.open .group-body{display:block}
@@ -543,6 +559,33 @@ footer{margin-top:48px;padding:24px 16px;text-align:center;color:var(--muted);fo
   h1{font-size:18px}
   .sec-head{margin:24px 0 12px}
   .bar{margin:16px 0 12px}
+}
+
+/* ---------- 详情页右下角的常驻阅读进度指示器 ---------- */
+/* 圆环用 conic-gradient 画（--p 是 0-100 的百分比），不需要 JS 也不需要 SVG。
+   注意 position:fixed 的元素不能放进 overflow 容器里，所以它挂在 main 之外。 */
+.pfab{position:fixed;right:18px;bottom:18px;z-index:40;display:flex;align-items:center;gap:10px;
+  padding:9px 15px 9px 10px;border-radius:30px;background:var(--card);
+  border:1px solid var(--border);box-shadow:0 4px 16px rgba(16,22,26,.14);
+  font-size:12px;line-height:1.3;pointer-events:none}
+.pfab .pring{width:34px;height:34px;border-radius:50%;flex-shrink:0;display:grid;place-items:center;
+  background:conic-gradient(var(--accent) calc(var(--p) * 1%), var(--border) 0)}
+.pfab .pring i{width:26px;height:26px;border-radius:50%;background:var(--card);display:grid;
+  place-items:center;font-style:normal;font-size:10px;font-weight:600;color:var(--text);
+  font-variant-numeric:tabular-nums}
+.pfab.pdone .pring{background:conic-gradient(#1a7f37 calc(var(--p) * 1%), var(--border) 0)}
+.pfab .ptxt{display:flex;flex-direction:column;min-width:0}
+.pfab .ptxt b{font-weight:500;color:var(--text);white-space:nowrap}
+.pfab .ptxt span{color:var(--muted);font-size:11px;white-space:nowrap}
+@media (prefers-color-scheme:dark){
+  .pfab.pdone .pring{background:conic-gradient(#4ac26b calc(var(--p) * 1%), var(--border) 0)}
+  .vol .meta .s .vp.done{color:#4ac26b;background:rgba(74,194,107,.14)}
+}
+@media (max-width:640px){
+  .pfab{right:10px;bottom:10px;padding:7px 12px 7px 8px;gap:8px}
+  .pfab .pring{width:30px;height:30px}
+  .pfab .pring i{width:23px;height:23px;font-size:9.5px}
+  .pfab .ptxt span{display:none}
 }
 """
 
@@ -868,18 +911,78 @@ def _mark_form(key, back, finished, readlist=False):
         "</form>")
 
 
+def _prog_pill(st):
+    """作品级进度 → ``(角标元组, 副标题片段)``；没有进度数据时两者都为空。"""
+    if not st:
+        return None, ""
+    pct = int(round(st["percent"]))
+    return (pct, st["all"]), f'已读 {st["done"]}/{st["total"]} 卷'
+
+
+def _work_prog(vols, vis):
+    """取某部作品的进度角标数据（``vis`` 为假时直接跳过，连算都不算）。"""
+    return _prog_pill(MOON.stat_of(vols)) if vis else (None, "")
+
+
+def _vol_prog(rel, vis):
+    """分卷进度片段：``已读 33%`` / ``读完``；没有记录返回空串。
+
+    文案刻意用「读完」而不是「已读完」—— 「已读完」是管理员功能的专有词，
+    访客页面里一个字符都不该出现（有回归断言盯着这个子串）。
+    """
+    if not vis:
+        return ""
+    got = MOON.vol_progress(rel)
+    if got is None:
+        return ""
+    done, pct = got
+    if done:
+        return '<span class="vp done">读完</span>'
+    return f'<span class="vp">已读 {int(round(pct))}%</span>'
+
+
+def _prog_fab(st):
+    """作品详情页右下角的常驻进度指示器：一个百分比圆环 + 一行文字。
+
+    ``conic-gradient`` 画环，不需要 JS / SVG；不支持时退化成纯文字（不影响可读性）。
+    整部读完时环变绿、文案换成「已全部读完」（刻意避开「已读完」这个管理员专有词）。
+    """
+    pct = int(round(st["percent"]))
+    done = bool(st["all"])
+    if done:
+        head, sub = "已全部读完", f"{st['total']} 卷 · 整体 {pct}%"
+    else:
+        head, sub = f"已读 {st['done']}/{st['total']} 卷", f"整体进度 {pct}%"
+    return (
+        f'<div class="pfab{" pdone" if done else ""}" role="status"'
+        f' aria-label="阅读进度 {pct}%">'
+        f'<span class="pring" style="--p:{pct}"><i>{pct}</i></span>'
+        f'<span class="ptxt"><b>{head}</b><span>{sub}</span></span>'
+        "</div>")
+
+
 def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
-               finished=False, fin_note="", upd=0, readlist=False):
+               finished=False, fin_note="", upd=0, readlist=False, prog=None,
+               pnote=""):
     """一张书卡。
 
     * ``key`` 非空（= 管理员视角）时封面左上角挂「标记已读完」按钮；
     * ``upd`` > 0 表示这本书有新卷：封面左下角压一条「有更新」、整卡描暖色边、
-      副标题里点明新增几卷（角标只写数字，副标题给完整说法）。
+      副标题里点明新增几卷（角标只写数字，副标题给完整说法）；
+    * ``prog`` = ``(百分比, 是否整部读完)`` → 封面**右下角**的进度角标（照 Moon+ 的做法）；
+      ``pnote`` 是副标题里的文字版（``已读 3/9 卷``）。
     """
     badge_html = f'<span class="badge">{html.escape(badge)}</span>' if badge else ""
     mark = _mark_form(key, back, finished, readlist=readlist) if key else ""
+    prog_html = ""
+    if prog:
+        pct, done = prog
+        prog_html = (f'<span class="prog{" pdone" if done else ""}"'
+                     f' title="阅读进度 {pct}%">{pct}%</span>')
     sub_html = html.escape(sub) + (f' · <span class="fin">{html.escape(fin_note)}</span>'
                                   if fin_note else "")
+    if pnote:
+        sub_html += f' · <span class="pnt">{html.escape(pnote)}</span>'
     if upd:
         sub_html += f' · <span class="newt">有更新 +{upd} 卷</span>'
     upd_html = (f'<span class="upd">有更新 +{upd}</span>' if upd else "")
@@ -887,7 +990,7 @@ def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
         '<div class="card%s">' % (" upd" if upd else "")
         + f'<a class="cardlink" href="{href}">'
         f'<div class="ph"><img src="{_cover_url(cover_rel)}" alt="" loading="lazy">'
-        f"{badge_html}{upd_html}</div>"
+        f"{badge_html}{upd_html}{prog_html}</div>"
         f'<div class="t">{html.escape(title)}</div>'
         f'<div class="s">{sub_html}</div></a>'
         f"{mark}</div>")
@@ -1026,6 +1129,19 @@ def catalog_html(cat, page=1, is_admin=False):
     fin = load_finished() if is_admin else set()
     pend = upd.observe()                       # 顺带做一次「新增卷」检测
     upd_n = lambda k: len(pend[k]["vols"]) if k in pend else 0      # noqa: E731
+    vis = MOON.visible(is_admin)               # 进度角标对谁可见（默认所有人）
+
+    def card_for(key, cat_, book_, vols_, back_, badge=False):
+        prog, pnote = _work_prog(vols_, vis)
+        return _book_card("/opds/book/" + encode_path(key),
+                          _primary_vol(vols_, cat_, book_)["rel"], book_,
+                          f"{cat_} · {len(vols_)} 卷",
+                          badge=(f"{len(vols_)} 卷" if badge else None),
+                          key=key if is_admin else None, back=back_,
+                          finished=key in fin,
+                          fin_note="已读完" if key in fin else "",
+                          upd=upd_n(key), prog=prog, pnote=pnote)
+
     if cat == "all":
         merged = {}
         for c, bs in lib.items():
@@ -1035,13 +1151,7 @@ def catalog_html(cat, page=1, is_admin=False):
         chunk, extra = _paginate(keys, page, "/opds/catalog/all?page=1")
         back = "/opds/catalog/all?page=" + str(page)
         cards = "".join(
-            _book_card("/opds/book/" + encode_path(k),
-                       _primary_vol(merged[k][1], *k.split("/", 1))["rel"],
-                       k.split("/", 1)[1],
-                       f"{merged[k][0]} · {len(merged[k][1])} 卷",
-                       key=k if is_admin else None, back=back, finished=k in fin,
-                       fin_note="已读完" if k in fin else "", upd=upd_n(k))
-            for k in chunk)
+            card_for(k, *k.split("/", 1), merged[k][1], back) for k in chunk)
         total = len(keys)
         label = "全部作品"
         active = "all"
@@ -1053,13 +1163,7 @@ def catalog_html(cat, page=1, is_admin=False):
         chunk, extra = _paginate(keys, page, "/opds/catalog/" + quote(cat) + "?page=1")
         back = "/opds/catalog/" + quote(cat) + "?page=" + str(page)
         cards = "".join(
-            _book_card("/opds/book/" + encode_path(cat + "/" + b),
-                       _primary_vol(books[b], cat, b)["rel"],
-                       b, f"{len(books[b])} 卷", badge=f"{len(books[b])} 卷",
-                       key=f"{cat}/{b}" if is_admin else None, back=back,
-                       finished=f"{cat}/{b}" in fin,
-                       fin_note="已读完" if f"{cat}/{b}" in fin else "",
-                       upd=upd_n(f"{cat}/{b}"))
+            card_for(f"{cat}/{b}", cat, b, books[b], back, badge=True)
             for b in chunk)
         total = len(keys)
         label = cat
@@ -1118,8 +1222,13 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
     desc_html = f'<div class="desc">{html.escape(desc)}</div>' if desc else ""
 
     # 详情页一次性渲染全部卷（不翻页）：直接传完整 vols 列表，_render_groups 会显示所有分组
+    vis = MOON.visible(is_admin)
     groups = _group_vols_by_subdir(vols, cat, book)
-    groups_html = _render_groups(groups, cat, book, vols, new_rels)
+    groups_html = _render_groups(groups, cat, book, vols, new_rels, vis=vis)
+
+    # 右下角常驻进度环：作品级「读了几卷 / 整体百分比」，由 Moon+ 的位置数据派生（只读）
+    st = MOON.stat_of(vols) if vis else None
+    pill = _prog_fab(st) if st else ""
 
     # 标记按钮：管理员才有；已读时时样式换成实心绿并提示可取消
     mark_btn = ""
@@ -1155,6 +1264,7 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
          f'</div></div>' if groups_html else
          f'<h2>分卷下载 <span class="n">{len(vols)} 卷</span></h2>')
         + (groups_html or '<div class="empty">这一页没有内容</div>')
+        + pill
     )
     active = "done" if cat == CATEGORY_DONE else "ongoing"
     page_html = _html_page(f"{book} · {SERVER_TITLE}", body, active=active, is_admin=is_admin,
@@ -1218,11 +1328,12 @@ def _group_vols_by_subdir(vols, cat, book):
     return ordered
 
 
-def _render_groups(groups, cat, book, page_chunk, new_rels=frozenset()):
+def _render_groups(groups, cat, book, page_chunk, new_rels=frozenset(), vis=False):
     """把分组渲染成「文件夹 + 卷列表」，并标记哪些卷在当前分页里。
 
     ``new_rels`` 里的卷会给行加「新」标，其所属分组额外挂「有更新 +N」并**默认展开** ——
     新卷常常落在后面那些默认折叠的组里，不展开就等于没提示。
+    ``vis`` 为真时每行再带一个该卷的阅读进度（来自 Moon+ 位置数据）。
     """
     rels_in_page = {v["rel"] for v in page_chunk}
     out = []
@@ -1242,6 +1353,7 @@ def _render_groups(groups, cat, book, page_chunk, new_rels=frozenset()):
             f'<div class="meta"><div class="t">{html.escape(v["title"])}</div>'
             f'<div class="s">'
             + ('<span class="vnew">新</span>' if v["rel"] in new_rels else "")
+            + _vol_prog(v["rel"], vis)
             + f'{human_size(v["size"])}</div></div>'
             f'<span class="dl">下载</span></a>'
             for v in in_page)
@@ -1262,12 +1374,12 @@ def _render_groups(groups, cat, book, page_chunk, new_rels=frozenset()):
     return "".join(out)
 
 
-def _vol_rows(items):
+def _vol_rows(items, vis=False):
     return "".join(
         f'<a class="vol" href="/dl/{encode_path(v["rel"])}">'
         f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy"></div>'
         f'<div class="meta"><div class="t">{html.escape(title)}</div>'
-        f'<div class="s">{html.escape(c)} · {human_size(v["size"])}</div></div>'
+        f'<div class="s">{_vol_prog(v["rel"], vis)}{html.escape(c)} · {human_size(v["size"])}</div></div>'
         f'<span class="dl">下载</span></a>'
         for c, b, v, title in items)
 
@@ -1275,7 +1387,8 @@ def _vol_rows(items):
 def recent_html(page=1, is_admin=False):
     vols = sorted(all_vols(), key=lambda t: t[2]["mtime"], reverse=True)[:RECENT_SIZE]
     chunk, extra = _paginate(vols, page, "/opds/recent?page=1")
-    rows = _vol_rows([(c, b, v, f"{b} · {v['title']}") for c, b, v in chunk])
+    rows = _vol_rows([(c, b, v, f"{b} · {v['title']}") for c, b, v in chunk],
+                     vis=MOON.visible(is_admin))
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span><span>最近更新</span></div>'
         "<h1>最近更新</h1>"
@@ -1295,7 +1408,8 @@ def search_html(q, page=1, is_admin=False):
             if q.lower() in f"{b}/{v['rel']}".lower():
                 hits.append((c, b, v))
         chunk, extra = _paginate(hits, page, "/opds/search?q=" + quote(q) + "&page=1")
-        rows = _vol_rows([(c, b, v, f"{b} · {v['title']}") for c, b, v in chunk])
+        rows = _vol_rows([(c, b, v, f"{b} · {v['title']}") for c, b, v in chunk],
+                         vis=MOON.visible(is_admin))
         result_html = (
             f'<p class="sub">「{html.escape(q)}」命中 {len(hits)} 卷</p>'
             + (rows or f'<div class="empty">没有找到与「{html.escape(q)}」相关的内容</div>')
@@ -1313,12 +1427,24 @@ def search_html(q, page=1, is_admin=False):
     return _html_page(f"搜索 · {SERVER_TITLE}", body, active="", is_admin=is_admin, back=url)
 
 
+# 自动判定栏一次最多渲染多少张卡（派生清单可能很长，超出只提示数量）
+_AUTO_MAX = 60
+
+
 def read_html(page=1):
     """「已读完」列表页（**仅管理员**：服务端在路由层就会把访客挡在外面，
     非管理员拿不到这个页面，也拿不到顶栏入口）。
 
-    管理动作只有「取消标记」一个 —— 清单是人工维护的小状态，不做批量清空：
-    误点一下只是少一条记录，不需要「不可逆」的操作来增加风险。
+    分成两栏，**人工与自动严格分开**：
+
+    * **人工标记** —— 就是 ``.autosync/finished.json``，管理动作只有「取消标记」一个。
+      清单是人工维护的小状态，不做批量清空：误点一下只是少一条记录，
+      不需要「不可逆」的操作来增加风险。
+    * **Moon+ 自动判定** —— 由手机阅读器的位置数据派生（作品下所有卷都读完）。
+      **只读、不写清单**：``updates.observe()`` 有「出现新卷 → 自动从已读完剔除」的联动，
+      自动判定若每轮写回 ``finished.json``，两边会互相拉扯（加回 → 删 → 又加回）。
+
+    两栏重叠时只在人工栏出现（人工结论优先），页头会点明重叠了多少部。
     """
     items = _finished_books()
     chunk, extra = _paginate(items, page, "/opds/read?page=1")
@@ -1341,6 +1467,37 @@ def read_html(page=1):
                    f'<template id="readempty">{empty_html}</template>')
     else:
         listing = empty_html
+
+    # ---- 自动判定栏（派生视图，无任何写操作）----
+    manual_keys = {key for key, _c, _b, _v in items}
+    auto = MOON.auto_finished() if MOON.enabled() else {}
+    overlap = len(set(auto) & manual_keys)
+    auto_only = [(k, v) for k, v in sorted(auto.items()) if k not in manual_keys]
+    lib = get_library()
+    auto_rows = []
+    for key, st in auto_only[:_AUTO_MAX]:
+        cat, book = key.split("/", 1)
+        vols = lib.get(cat, {}).get(book)
+        if not vols:
+            continue
+        auto_rows.append(_book_card(
+            "/opds/book/" + encode_path(key),
+            _primary_vol(vols, cat, book)["rel"], book,
+            f"{cat} · {len(vols)} 卷", badge=f"{len(vols)} 卷",
+            prog=(int(round(st["percent"])), True),
+            pnote=f'{len(vols)}/{len(vols)} 卷'))
+    more = len(auto_only) - len(auto_rows)
+    if auto_rows:
+        auto_block = (f'<div class="grid">{"".join(auto_rows)}</div>'
+                      + (f'<p class="sub">还有 {more} 部未列出…</p>' if more > 0 else ""))
+    else:
+        auto_block = ('<div class="empty">还没有作品被自动判定为读完。<br>'
+                      '<span style="font-size:12px">判定依据：手机阅读器（Moon+）里'
+                      '这部作品的每一卷进度都到 99% 以上。</span></div>')
+    auto_note = (f'（与人工标记重叠 {overlap} 部，已在上一栏显示）' if overlap else "")
+    if not MOON.enabled():
+        auto_note = "（未启用：设 LN_MOON_PROGRESS=0 可关闭）"
+
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span><span>已读完</span></div>'
         '<div class="bar">'
@@ -1350,8 +1507,13 @@ def read_html(page=1):
         "</div>"
         f'<p class="sub">鼠标移上封面后，点左上角的 &#10003; 可取消标记。'
         f'（这份清单只保存在本机 <code>.autosync/finished.json</code>，不同步到书库/仓库）</p>'
+        '<div class="sec-head"><h2>人工标记 <span class="n">%d 部</span></h2></div>' % total
         + listing
         + _pager_html(page, _next_link(extra), _prev_link(extra))
+        + '<div class="sec-head" style="margin-top:26px"><h2>阅读器自动判定 '
+          f'<span class="n">{len(auto_only)} 部</span></h2></div>'
+        + f'<p class="sub">由手机阅读器的阅读位置派生，<b>只读展示、不会写进上面的清单</b>。{auto_note}</p>'
+        + auto_block
     )
     return _html_page(f"已读完 · {SERVER_TITLE}", body, active="read", is_admin=True, back=back)
 

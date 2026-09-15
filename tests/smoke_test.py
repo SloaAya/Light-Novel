@@ -2761,6 +2761,552 @@ SRV.AUTH_USER, SRV.AUTH_PASS, SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = _t_save
 if SESS is not None:
     SESS.forget_key()
 
+# ==================== U. 阅读进度指示器 + 自动「已读完」 ====================
+section("U. Moon+ 阅读进度指示器（封面角标 / 详情页进度环 / 自动判定已读完）")
+
+try:
+    from lightnovel.opds import moon as MOON
+    _U_ERR = ""
+except Exception as _exc:                                 # noqa: BLE001
+    MOON = None
+    _U_ERR = "%s: %s" % (type(_exc).__name__, _exc)
+
+_U_TMP = os.path.join(TMP_ROOT, "moon")
+os.makedirs(_U_TMP, exist_ok=True)
+_u_saved = {}
+
+
+def _ucheck(label, fn):
+    if MOON is None:
+        _rskip(label, "moon 模块不可用：%s" % _U_ERR)
+    else:
+        check(label, fn)
+
+
+def _u_snap():
+    """保存会被本节点打桩的模块级配置（避免污染别的测试 / 真实缓存）。"""
+    if _u_saved or MOON is None:
+        return
+    _u_saved.update({
+        "MOON_ROOT": MOON.MOON_ROOT,
+        "MOON_POS_FILE": MOON.MOON_POS_FILE,
+        "MOON_ENABLED": MOON.MOON_ENABLED,
+        "MOON_PUBLIC": MOON.MOON_PUBLIC,
+        "MOON_DONE_PERCENT": MOON.MOON_DONE_PERCENT,
+        "rel_pct": dict(MOON._state["rel_pct"]),
+        "meta": dict(MOON._state["meta"]),
+    })
+
+
+def _u_restore():
+    if not _u_saved or MOON is None:
+        return
+    MOON.MOON_ROOT = _u_saved["MOON_ROOT"]
+    MOON.MOON_POS_FILE = _u_saved["MOON_POS_FILE"]
+    MOON.MOON_ENABLED = _u_saved["MOON_ENABLED"]
+    MOON.MOON_PUBLIC = _u_saved["MOON_PUBLIC"]
+    MOON.MOON_DONE_PERCENT = _u_saved["MOON_DONE_PERCENT"]
+    MOON._state["rel_pct"] = _u_saved["rel_pct"]
+    MOON._state["meta"] = _u_saved["meta"]
+
+
+def _u_isolate():
+    """把进度相关的一切指到一个**干净**的临时目录。
+
+    「干净」是必须的：``read_positions`` 读的是 ``<root>/Cache/*.po``，
+    不清空的话上一个用例写下的 ``.po`` 会漏进下一个用例（``_u_join`` 就会多出一堆
+    「意外命中」，断言随之假失败）。两个 ``.tmp`` 也一并清掉，避免缓存校验戳
+    用半截文件。**绝不碰真实 .autosync/moon_cache**。
+    """
+    _u_snap()
+    root = os.path.join(_U_TMP, "dotmoon")
+    cache_dir = os.path.join(root, "Cache")
+    if os.path.isdir(cache_dir):
+        for _n in os.listdir(cache_dir):
+            try:
+                os.remove(os.path.join(cache_dir, _n))
+            except OSError:
+                pass
+    cache_file = os.path.join(_U_TMP, "positions.json")
+    for _p in (cache_file, cache_file + ".tmp"):
+        if os.path.exists(_p):
+            try:
+                os.remove(_p)
+            except OSError:
+                pass
+    MOON.MOON_ROOT = root
+    MOON.MOON_POS_FILE = cache_file
+    MOON.MOON_ENABLED = True
+    MOON.MOON_PUBLIC = True
+    MOON.MOON_DONE_PERCENT = 99.0
+    MOON._state["rel_pct"] = {}
+    MOON._state["meta"] = {"ok": False, "at": 0.0, "error": "", "po_files": 0,
+                           "matched": 0, "unmatched": 0, "ambiguous": 0, "elapsed_ms": 0.0}
+    return MOON.MOON_ROOT
+
+
+# ---------- U1. 纯函数：解析 / 归一化 / 读取 / 关联 ----------
+def _u_parse():
+    a = MOON.parse_position("1779019601627*3@0#10926:100%")
+    b = MOON.parse_position("1779019601627*34:100%")          # PDF 没有 @y#z
+    c = MOON.parse_position("1753089022677*5@0#0:11.0%")
+    return (a == {"device_id": "1779019601627", "section": 3, "sub_section": 0,
+                  "offset": 10926, "percent": 100.0, "is_pdf": False}
+            and b["is_pdf"] and b["section"] == 34 and b["offset"] is None
+            and c["percent"] == 11.0,
+            "epub/pdf/中间态 三种形态都解析正确")
+
+
+_ucheck("解析 .po：dev*x@y#z:p% 三种形态（含 PDF 无 @y#z 段）", _u_parse)
+
+
+def _u_parse_bad():
+    bad = ["", None, "garbage", "1779019601627", "1779019601627*3", "x*3@0#1:5%",
+           "1779019601627*3@0#1:5", "1779019601627*3@0#1:5%%"]
+    return all(MOON.parse_position(s) is None for s in bad), "8 种非法输入全部返回 None"
+
+
+_ucheck("解析 .po：空值/缺段/非数字一律返回 None（不抛异常）", _u_parse_bad)
+
+
+def _u_norm():
+    """归一化要同时打通「第X卷 ↔ XX」「汉字 ↔ 阿拉伯」「补零」。"""
+    cases = {
+        "GJ部 01": ("gj部", "01"),
+        "GAMERS电玩咖01": ("gamers电玩咖", "01"),
+        "玩乐关系 1": ("玩乐关系", "01"),
+        "在地下城寻求邂逅是否搞错了什么 第一卷": ("在地下城寻求邂逅是否搞错了什么", "01"),
+        "灼眼的夏娜 第十三卷": ("灼眼的夏娜", "13"),
+        "弹珠汽水瓶里的千岁同学 06.5": ("弹珠汽水瓶里的千岁同学", "6.5"),
+        "NO GAME LIFE": ("nogamelife", ""),
+    }
+    ok = all(MOON.norm_key(k) == v for k, v in cases.items())
+    pairs = [("GJ部 01", "GJ部 第一卷"), ("玩乐关系 1", "玩乐关系 第一卷"),
+             ("在地下城寻求邂逅是否搞错了什么 01", "在地下城寻求邂逅是否搞错了什么 第一卷")]
+    same = all(MOON.norm_key(a) == MOON.norm_key(b) for a, b in pairs)
+    return ok and same, "7 组格式 + 3 组跨命名体系等价"
+
+
+_ucheck("卷号归一化：第X卷 ↔ XX、汉字 ↔ 阿拉伯、补零、小数", _u_norm)
+
+
+def _u_norm_cn_dot():
+    """用户自己的「第三之五卷 = 3.5」约定必须归一到小数，不能当成「第五卷」。"""
+    got = MOON.norm_key("第三之五卷")
+    want = MOON.norm_key("第三之五卷")            # 同一输入两次结果必须一致（纯函数）
+    return (got[1] == "3.5" and got == want and got[1] != "05",
+            "第三之五卷 -> 卷号 %r（不是 05）" % got[1])
+
+
+_ucheck("卷号归一化：支持「第三之五卷 ↔ 3.5」的小数约定", _u_norm_cn_dot)
+
+
+def _u_write_po(root, name, text, mtime=None):
+    p = os.path.join(root, "Cache", name)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    if mtime is not None:
+        os.utime(p, (mtime, mtime))
+    return p
+
+
+def _u_read_cached():
+    _u_isolate()
+    root = MOON.MOON_ROOT
+    _u_write_po(root, "书A 01.epub.po", "1779019601627*3@0#271:2.6%")
+    _u_write_po(root, "书A 02.epub.po", "1779019601627*3@0#10926:100%")
+    _u_write_po(root, "书B.pdf.po", "1779019601627*34:100%")
+    sfile(root, "Cache/notes.txt", "不是 po，必须被忽略")
+    p1, m1 = MOON.read_positions()
+    p2, m2 = MOON.read_positions()                 # 第二次应命中本地缓存
+    return (m1["from_cache"] is False and m2["from_cache"] is True
+            and len(p1) == 3 and set(p1) == {"书A 01", "书A 02", "书B"}
+            and p1["书B"]["is_pdf"] and p1["书A 02"]["percent"] == 100.0
+            and "notes" not in str(p1),
+            "3 个 .po 读出（非 .po 忽略）；重读命中缓存")
+
+
+_ucheck("读取位置：解析 Cache/*.po、忽略非 .po、二次读命中本地缓存", _u_read_cached)
+
+
+def _u_read_invalidate():
+    _u_isolate()
+    root = MOON.MOON_ROOT
+    _u_write_po(root, "书A 01.epub.po", "1779019601627*3@0#271:2.6%")
+    MOON.read_positions()
+    _u_write_po(root, "书A 01.epub.po", "1779019601627*3@0#999:60.0%")   # 内容变了
+    p2, m2 = MOON.read_positions()
+    return (m2["from_cache"] is False and p2["书A 01"]["percent"] == 60.0,
+            "校验戳不一致 → 重读并拿到新值（不会拿旧缓存糊弄）")
+
+
+_ucheck("读取位置：缓存校验戳（mtime+大小）不一致时重读", _u_read_invalidate)
+
+
+def _u_read_missing():
+    _u_isolate()
+    MOON.MOON_ROOT = os.path.join(_U_TMP, "根本不存在")
+    p, meta = MOON.read_positions()
+    return (p is None and meta.get("error") and not meta.get("from_cache"),
+            "网盘没挂载 → 返回 (None, error)，**不抛异常**")
+
+
+_ucheck("读取位置：目录不存在（网盘没挂载）→ 返回 None 且不抛", _u_read_missing)
+
+
+def _u_join():
+    _u_isolate()
+    root = MOON.MOON_ROOT
+    _u_write_po(root, "书A 01.epub.po", "1779019601627*1@0#1:30.0%")
+    _u_write_po(root, "书A 第一卷.epub.po", "1779019601627*1@0#1:30.0%")   # 归一化才命中
+    _u_write_po(root, "与书库无关.epub.po", "1779019601627*1@0#1:50.0%")
+    pos, _m = MOON.read_positions()
+    lib = {"已完结": {"书A": [_s_vol("已完结/书A/书A 01.epub", 100),
+                              _s_vol("已完结/书A/书A 02.epub", 100)]},
+           "未完结": {}}
+    del lib["已完结"]["书A"][0]["title"]
+    lib["已完结"]["书A"][0]["title"] = "书A 01"
+    lib["已完结"]["书A"][1]["title"] = "书A 02"
+    rel, meta = MOON.join_library(pos, lib)
+    return (rel == {"已完结/书A/书A 01.epub": 30.0}
+            and meta["matched"] == 2 and meta["unmatched"] == 1,
+            "严格+归一化各命中一条（都落到同一卷），异物未命中")
+
+
+_ucheck("关联书库：严格相等 + 归一化兜底 + 未命中计数", _u_join)
+
+
+def _u_stat():
+    _u_isolate()
+    vols = [_s_vol("已完结/书A/01.epub", 1), _s_vol("已完结/书A/02.epub", 1),
+            _s_vol("已完结/书A/03.epub", 1)]
+    for v in vols:
+        v["title"] = v["rel"].rsplit("/", 1)[-1][:-5]
+    if MOON.stat_of(vols) is not None:
+        return False, "没有记录时应当返回 None"
+    MOON._swap({"已完结/书A/01.epub": 100.0, "已完结/书A/02.epub": 99.4})
+    st = MOON.stat_of(vols)
+    ok1 = (st["total"] == 3 and st["seen"] == 2 and st["done"] == 2
+           and st["all"] is False and abs(st["percent"] - 66.5) < 0.05)
+    MOON._swap({"已完结/书A/01.epub": 100.0, "已完结/书A/02.epub": 100.0,
+                "已完结/书A/03.epub": 99.9})
+    st2 = MOON.stat_of(vols)
+    return (ok1 and st2["all"] is True and st2["done"] == 3,
+            "无记录→None；部分读完 all=False；全卷≥99% all=True")
+
+
+_ucheck("作品统计：无记录返回 None；部分读完 all=False；全卷达标才 all=True", _u_stat)
+
+
+def _u_threshold():
+    """阈值必须是可配的：设成 100 之后 99.4% 就不算读完（证明 99 这个默认值真的在起作用）。"""
+    _u_isolate()
+    vols = [_s_vol("已完结/书A/01.epub", 1)]
+    vols[0]["title"] = "01"
+    MOON._swap({"已完结/书A/01.epub": 99.4})
+    at99 = MOON.stat_of(vols)
+    MOON.MOON_DONE_PERCENT = 100.0
+    at100 = MOON.stat_of(vols)
+    return (at99["all"] is True and at100["all"] is False,
+            "阈值 99 → 算读完；阈值 100 → 不算（MoM+ 的百分比是估算值）")
+
+
+_ucheck("读完阈值可配：99% 算读完，调到 100% 就不算", _u_threshold)
+
+
+def _u_auto():
+    _u_isolate()
+    lib = {"已完结": {"全读完": [_s_vol("已完结/全读完/01.epub", 1),
+                                 _s_vol("已完结/全读完/02.epub", 1)],
+                      "读一半": [_s_vol("已完结/读一半/01.epub", 1),
+                                 _s_vol("已完结/读一半/02.epub", 1)]},
+           "未完结": {}}
+    for _c, bs in lib.items():
+        for _b, vs in bs.items():
+            for v in vs:
+                v["title"] = v["rel"].rsplit("/", 1)[-1][:-5]
+    MOON._swap({"已完结/全读完/01.epub": 100.0, "已完结/全读完/02.epub": 100.0,
+                "已完结/读一半/01.epub": 100.0})
+    auto = MOON.auto_finished(lib)
+    return (set(auto) == {"已完结/全读完"} and auto["已完结/全读完"]["done"] == 2,
+            "只有「全部卷都读完」的作品入选，读到一半的排除")
+
+
+_ucheck("自动判定：只有整部读完的作品入选（读一半的不能算）", _u_auto)
+
+
+def _u_disabled_off():
+    _u_isolate()
+    vols = [_s_vol("已完结/书A/01.epub", 1)]
+    vols[0]["title"] = "01"
+    MOON._swap({"已完结/书A/01.epub": 100.0})
+    MOON.MOON_ENABLED = False
+    off = (MOON.stat_of(vols) is None and MOON.percent_of("已完结/书A/01.epub") is None
+           and MOON.auto_finished({"已完结": {"书A": vols}}) == {}
+           and MOON.visible(True) is False)
+    MOON.MOON_ENABLED = True
+    return (off, "ENABLED=0 时所有查询退化为空（整层可一键关闭）")
+
+
+_ucheck("总开关：LN_MOON_PROGRESS=0 时所有进度查询退化为空", _u_disabled_off)
+
+
+def _u_public_switch():
+    _u_isolate()
+    MOON.MOON_PUBLIC = True
+    pub = MOON.visible(False) and MOON.visible(True)
+    MOON.MOON_PUBLIC = False
+    priv = (not MOON.visible(False)) and MOON.visible(True)
+    return (pub and priv, "PUBLIC=1 访客可见；PUBLIC=0 仅管理员可见")
+
+
+_ucheck("可见性开关：MOON_PUBLIC 控制访客能不能看到进度", _u_public_switch)
+
+
+# ---------- U2. HTTP 端到端：真页面上的三处呈现 ----------
+_u_srv = None
+_u_port = 0
+_u_saved_auth = (SRV.AUTH_USER, SRV.AUTH_PASS)
+try:
+    SRV.AUTH_USER, SRV.AUTH_PASS = "ran", "147258"
+    _u_srv = SRV.make_server(port=0, bind="127.0.0.1")
+    _u_port = _u_srv.server_address[1]
+    threading.Thread(target=_u_srv.serve_forever, daemon=True).start()
+except Exception:                                         # noqa: BLE001
+    _u_srv = None
+
+_U_ADMIN = {"Authorization": "Basic " + base64.b64encode(b"ran:147258").decode()}
+
+
+def _u_http(path, headers=None):
+    import http.client as _hc
+    conn = _hc.HTTPConnection("127.0.0.1", _u_port, timeout=30)
+    conn.request("GET", path, headers=dict(headers or {}))
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8", "replace")
+    conn.close()
+    return resp.status, text
+
+
+def _uhcheck(label, fn):
+    if _u_srv is None:
+        _rskip(label, "无法起测试服务")
+    else:
+        check(label, fn)
+
+
+def _u_pick_book():
+    """挑一部真实作品并给它注入合成进度（真实数据只读，不改任何文件）。"""
+    _u_isolate()
+    lib = LIB.get_library(force=True)
+    for cat in ("已完结", "未完结"):
+        for book, vols in sorted(lib.get(cat, {}).items()):
+            if len(vols) >= 2:
+                return cat, book, vols
+    return None, None, None
+
+
+def _u_card_badge():
+    _u_isolate()
+    lib = LIB.get_library()
+    cat, book = "已完结", sorted(lib.get("已完结", {}))[0]
+    vols = lib[cat][book]
+    rel_map = {v["rel"]: 42.0 for v in vols}
+    MOON._swap(rel_map)
+    st, body = _u_http("/opds/catalog/" + quote(cat), headers=_U_ADMIN)
+    idx = body.find(f">{book}</div>")
+    zone = body[max(0, idx - 1400):idx + 200] if idx > 0 else ""
+    html_page = body
+    return (st == 200 and 'class="prog"' in html_page
+            and 'title="阅读进度 42%"' in html_page and ">42%</span>" in html_page
+            and zone.count('class="prog') >= 1,
+            "状态=%s 页面含 42%% 角标且落在该书的封面块里" % st)
+
+
+_uhcheck("HTTP 分类页：封面右下角出现进度角标（百分比 + title 无障碍文案）", _u_card_badge)
+
+
+def _u_card_badge_done():
+    _u_isolate()
+    lib = LIB.get_library()
+    cat, book = "已完结", sorted(lib.get("已完结", {}))[0]
+    MOON._swap({v["rel"]: 100.0 for v in lib[cat][book]})
+    st, body = _u_http("/opds/catalog/" + quote(cat), headers=_U_ADMIN)
+    return (st == 200 and 'class="prog pdone"' in body
+            and f'已读 {len(lib[cat][book])}/{len(lib[cat][book])} 卷' in body,
+            "整部读完 → 角标加 pdone 类、副标题写「已读 N/N 卷」")
+
+
+_uhcheck("HTTP 分类页：整部读完时角标变绿色（pdone）且副标题标出卷数", _u_card_badge_done)
+
+
+def _u_badge_vs_updbar():
+    """有「有更新」条时角标要抬高，否则会被那条左右贯通的色带压住。"""
+    css = FEED.SITE_CSS
+    return (".card.upd .ph .prog{bottom:25px}" in css
+            and "conic-gradient(var(--accent)" in css
+            and ".pfab.pdone .pring" in css,
+            "CSS 含角标避让 + 进度环 + 完成态配色三条规则")
+
+
+_ucheck("CSS：角标避开「有更新」条、进度环与完成态配色齐备", _u_badge_vs_updbar)
+
+
+def _u_detail_fab():
+    _u_isolate()
+    cat, book, vols = _u_pick_book()
+    if not book:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    MOON._swap({v["rel"]: (100.0 if i < 1 else 0.0) for i, v in enumerate(vols)})
+    st, body = _u_http("/opds/book/" + O.encode_path(f"{cat}/{book}"), headers=_U_ADMIN)
+    pct = int(round(sum(100.0 if i < 1 else 0.0 for i in range(len(vols))) / len(vols)))
+    return (st == 200 and 'class="pfab"' in body and f'style="--p:{pct}"' in body
+            and "已读 1/%d 卷" % len(vols) in body,
+            "状态=%s 进度环 --p=%d、文案「已读 1/%d 卷」" % (st, pct, len(vols)))
+
+
+_uhcheck("HTTP 详情页：右下角常驻进度环（含 --p 与「已读 N/M 卷」）", _u_detail_fab)
+
+
+def _u_detail_volrow():
+    _u_isolate()
+    cat, book, vols = _u_pick_book()
+    if not book:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    MOON._swap({vols[0]["rel"]: 33.0, vols[1]["rel"]: 100.0})
+    st, body = _u_http("/opds/book/" + O.encode_path(f"{cat}/{book}"), headers=_U_ADMIN)
+    return (st == 200 and '<span class="vp">已读 33%</span>' in body
+            and '<span class="vp done">读完</span>' in body,
+            "分卷行分别显示「已读 33%」与「读完」")
+
+
+_uhcheck("HTTP 详情页：分卷列表每行标出该卷进度（未读完/读完两种态）", _u_detail_volrow)
+
+
+def _u_read_two_columns():
+    _u_isolate()
+    _reset_fin(os.path.join(_U_TMP, "finished_two.json"))   # 人工栏留空，专注自动栏
+    cat, book, vols = _u_pick_book()
+    if not book:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    MOON._swap({v["rel"]: 100.0 for v in vols})
+    st, body = _u_http("/opds/read", headers=_U_ADMIN)
+    key = f"{cat}/{book}"
+    return (st == 200 and "人工标记" in body and "阅读器自动判定" in body
+            and "只读展示" in body and O.encode_path(key) in body
+            and "还没有作品被自动判定为读完" not in body,
+            "两栏齐备，自动栏渲染出「%s」" % key)
+
+
+_uhcheck("HTTP 已读完页：拆成「人工标记」+「阅读器自动判定」两栏", _u_read_two_columns)
+
+
+def _u_auto_readonly():
+    """最关键的一条：自动判定**绝不能**写进 finished.json（否则与「新卷自动剔除」互相拉扯）。"""
+    _u_isolate()
+    fin_path = _reset_fin(os.path.join(_U_TMP, "finished_ro.json"))
+    cat, book, vols = _u_pick_book()
+    if not book:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    MOON._swap({v["rel"]: 100.0 for v in vols})
+    st, body = _u_http("/opds/read", headers=_U_ADMIN)
+    fin = FIN.load_finished()
+    return (st == 200 and FIN.normalize_key(f"{cat}/{book}") not in fin
+            and not os.path.exists(fin_path),
+            "自动判定命中「%s」，但 finished.json 依然不存在（%s）"
+            % (f"{cat}/{book}", "未创建" if not os.path.exists(fin_path) else "被写了"))
+
+
+_uhcheck("自动判定是纯派生：命中作品但绝不写 finished.json", _u_auto_readonly)
+
+
+def _u_manual_wins():
+    """人工标过的作品只在人工栏出现，不重复出现在自动栏（人工结论优先）。"""
+    _u_isolate()
+    _reset_fin(os.path.join(_U_TMP, "finished_ov.json"))
+    cat, book, vols = _u_pick_book()
+    if not book:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    key = f"{cat}/{book}"
+    MOON._swap({v["rel"]: 100.0 for v in vols})
+    FIN.mark_finished(key, True)
+    st, body = _u_http("/opds/read", headers=_U_ADMIN)
+    FIN.mark_finished(key, False)
+    overlapped = "与人工标记重叠" in body
+    return (st == 200 and overlapped and "0 部" in body,
+            "重叠时只在人工栏出现，自动栏计数归零（页头点明重叠）")
+
+
+_uhcheck("已读完页：人工与自动重叠时不重复展示（人工优先）", _u_manual_wins)
+
+
+def _u_guest_hidden():
+    """MOON_PUBLIC=0 时访客看不到任何进度；管理员仍然看得到。"""
+    _u_isolate()
+    cat, book, vols = _u_pick_book()
+    if not book:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    MOON._swap({v["rel"]: 55.0 for v in vols})
+    MOON.MOON_PUBLIC = False
+    _s1, guest_page = _u_http("/opds/catalog/" + quote(cat))
+    _s2, admin_page = _u_http("/opds/catalog/" + quote(cat), headers=_U_ADMIN)
+    off = 'class="prog"' not in guest_page and 'class="prog"' in admin_page
+    _s3, guest_book = _u_http("/opds/book/" + O.encode_path(f"{cat}/{book}"))
+    off = off and 'class="pfab"' not in guest_book
+    MOON.MOON_PUBLIC = True
+    _s4, on = _u_http("/opds/catalog/" + quote(cat))
+    return (off and 'class="prog"' in on and "已读完" not in on and "/opds/read" not in on,
+            "PUBLIC=0：访客无角标/无进度环；PUBLIC=1：访客可见但**仍看不到管理入口**")
+
+
+_uhcheck("访客门禁：MOON_PUBLIC 关掉后访客无角标，且任何情况下都拿不到管理入口",
+         _u_guest_hidden)
+
+
+def _u_switch_off_http():
+    _u_isolate()
+    cat, book, vols = _u_pick_book()
+    if not book:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    MOON._swap({v["rel"]: 88.0 for v in vols})
+    MOON.MOON_ENABLED = False
+    _s1, page = _u_http("/opds/catalog/" + quote(cat), headers=_U_ADMIN)
+    MOON.MOON_ENABLED = True
+    return ('class="prog"' not in page, "总开关关掉后页面上一个角标都没有")
+
+
+_uhcheck("总开关：LN_MOON_PROGRESS=0 后页面不再渲染进度角标", _u_switch_off_http)
+
+
+def _u_stats_health():
+    """把「关联健康度」暴露到 /opds/stats —— 书库改名导致关联断掉时能一眼看出来。"""
+    _u_isolate()
+    _s, body = _u_http("/opds/stats", headers=_U_ADMIN)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False, "stats 不是 JSON"
+    m = data.get("_moon") or {}
+    keys = {"enabled", "root", "ttl", "done_percent", "rel_entries", "unmatched",
+            "matched", "ambiguous", "public", "ok"}
+    return (keys <= set(m) and m.get("root") == MOON.MOON_ROOT,
+            "stats 含 _moon 健康块（含 unmatched/ambiguous）")
+
+
+_uhcheck("HTTP /opds/stats：暴露阅读器进度的关联健康度（unmatched/ambiguous）",
+         _u_stats_health)
+
+
+if _u_srv is not None:
+    try:
+        _u_srv.shutdown()
+        _u_srv.server_close()
+    except Exception:                                     # noqa: BLE001
+        pass
+SRV.AUTH_USER, SRV.AUTH_PASS = _u_saved_auth
+_u_restore()
+
 # ============================== 汇总 ==============================
 print("\n" + "=" * 70)
 _p = [r for r in RESULTS if r[2]]
