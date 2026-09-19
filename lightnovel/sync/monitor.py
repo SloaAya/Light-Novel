@@ -5,19 +5,12 @@
 import argparse
 import logging
 import os
-import shutil
 import sys
 import time
 
 from ..paths import (
-    BOOK_NAME,
-    CATEGORY_DIRS,
-    CATEGORY_DONE,
-    CATEGORY_ONGOING,
-    ENABLE_SEED_COPY,
     LIGHT_NOVEL_DIR,
     LOG_DIR,
-    LOG_FILE,
     MAX_SETTLE_WAIT,
     MIRROR_HTML_FILE,
     MIRROR_LOG_FILE,
@@ -26,18 +19,10 @@ from ..paths import (
     OPDS_BIND,
     OPDS_PORT,
     SETTLE_TIME,
-    SOURCE_DIR,
-    TARGET_DIR,
-    TARGET_SUBDIR,
     WATCH_DIRS,
 )
-from .gitops import (
+from .catalog import (
     EXCLUDE_FILE_NAMES,
-    ensure_remote,
-    ensure_repo,
-    git_available,
-    list_books,
-    run_git,
     setup_logging,
 )
 from .mirror import (
@@ -48,37 +33,6 @@ from .mirror import (
 )
 
 log = logging.getLogger("sync")
-
-# ---------------------------- 文件复制（种子） ----------------------------
-def smart_copy():
-    """将源书籍文件夹增量复制到目标分类目录（仅复制缺失或变化的文件）。返回复制文件数。"""
-    src = os.path.join(SOURCE_DIR, BOOK_NAME)
-    dst = os.path.join(TARGET_DIR, TARGET_SUBDIR)
-    if not os.path.isdir(src):
-        log.error("源目录不存在：%s", src)
-        return 0
-    copied = 0
-    for root, _dirs, files in os.walk(src):
-        for f in files:
-            if f.lower() in EXCLUDE_FILE_NAMES:
-                continue  # 系统垃圾文件不复制进仓库
-            sf = os.path.join(root, f)
-            rel = os.path.relpath(sf, src)
-            tf = os.path.join(dst, rel)
-            need = True
-            if os.path.exists(tf):
-                ss = os.stat(sf)
-                ts = os.stat(tf)
-                if ss.st_size == ts.st_size and abs(ss.st_mtime - ts.st_mtime) < 2:
-                    need = False
-            if need:
-                os.makedirs(os.path.dirname(tf), exist_ok=True)
-                shutil.copy2(sf, tf)
-                copied += 1
-                log.info("已复制：%s", rel)
-    log.info("复制完成，新增 / 更新文件数：%d", copied)
-    return copied
-
 
 # ---------------------------- 目录快照 / 变更检测 ----------------------------
 def snapshot_dir(roots=None):
@@ -208,8 +162,8 @@ def monitor_loop():
     """实时监控循环。
 
     ⚠ 锁**不由本函数管理**：``main()`` 在初始同步之前就先占锁（那一步要跑全量
-    F 盘镜像 + git 推送，实测两分钟起步，期间没锁会让面板状态灯一直是红的、
-    单实例保护也是空的）。本函数只负责循环本身，锁由 main 的 try/finally 收尾。
+    F 盘镜像，实测两分钟起步，期间没锁会让面板状态灯一直是红的、单实例保护也是
+    空的）。本函数只负责循环本身，锁由 main 的 try/finally 收尾。
     """
     log.info("开始后台实时监控 %s（每 %d 秒轮询一次，Ctrl+C 退出）", "、".join(WATCH_DIRS), MONITOR_INTERVAL)
     prev = snapshot_dir(WATCH_DIRS)
@@ -239,8 +193,8 @@ def monitor_loop():
                 perform_sync(
                     f"auto-sync: +{len(added)} ~{len(modified)} -{len(removed)}"
                 )
-                # 同步过程可能改动工作区（如清理远程多余文件时的 rebase + git rm），
-                # 重新快照，避免下一轮把同步自身的改动误判为新的外部变更
+                # 同步过程会往 F 盘写入、并刷新 README，重新快照，避免下一轮把
+                # 同步自身的产物误判为新的外部变更
                 prev = snapshot_dir(WATCH_DIRS)
             except Exception as exc:  # 单次轮询出错不应中断监控
                 log.error("监控轮询出错：%s", exc)
@@ -270,17 +224,6 @@ def start_opds_background(port=OPDS_PORT, bind=OPDS_BIND):
     except Exception as exc:
         log.warning("OPDS 书源启动失败（不影响同步）：%s", exc)
         return None, None
-
-
-# ---------------------------- 状态查看 ----------------------------
-def show_status():
-    rc, out, _ = run_git(["status", "-s"], check=False)
-    log.info("===== git status =====\n%s", out.strip() or "(干净)")
-    snap = snapshot_dir()
-    log.info("轻小说 当前监控快照文件数：%d", len(snap))
-    log.info("已完结 %d 本 / 未完结 %d 本", len(list_books(CATEGORY_DIRS[CATEGORY_DONE])),
-             len(list_books(CATEGORY_DIRS[CATEGORY_ONGOING])))
-    log.info("日志文件：%s", LOG_FILE)
 
 
 # ---------------------------- F 盘镜像状态（查） ----------------------------
@@ -321,11 +264,8 @@ def show_mirror_status():
 
 # ---------------------------- 主流程 ----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Light-Novel GitHub 自动同步与监控工具（增强版）")
-    parser.add_argument("--once", action="store_true", help="种子复制 + 提交推送一次后退出")
-    parser.add_argument("--monitor-only", action="store_true", help="不复制种子，仅同步当前状态并持续监控")
-    parser.add_argument("--init", action="store_true", help="仅初始化 / 校验仓库与远程配置")
-    parser.add_argument("--status", action="store_true", help="查看仓库状态与监控快照")
+    parser = argparse.ArgumentParser(description="Light-Novel 目录监控与 F 盘镜像工具")
+    parser.add_argument("--once", action="store_true", help="镜像一次后退出（不启动持续监控）")
     parser.add_argument("--mirror-f", action="store_true",
                         help="执行一次 D 盘 → F 盘的完整镜像（增 / 改 / 删 / 查）后退出")
     parser.add_argument("--mirror-status", action="store_true",
@@ -344,10 +284,6 @@ def main():
 
     setup_logging()
 
-    if not git_available():
-        log.error("Git 不可用，程序无法运行。")
-        sys.exit(1)
-
     if args.opds_only:
         try:
             from ..opds import server as opds_server
@@ -355,11 +291,6 @@ def main():
             opds_server.run_service(port=args.opds_port, bind=OPDS_BIND)
         except Exception as exc:
             log.error("OPDS 服务退出：%s", exc)
-        return
-
-    if args.status:
-        ensure_repo()
-        show_status()
         return
 
     if args.mirror_status:
@@ -370,33 +301,20 @@ def main():
         sync_to_f(dry_run=args.mirror_dry_run, allow_delete=not args.mirror_no_delete)
         return
 
-    if not ensure_repo():
-        sys.exit(1)
-    ensure_remote()
-
-    if args.init:
-        log.info("仓库与远程配置校验完成。")
-        show_status()
-        return
-
     if args.once:
-        if ENABLE_SEED_COPY and not args.monitor_only:
-            smart_copy()
-        perform_sync("sync: 手动/初始同步")
+        perform_sync("sync: 手动同步一次")
         log.info("--once 完成。")
         return
 
-    # 默认模式：（可选）种子复制 + 提交推送 + 持续监控
-    # ⚠ 锁必须在**初始同步之前**拿到：那一步要跑全量 F 盘镜像 + git 推送，实测
-    #   两分钟起步。期间若还没写锁，控制面板会一直显示「已停止」（用户看不出它在
-    #   干活），而且单实例保护形同虚设 —— 这段时间再启动一个实例，就会两个进程
-    #   并发跑同步/镜像/git，互相踩（rebase 撞 git rm 会造成工作区幽灵删除）。
+    # 默认模式：初始同步 + 持续监控
+    # ⚠ 锁必须在**初始同步之前**拿到：那一步要跑全量 F 盘镜像，实测两分钟起步。
+    #   期间若还没写锁，控制面板会一直显示「已停止」（用户看不出它在干活），而且
+    #   单实例保护形同虚设 —— 这段时间再启动一个实例，就会两个进程并发跑镜像，
+    #   一边在写、一边在删，容易留下半截文件。
     if not acquire_lock():
         log.error("已有监控实例在运行（锁文件 %s），本实例退出。", lock_path())
         sys.exit(1)
     try:
-        if ENABLE_SEED_COPY and not args.monitor_only:
-            smart_copy()
         perform_sync("sync: 初始同步")
         if args.opds:
             start_opds_background(args.opds_port)

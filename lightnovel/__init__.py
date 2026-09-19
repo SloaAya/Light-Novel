@@ -5,7 +5,7 @@
 模块总览：
     paths         全局配置与路径（唯一真源）
     opds.*        OPDS 1.2 书源服务 —— library（数据层）/ feeds（表示层）/ server（服务层）
-    sync.*        GitHub 同步与 F 盘镜像 —— gitops（Git）/ mirror（镜像）/ monitor（监控+主流程）
+    sync.*        F 盘镜像与目录监控 —— catalog（目录/书单工具）/ mirror（镜像）/ monitor（监控+主流程）
     tunnel_setup  Cloudflare 固定域名隧道配置向导
     ui            Tkinter 图形控制面板
     cli           统一命令行入口（``python -m lightnovel``）

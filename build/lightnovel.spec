@@ -33,7 +33,7 @@ HIDDEN = [
     "lightnovel.opds.session",
     "lightnovel.opds.moon",
     "lightnovel.sync",
-    "lightnovel.sync.gitops",
+    "lightnovel.sync.catalog",
     "lightnovel.sync.mirror",
     "lightnovel.sync.monitor",
 ]

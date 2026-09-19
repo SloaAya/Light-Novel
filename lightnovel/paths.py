@@ -104,29 +104,12 @@ BLANK_PNG     = (
 NAMED_TUNNEL_NAME = os.environ.get("LN_TUNNEL_NAME", "ln-opds")
 CF_CONFIG = os.path.join(os.path.expanduser("~"), ".cloudflared", "config.yml")
 
-# ============================ GitHub 同步 ============================
-# 推荐 SSH：大体积推送在部分代理/网络下 HTTPS 上传会被重置，SSH 通常能稳定通过。
-# SSH 22 端口被封时的兜底：git@ssh.github.com:443/SloaAya/Light-Novel.git
-REPO_URL = "git@github.com:SloaAya/Light-Novel.git"
-REMOTE   = "origin"
-BRANCH   = "main"
-GIT_BIN  = "git"   # 不在 PATH 时可改为完整路径，如 r"C:\Program Files\Git\bin\git.exe"
-
+# 书单（README）的两个 <details> 区块由 lightnovel.sync.catalog 自动刷新
 README_PATH = os.path.join(TARGET_DIR, "README.md")
 
 MONITOR_INTERVAL    = 5     # 监控轮询间隔（秒）
 SETTLE_TIME         = 3     # 判定文件「已写完、稳定」的等待时间（秒）
 MAX_SETTLE_WAIT     = 180   # 单轮最多等待稳定的时间（秒），超时则强制同步
-MAX_DELETIONS_GUARD = 100   # 单次提交允许的最大删除数（超过判定异常，拒绝提交）
-
-# ---- 种子复制（源目录已不存在，默认关闭）----
-SOURCE_DIR   = r"D:\BaiduNetdiskDownload"
-BOOK_NAME    = "线上游戏的老婆不可能是女生？"
-ENABLE_SEED_COPY = False
-TARGET_SUBDIR = os.path.join("轻小说", CATEGORY_ONGOING, BOOK_NAME)
-
-# ---- 认证：留空即用系统凭据管理器 / SSH（令牌等同密码，切勿写死）----
-PAT_TOKEN = ""
 
 # ======================== F 盘网络云盘镜像（CloudDrive2）========================
 F_TARGET_ROOT = r"F:\LightNovel"

@@ -32,7 +32,23 @@
 > | `setup_named_tunnel.py` | 218 | Cloudflare 固定域名隧道配置向导 |
 > | `run_monitor.bat` / `run_once.bat` / `run_opds.bat` | 8 / 8 / 21 | 启动器（前两个已移除） |
 > | `run_named_tunnel.bat` / `setup_named_tunnel.bat` / `stop_opds.bat` | 23 / 22 / 18 | 启动器 / 停止器（前两个已移除） |
-> | `.github/workflows/OneDriveSync.yml` | 41 | 云端 rclone 同步（当前停用） |
+> | `.github/workflows/OneDriveSync.yml` | 41 | 云端 rclone 同步（当前停用，**已于 09-19 移除**） |
+>
+> **2026-09-19 后续变更（本页其余内容仍是 09-14 的快照）**：
+> 同步链路收窄为「只镜像到 F 盘」，Git 提交与推送整体移除：
+>
+> | 已移除 | 说明 |
+> | --- | --- |
+> | `lightnovel/sync/gitops.py` | 整个模块删除。其中**非 Git 的**扫描与书单工具（`scan_tree` / `scan_dirs` / `ensure_category_dirs` / `list_books` / `regenerate_readme` / `setup_logging` / `EXCLUDE_FILE_NAMES`）改名到新的 `lightnovel/sync/catalog.py` —— F 盘镜像与目录监控照旧复用它们 |
+> | `perform_sync()` 的 Git 三步 | `git_commit` → `remove_remote_extras` → `push_with_retry` 全部删除；现在只做「建分类目录 → 刷书单 → 镜像 F 盘」 |
+> | `monitor` 的 Git 门禁 | `show_status()`、`git_available()` / `ensure_repo()` / `ensure_remote()` 检查，以及 `--init` / `--status` / `--monitor-only` 三个选项 |
+> | `smart_copy()` 种子复制 | 源目录 `D:\BaiduNetdiskDownload` 早已不存在、`ENABLE_SEED_COPY` 恒为 False（下文 A-2 / B-2 作废） |
+> | `.github/workflows/OneDriveSync.yml` | 已停用的云端 rclone 同步（下文 B-6 作废） |
+> | `paths.py` 的 Git 常量 | `REPO_URL` / `REMOTE` / `BRANCH` / `GIT_BIN` / `PAT_TOKEN` / `MAX_DELETIONS_GUARD` 一并删除；`README_PATH` 保留（书单维护仍在用） |
+> | UI「同步一次」按钮 | 它等于直接 git 提交推送。面板保留「镜像到 F 盘」「查看 F 盘差异」与「启动 / 停止目录监控」 |
+>
+> 同批：书库本体（`轻小说/`，1774 个文件）已移出 Git 仓库并清理了历史，仓库只保留代码；
+> 本地书库与 F 盘镜像不受影响。
 
 ---
 

@@ -26,15 +26,12 @@ from ..paths import (
     MIRROR_STATE_FILE,
     MTIME_TOLERANCE,
 )
-from .gitops import (
+from .catalog import (
     EXCLUDE_FILE_NAMES,
     IGNORE_NAMES,
     _now_iso,
     ensure_category_dirs,
-    git_commit,
-    push_with_retry,
     regenerate_readme,
-    remove_remote_extras,
     scan_dirs,
     scan_tree,
 )
@@ -575,7 +572,7 @@ def sync_to_f(dry_run=False, allow_delete=True):
       改 = 大小或 mtime 不同 → 覆盖（同时检测 F 侧更新的冲突）
       删 = F 有 D 无 → 直接删除，并清理空目录
       查 = 每轮都生成差异报告并写入审计日志
-    返回 True/False（F 盘不可用时返回 False，但不影响 GitHub 推送）。"""
+    返回 True/False（F 盘不可用时返回 False）。"""
     if not os.path.isdir(F_TARGET_ROOT):
         log.warning("未找到网络云盘 %s（CD2 未挂载？），跳过 F 盘镜像。", F_TARGET_ROOT)
         return False
@@ -661,25 +658,25 @@ def _warn_stray_items():
         pass
 
 
-def perform_sync(message):
-    """一次完整的同步：确保目录 -> 刷新 README -> 镜像 F 盘 -> 提交本地改动
-    -> 以本地为准删除 GitHub 多余文件 -> 统一推送。"""
+def perform_sync(message=""):
+    """一次完整的同步：确保分类目录 → 刷新书单（README）→ 镜像到 F 盘。
+
+    2026-09-19 起同步只到 F 盘为止 —— Git 提交与推送已整体移除（书库本体也从
+    仓库移除了，改由网盘镜像承担备份）。``message`` 参数保留是为了兼容调用方，
+    现在只作为日志里的一句话。
+    返回 True/False：F 盘镜像是否全部成功（未挂载按失败计）。
+    """
+    if message:
+        log.info("开始同步：%s", message)
     ensure_category_dirs()
     regenerate_readme()
+    ok = True
     try:
-        sync_to_f()
-    except Exception as exc:
+        ok = sync_to_f()
+    except Exception as exc:                       # 网络盘异常不该冒泡出去
         log.warning("F 盘镜像异常：%s", exc)
+        ok = False
     _warn_stray_items()
-    if not git_commit(message):  # 先提交本地改动，保证工作区干净（后续 rebase 需要）
-        return False
-    try:
-        remove_remote_extras()  # 以本地为准：删除 GitHub 上多出来的文件
-    except Exception as exc:
-        log.warning("远程多余文件清理异常：%s", exc)
-    ok = push_with_retry()
-    if not ok:
-        log.warning("推送未完全成功，请检查网络 / 凭据后重试。")
-    return ok
+    return bool(ok)
 
 
