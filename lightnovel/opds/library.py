@@ -499,16 +499,41 @@ def get_epub_meta(rel):
 class _ZipSink:
     """把 HTTP 响应流包装成 zipfile 可写的目标（不可 seek，用 data descriptors）。
     zipfile 对 seekable()==False 的流会在每条 entry 后写 data descriptor，
-    从而支持真正流式生成 zip，不需要临时文件、不占内存。"""
+    从而支持真正流式生成 zip，不需要临时文件、不占内存。
 
-    def __init__(self, raw):
+    ``skip`` / ``limit``：断点续传用 —— 只把第 ``[skip, skip+limit)`` 这段字节写出去。
+    zip 是**顺序生成**的字节流（每条的头部与中央目录的偏移互相依赖），没法直接跳到
+    中间，所以「从第 N 字节接着下」只能是**照样从头生成、前半段丢弃**：省下的是
+    **网络流量**，不是磁盘读取 —— 而断点续传要省的本就是流量。
+    ``tell()`` 返回的是**已生成**的总字节数（zipfile 靠它算偏移），不是已写出的字节数。
+    """
+
+    def __init__(self, raw, skip=0, limit=None):
         self._raw = raw
-        self._pos = 0
+        self._pos = 0                                   # 已生成（含被丢弃的）
+        self._skip = max(0, int(skip))
+        self._limit = None if limit is None else max(0, int(limit))
+        self._out = 0                                   # 已写出（计入 limit）
 
     def write(self, data):
-        n = self._raw.write(data)
-        self._pos += n if n is not None else len(data)
-        return n if n is not None else len(data)
+        n = len(data)
+        self._pos += n
+        if self._skip:
+            if self._skip >= n:
+                self._skip -= n
+                return n
+            data = data[self._skip:]
+            self._skip = 0
+        if self._limit is not None:
+            room = self._limit - self._out
+            if room <= 0:
+                return n
+            if len(data) > room:
+                data = data[:room]
+        if data:
+            self._raw.write(data)
+            self._out += len(data)
+        return n                                        # 始终报「原样收到」
 
     def flush(self):
         try:
@@ -530,5 +555,111 @@ class _ZipSink:
 
     def writable(self):
         return True
+
+
+class _CountSink:
+    """只计字节数：既不落盘也不进内存（用来**预演**一遍 zip 会产出多长）。"""
+
+    def __init__(self):
+        self._pos = 0
+
+    def write(self, data):
+        self._pos += len(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def tell(self):
+        return self._pos
+
+    def seekable(self):
+        return False
+
+    def seek(self, *_args, **_kwargs):
+        raise io.UnsupportedOperation("not seekable")
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+
+def zip_plan(vols, cat, book="", subdir=""):
+    """``vols`` → ``[(磁盘路径, zip 内路径), …]``（读不到的卷直接跳过）。
+
+    剥前缀的规则（``分类/`` → ``书名/`` → ``子目录/``）只写这一份：**正式打包与长度
+    预演必须走同一套路径**，否则算出来的长度和实际发出去的会对不上。
+    """
+    out = []
+    for v in vols:
+        disk = resolve_under(LIGHT_NOVEL_DIR, v["rel"])
+        if not disk or not os.path.isfile(disk):
+            continue
+        arc = v["rel"]
+        if arc.startswith(cat + "/"):
+            arc = arc[len(cat) + 1:]
+        if book and arc.startswith(book + "/"):
+            arc = arc[len(book) + 1:]
+        if subdir and arc.startswith(subdir + "/"):
+            arc = arc[len(subdir) + 1:]
+        out.append((disk, arc))
+    return out
+
+
+def zip_size(pairs):
+    """预演一遍 ``ZIP_STORED`` 打包，返回**精确总字节数**。
+
+    拿到它才能给响应带上 ``Content-Length``。没有它的时候，手机浏览器只能画一根
+    不知道尽头的进度条、配一句「继续下载中…」，看不到「已下 4.4 MB / 共 130 MB」
+    —— 实测就是这个症状。
+
+    长度交给 ``zipfile`` 自己算，**不手推公式**：data descriptor 的写法、UTF-8 文件名
+    标记、zip64 的取舍都随内容与版本变化，手推迟早差几个字节，而 ``Content-Length``
+    少一字节就是下载中途断流。
+
+    代价是**多读一遍**这些文件（``ZIP_STORED`` 不压缩，预演读到的就是产出）。本地盘
+    几百 MB 约零点几秒，换来可显示进度的下载，划算。
+    """
+    sink = _CountSink()
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_STORED,
+                         allowZip64=True) as zf:
+        for disk, arc in pairs:
+            zf.write(disk, arcname=arc)
+    return sink.tell()
+
+
+_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def parse_range(value, total):
+    """解析**单段** ``Range`` 头 → ``(start, end)``（闭区间）；无法处理返回 ``None``。
+
+    返回的 ``start >= total`` 表示越界，调用方据此回 416。
+    三种写法都认：``bytes=a-b``（常规）、``bytes=a-``（到结尾，下载器续传最常用）、
+    ``bytes=-N``（最后 N 字节）。
+
+    **多段**（``bytes=0-9,20-29``）返回 ``None``：RFC 允许服务端直接忽略 Range 头，
+    忽略即整包重发 —— 比拼 ``multipart/byteranges`` 简单得多，而续传不会用多段。
+    """
+    if not value:
+        return None
+    m = _RANGE_RE.match(value.strip())
+    if not m:
+        return None
+    a, b = m.group(1), m.group(2)
+    if not a and not b:
+        return None
+    if a:
+        start = int(a)
+        if start >= total:
+            return start, start                         # 越界 → 416
+        end = min(int(b), total - 1) if b else total - 1
+        return (start, end) if end >= start else None
+    n = int(b)                                          # bytes=-N：最后 N 字节
+    if n <= 0:
+        return None
+    return max(0, total - n), total - 1
 
 

@@ -56,7 +56,12 @@ SESSION_KEY_FILE = os.path.join(LOG_DIR, "session.key")
 MOON_ROOT   = os.environ.get("LN_MOON_ROOT", r"F:\Apps\Books\.Moon+")
 MOON_CACHE_DIR = os.path.join(LOG_DIR, "moon_cache")       # 本地缓存（gitignore 内）
 MOON_POS_FILE  = os.path.join(MOON_CACHE_DIR, "positions.json")
-MOON_TTL    = int(os.environ.get("LN_MOON_TTL", "300"))    # 后台刷新间隔（秒）
+# 后台刷新间隔（秒）。设成 **5 秒**：进度是「读完一本书」这类需要即时反馈的状态，
+# 5 分钟一轮的话，用户在阅读器里读完了，网页要过几分钟才认。敢设这么短是因为刷新是
+# **增量**的 —— 每轮只做一次目录 stat（几十个文件约 7 ms），真有文件变了才读它
+# （见 moon.read_positions）；只有首次启动或缓存失效才是全量重读。
+# 想更保守/更激进用 LN_MOON_TTL 覆盖（单位秒）。
+MOON_TTL    = int(os.environ.get("LN_MOON_TTL", "5"))
 # 单卷「读完」阈值：用 >=99 而不是 ==100 —— Moon+ 的百分比是估算值，
 # 实测存在 99.4% / 97.9% 这类「读到底但没到 100」的情况。
 MOON_DONE_PERCENT = float(os.environ.get("LN_MOON_DONE", "99"))

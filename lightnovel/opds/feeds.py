@@ -713,21 +713,6 @@ MARK_JS = """
     if(!on && f.getAttribute("data-list") === "read"){ dropFromRead(card); }
   }
 
-  /* 详情页：按钮换成实心绿 + 阅读状态那一行同步（不重绘整页，分组的展开状态就不会被重置） */
-  function patchHero(f, on){
-    var b = f.querySelector("button");
-    if(b){
-      b.classList.toggle("ok", on);
-      b.classList.toggle("ghost", !on);
-      b.textContent = on ? GLYPH_ON + " 已读完（点击取消）" : "标记为已读完";
-    }
-    var st = document.getElementById("finstate");
-    if(st){
-      st.textContent = on ? FIN : "未读";
-      st.style.color = on ? "#1a7f37" : "";
-    }
-  }
-
   /* 只换 <main> 内容：不刷新页面（滚动位置、历史记录、分组展开都还在），
      顺序由服务端重新算 —— 前端不必知道「哪本书该排到第几位」。 */
   function softReload(){
@@ -746,8 +731,9 @@ MARK_JS = """
   document.addEventListener("submit", function(e){
     var f = e.target;
     if(!f || !f.classList || f.getAttribute("data-busy") === "1"){ return; }
+    /* 只有两种表单走 fetch：书卡上的标记（mkform）、列表页的清空提示（barupd）。
+       详情页那个标记按钮已经移除，所以不再有 "hero" 这一支。 */
     var kind = f.classList.contains("mkform") ? "card"
-             : f.classList.contains("mkbig")  ? "hero"
              : f.classList.contains("barupd") ? "bar" : "";
     if(!kind || !window.fetch || !window.FormData){ return; }   /* 不拦 → 原生提交兜底 */
     e.preventDefault();
@@ -764,8 +750,7 @@ MARK_JS = """
       f.removeAttribute("data-busy");
       try{
         if(kind === "bar"){ softReload(); return; }
-        if(kind === "card"){ patchCard(f, !!d.finished); }
-        else { patchHero(f, !!d.finished); }
+        patchCard(f, !!d.finished);
       }catch(err){
         /* 提交**已经成功**了，只是本地回写出错（某个锚点被改名之类）。
            这里绝不能走下面的 f.submit() —— 那会把刚写下的状态再翻回去（双提交）。
@@ -955,7 +940,7 @@ def _cover_url(rel):
     return "/cover/" + encode_path(rel)
 
 
-def _mark_form(key, back, finished, readlist=False):
+def _mark_form(key, back, finished, readlist=False, auto=False):
     """「标记 / 取消已读完」表单 —— 纯 HTML 表单 POST。
 
     刻意**不依赖 JS**：手机上 JS 被禁、阅读器内嵌浏览器兼容性参差时，原生提交照样能用，
@@ -967,7 +952,16 @@ def _mark_form(key, back, finished, readlist=False):
     ``readlist=True``：这张卡出现在「已读完」列表里 —— JS 取消标记后可以直接把卡拿掉
     （那份清单里出现「未读完」的书本身就是自相矛盾的）。目录页没有这个标记，
     因为那里的卡取消后必须留在原地。
+
+    ``auto=True``：这个「已读完」是**阅读器判定**出来的，不是人工标记 —— 只渲染一个
+    **不可点的实心勾**（无 ``<form>``、``disabled``）。不能做成可点按钮：那份状态既不在
+    ``finished.json`` 里、又没法从 UI 取消，点下去只会往人工清单加一条而**视觉毫无变化**
+    （自动判定仍在），下一个人就会以为按钮坏了。
     """
+    if auto:
+        tip = "阅读器已判定全部读完"
+        return (f'<button class="mk on" type="button" disabled title="{tip}"'
+                f' aria-label="{tip}">&#10003;</button>')
     on = " on" if finished else ""
     tip = "已读完，点击取消标记" if finished else "标记为已读完"
     glyph = "&#10003;" if finished else "&#9675;"
@@ -982,16 +976,20 @@ def _mark_form(key, back, finished, readlist=False):
 
 
 def _prog_pill(st):
-    """作品级进度 → ``(角标元组, 副标题片段)``；没有进度数据时两者都为空。"""
+    """作品级进度 → 封面**右下角**的角标数据 ``(百分比, 是否整部读完)``；无数据显示 ``None``。
+
+    **不往副标题里塞文字**：进度只由角标表达。多写一句「已读 9/9 卷」或
+    「已读 1/4 卷」都是重复 —— 前者恒等于副标题里已有的总卷数，后者与角标上那个
+    百分比说的是同一件事。副标题只留「分类 · N 卷」。
+    """
     if not st:
-        return None, ""
-    pct = int(round(st["percent"]))
-    return (pct, st["all"]), f'已读 {st["done"]}/{st["total"]} 卷'
+        return None
+    return (int(round(st["percent"])), st["all"])
 
 
 def _work_prog(vols, vis):
     """取某部作品的进度角标数据（``vis`` 为假时直接跳过，连算都不算）。"""
-    return _prog_pill(MOON.stat_of(vols)) if vis else (None, "")
+    return _prog_pill(MOON.stat_of(vols)) if vis else None
 
 
 def _vol_prog(rel, vis):
@@ -1033,17 +1031,18 @@ def _prog_fab(st):
 
 def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
                finished=False, fin_note="", upd=0, readlist=False, prog=None,
-               pnote=""):
+               auto_fin=False):
     """一张书卡。
 
     * ``key`` 非空（= 管理员视角）时封面左上角挂「标记已读完」按钮；
     * ``upd`` > 0 表示这本书有新卷：封面左下角压一条「有更新」、整卡描暖色边、
       副标题里点明新增几卷（角标只写数字，副标题给完整说法）；
     * ``prog`` = ``(百分比, 是否整部读完)`` → 封面**右下角**的进度角标（照 Moon+ 的做法）；
-      ``pnote`` 是副标题里的文字版（``已读 3/9 卷``）。
+    * ``auto_fin=True``：勾是**阅读器判定**出来的，不是人工标记（见 :func:`_mark_form`）。
     """
     badge_html = f'<span class="badge">{html.escape(badge)}</span>' if badge else ""
-    mark = _mark_form(key, back, finished, readlist=readlist) if key else ""
+    mark = (_mark_form(key, back, finished, readlist=readlist, auto=auto_fin)
+            if key else "")
     prog_html = ""
     if prog:
         pct, done = prog
@@ -1051,8 +1050,6 @@ def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
                      f' title="阅读进度 {pct}%">{pct}%</span>')
     sub_html = html.escape(sub) + (f' · <span class="fin">{html.escape(fin_note)}</span>'
                                   if fin_note else "")
-    if pnote:
-        sub_html += f' · <span class="pnt">{html.escape(pnote)}</span>'
     if upd:
         sub_html += f' · <span class="newt">有更新 +{upd} 卷</span>'
     upd_html = (f'<span class="upd">有更新 +{upd}</span>' if upd else "")
@@ -1385,15 +1382,20 @@ def catalog_html(cat, page=1, is_admin=False):
     vis = MOON.visible(is_admin)               # 进度角标对谁可见（默认所有人）
 
     def card_for(key, cat_, book_, vols_, back_, badge=False):
-        prog, pnote = _work_prog(vols_, vis)
+        prog = _work_prog(vols_, vis)
+        # 「已读完」有两种来源，两种都要在封面上勾上：人工标记，或阅读器把整部读完了。
+        # 只认人工标记的话，一本明明读完的书在目录页仍是空圈，而「已读完」页里却有它 ——
+        # 同一本书在两个页面上自相矛盾。
+        marked = key in fin
+        auto_fin = bool(prog and prog[1]) and not marked
         return _book_card("/opds/book/" + encode_path(key),
                           _primary_vol(vols_, cat_, book_)["rel"], book_,
                           f"{cat_} · {len(vols_)} 卷",
                           badge=(f"{len(vols_)} 卷" if badge else None),
                           key=key if is_admin else None, back=back_,
-                          finished=key in fin,
-                          fin_note="已读完" if key in fin else "",
-                          upd=upd_n(key), prog=prog, pnote=pnote)
+                          finished=marked or auto_fin, auto_fin=auto_fin,
+                          fin_note="已读完" if marked else "",
+                          upd=upd_n(key), prog=prog)
 
     if cat == "all":
         merged = {}
@@ -1483,16 +1485,8 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
     st = MOON.stat_of(vols) if vis else None
     pill = _prog_fab(st) if st else ""
 
-    # 标记按钮：管理员才有；已读时时样式换成实心绿并提示可取消
-    mark_btn = ""
-    if is_admin:
-        mark_btn = (
-            '<form class="mkbig" method="post" action="/opds/read/toggle">'
-            f'<input type="hidden" name="key" value="{html.escape(key, quote=True)}">'
-            f'<input type="hidden" name="back" value="/opds/book/{html.escape(encode_path(rel), quote=True)}">'
-            f'<button class="dl big{" ok" if finished else " ghost"}" type="submit">'
-            + ("&#10003; 已读完（点击取消）" if finished else "标记为已读完")
-            + "</button></form>")
+    # 详情页不再挂「标记为已读完」大按钮：标记在目录页每张书卡的封面左上角就能做
+    # （悬停出现圆圈，点一下即可），再来一个重复入口只会让页面更杂。
 
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span>'
@@ -1504,8 +1498,9 @@ def book_html(rel, page=1, is_admin=False):               # page 参数保留以
         f"<h1>{html.escape(book)}</h1>"
         + meta_lines + desc_html +
         '<div class="actions">'
-        f'<a class="dl big" href="{zip_url}">⬇ 打包下载全部（{len(vols)} 卷 · {human_size(total_size)}）</a>'
-        + mark_btn +
+        # 卷数与体积在上面的 meta 行已经写过（「卷数 18 · 体积 115.7 MB」），
+        # 按钮上再重复一遍没必要
+        f'<a class="dl big" href="{zip_url}">⬇ 打包下载全部</a>'
         "</div>"
         "</div></div>"
         + _upd_box(new_vols, cat, book, entry)
@@ -1709,10 +1704,12 @@ def read_html(page=1):
         if st is None:                      # 人工标记：带 ✓，可取消
             rows.append(_book_card(**card_kw, key=key, back=back,
                                    finished=True, fin_note="已读完", readlist=True))
-        else:                               # 仅阅读器判定：显示进度，无 ✓
+        else:
+            # 仅阅读器判定：只带进度角标。后缀那行「9/9 卷」去掉了 —— 入选条件本就是
+            # 「全部卷读完」，这个数字恒等于副标题里的总卷数，纯重复。也不给勾：这里
+            # 的状态是只读派生出来的，没有标记可取消（人工标记的那种卡才带可点的 ✓）。
             rows.append(_book_card(**card_kw,
-                                   prog=(int(round(st["percent"])), True),
-                                   pnote=f'{len(vols)}/{len(vols)} 卷'))
+                                   prog=(int(round(st["percent"])), True)))
     cards = "".join(rows)
 
     empty_html = ('<div class="empty">还没有已读完的作品。<br>'
@@ -1733,8 +1730,6 @@ def read_html(page=1):
         '<span class="spacer"></span>'
         f'<span class="sub" id="readcnt" style="margin:0">{total} 部作品</span>'
         "</div>"
-        f'<p class="sub">鼠标移上封面后，点左上角的 &#10003; 可取消标记。'
-        f'（本机状态，不同步到书库/仓库）</p>'
         + listing
         + _pager_html(page, _next_link(extra), _prev_link(extra))
     )

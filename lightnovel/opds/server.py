@@ -47,7 +47,10 @@ from .library import (
     get_cover,
     get_library,
     local_ip,
+    parse_range,
     resolve_under,
+    zip_plan,
+    zip_size,
 )
 from .finished import normalize_key, toggle_finished
 from . import moon
@@ -570,8 +573,13 @@ class OPDSHandler(BaseHTTPRequestHandler):
     def _serve_cover(self, enc_rel, head_only=False, max_w=None):
         blob, mime = get_cover(enc_rel, max_w)
         if not blob:
+            # 取不到封面时回一张 1×1 透明 PNG，而不是 404：<img> 报错会在控制台刷屏，
+            # 卡片也会塌成 alt 文本。
+            # **但绝不能被缓存**：原先写的是 public/max-age=86400，于是一次偶发的
+            # 取不到（服务正在重启、epub 被同步或杀毒临时占用）就会让浏览器把白图
+            # 钉住整整一天 —— 服务早就恢复了，页面却一直是灰块。失败响应不是结果。
             self._send(200, BLANK_PNG, "image/png",
-                       {"Cache-Control": "public, max-age=86400"}, head_only=head_only)
+                       {"Cache-Control": "no-store"}, head_only=head_only)
             return
         cache = {"Cache-Control": "public, max-age=604800",
                  "ETag": '"%s"' % hashlib.md5(blob).hexdigest()[:20]}
@@ -615,9 +623,33 @@ class OPDSHandler(BaseHTTPRequestHandler):
             self._notfound("没有可打包的卷")
             return
 
-        # 流式发送：无法预知总长度，用 Connection: close 结尾。
-        self.send_response(200)
+        pairs = zip_plan(vols, cat, book, subdir)
+        if not pairs:
+            self._notfound("没有可打包的卷")
+            return
+        # 先预演一遍拿到精确长度，再带着 Content-Length 发响应头。
+        # 下载端靠它才能显示「已下 4.4 MB / 共 130 MB」—— 没有它只能画一根不知道
+        # 尽头的进度条、写着「继续下载中…」（实测的症状）。预演与实际打包共用
+        # 同一个 zip_plan、同一套 zipfile 参数，长度必然一致。
+        total = zip_size(pairs)
+        # 断点续传。zip 的字节是**确定的**：同一批文件 + 同样的 mtime → 同样的字节，
+        # 顺序也由 zip_plan 固定，所以按偏移重发是安全的（两段拼起来必然等于整包，
+        # 有回归断言盯着这一点）。
+        rng = parse_range(self.headers.get("Range"), total)
+        if rng and rng[0] >= total:                      # 越界
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % total)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        start, end = rng if rng else (0, total - 1)
+        body_len = end - start + 1
+        self.send_response(206 if rng else 200)
         self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(body_len))
+        self.send_header("Accept-Ranges", "bytes")
+        if rng:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, total))
         self.send_header("Content-Disposition",
                          f"attachment; filename*=UTF-8''{quote(label + '.zip')}")
         self.send_header("Connection", "close")
@@ -626,21 +658,12 @@ class OPDSHandler(BaseHTTPRequestHandler):
         if head_only:
             return
         try:
-            sink = _ZipSink(self.wfile)
+            # skip/limit 让 sink 只写出 [start, end] 这一段。zip 仍**从头生成**、
+            # 前半段丢弃 —— 省下的是网络流量（断点续传要省的正是它），磁盘读取省不掉。
+            sink = _ZipSink(self.wfile, skip=start, limit=body_len)
             with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_STORED,
                                  allowZip64=True) as zf:
-                for v in vols:
-                    disk = resolve_under(LIGHT_NOVEL_DIR, v["rel"])
-                    if not disk or not os.path.isfile(disk):
-                        continue
-                    # 动态剥前缀：cat/ ( + book/ ) ( + subdir/ )
-                    arc = v["rel"]
-                    if arc.startswith(cat + "/"):
-                        arc = arc[len(cat) + 1:]
-                    if book and arc.startswith(book + "/"):
-                        arc = arc[len(book) + 1:]
-                    if subdir and arc.startswith(subdir + "/"):
-                        arc = arc[len(subdir) + 1:]
+                for disk, arc in pairs:
                     zf.write(disk, arcname=arc)
         except (BrokenPipeError, ConnectionResetError, OSError) as exc:
             log.warning("zip 打包中断 %s：%s", rel, exc)

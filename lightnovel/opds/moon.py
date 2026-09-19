@@ -13,8 +13,10 @@
 网络往返约 55 ms** —— 读 128 个 ``.po`` 要 6.7 秒。因此：
 
 * **请求路径上只读内存**，绝不现读网盘；刷新交给一个 daemon 线程（TTL 见
-  ``paths.MOON_TTL``），失败就沿用旧数据（网盘偶尔掉线不该拖垮书库）。
-* 解析结果同时落一份本地缓存，进程重启后第一次刷新是毫秒级。
+  ``paths.MOON_TTL``，默认 **5 秒**），失败就沿用旧数据（网盘偶尔掉线不该拖垮书库）。
+* 解析结果同时落一份本地缓存，进程重启后第一次刷新是毫秒级；**校验戳变化时只重读
+  变了的那几个文件**（增量，见 :func:`read_positions`）—— 这是刷新周期敢设到 5 秒的
+  前提：一轮刷新通常只花一次目录 stat（约 7 ms），而不是几秒的全量读。
 * 唯一缓存的东西是 ``rel → 百分比``；「每部作品读了几卷」这类聚合全部**现算**
   （纯字典运算，1659 卷也就亚毫秒），避免聚合结果跟着缓存一起变陈旧。
 
@@ -151,11 +153,21 @@ def parse_position(text):
 
 # ---------------------------------------------------------------- 读取位置
 
+# 本地缓存的格式版本。2 起多存一份 ``by_file``（文件名 → 卷标题）—— 增量重读要靠它
+# 定位「这个文件上一次产出的旧记录」；没有它的旧缓存全量重读一次即自动升级。
+_CACHE_VERSION = 2
+
+
 def read_positions(root=None, cache_file=None, use_cache=True):
     """读 ``<root>/Cache/*.po`` → ``({卷标题: 位置信息}, meta)``。
 
     带本地缓存：缓存里存 ``{文件名: [mtime, size]}`` 当校验戳，一致就直接返回
-    （网络盘 128 次 stat 约 25 ms，而重读要 6.7 s）。
+    （网络盘几十次 stat 约 7 ms，而全量重读要数秒）。
+
+    **校验戳不一致时只重读变化的那几个文件**（增量）：网盘上每个小文件一次往返
+    约 55 ms，几十个全读要数秒；而实际变化通常只有一两个（阅读器正读到的那本）。
+    实测把一次刷新从 7.3 s 压到零点几秒 —— 刷新周期才敢设到 5 秒
+    （``paths.MOON_TTL``），否则短周期会让后台线程几乎一直泡在网盘读里。
     """
     root = root or MOON_ROOT
     cache_file = cache_file or MOON_POS_FILE
@@ -169,24 +181,46 @@ def read_positions(root=None, cache_file=None, use_cache=True):
     for n in names:
         try:
             st = os.stat(os.path.join(cache_dir, n))
-            stamp[n] = [int(st.st_mtime), st.st_size]
+            # mtime 取**亚秒**精度（不取 int）：阅读器更新进度时常常把同一个文件
+            # 改写成等长的内容（``...:2.6%`` → ``...:60.0%`` 长度就可能一样），
+            # 秒级精度 + 同 size 会让校验戳看不出变化，进度永远刷不出来。
+            stamp[n] = [st.st_mtime, st.st_size]
         except OSError:
             stamp[n] = None
 
+    cached = {}
     if use_cache and os.path.isfile(cache_file):
         try:
             with open(cache_file, encoding="utf-8") as fh:
                 cached = json.load(fh)
-            if cached.get("stamp") == stamp and isinstance(cached.get("positions"), dict):
-                return cached["positions"], {"from_cache": True, "elapsed_ms": 0.0}
         except (OSError, ValueError):
             pass          # 缓存坏了就当没有，重读一遍即可
+    if not isinstance(cached, dict):
+        cached = {}
+
+    prev_stamp = cached.get("stamp")
+    prev_by = cached.get("by_file")
+    prev_pos = cached.get("positions")
+    reusable = (isinstance(prev_stamp, dict) and isinstance(prev_by, dict)
+                and isinstance(prev_pos, dict))
+
+    if reusable and prev_stamp == stamp:
+        return prev_pos, {"from_cache": True, "elapsed_ms": 0.0, "changed": 0}
 
     t0 = time.perf_counter()
-    positions = {}
-    for n in names:
+    if reusable:
+        positions, by_file = dict(prev_pos), dict(prev_by)
+        todo = [n for n in names if stamp.get(n) != prev_stamp.get(n)]
+        for n in [k for k in by_file if k not in stamp]:     # 网盘上已被删掉的
+            positions.pop(by_file.pop(n), None)
+    else:
+        positions, by_file, todo = {}, {}, list(names)
+
+    for n in todo:
         if not n.lower().endswith(".po"):
             continue
+        # 同一文件内容变了：先摘掉它的旧记录，免得同一卷留下两条（标题也可能变）
+        positions.pop(by_file.pop(n, None), None)
         try:
             with open(os.path.join(cache_dir, n), "rb") as fh:
                 text = fh.read().decode("utf-8", "replace")
@@ -196,20 +230,25 @@ def read_positions(root=None, cache_file=None, use_cache=True):
         if pos is None:
             continue
         # 文件名 = <卷标题>.<ext>.po → 键取「卷标题」
+        title = os.path.splitext(os.path.splitext(n)[0])[0]
         pos["ext"] = os.path.splitext(os.path.splitext(n)[0])[1].lower()
-        positions[os.path.splitext(os.path.splitext(n)[0])[0]] = pos
+        positions[title] = pos
+        by_file[n] = title
     elapsed = (time.perf_counter() - t0) * 1000
 
     try:
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
         tmp = cache_file + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"stamp": stamp, "positions": positions}, fh, ensure_ascii=False)
+            json.dump({"version": _CACHE_VERSION, "stamp": stamp,
+                       "by_file": by_file, "positions": positions},
+                      fh, ensure_ascii=False)
         os.replace(tmp, cache_file)          # 原子替换：半个文件也不会被读走
     except OSError:
         pass
 
-    return positions, {"from_cache": False, "elapsed_ms": elapsed}
+    return positions, {"from_cache": False, "elapsed_ms": elapsed,
+                       "changed": len(todo)}
 
 
 def join_library(positions, lib=None):
@@ -298,15 +337,25 @@ def _reload():
 
 
 def _loop():
+    last = None
     while True:
         try:
             _reload()
             snap = snapshot()
-            if snap["ok"]:
-                log.info("Moon+ 进度已刷新：%d 条位置记录，关联书库 %d 卷"
-                         "（未关联 %d，歧义 %d，耗时 %.0f ms）",
-                         snap["po_files"], snap["rel_entries"],
-                         snap["unmatched"], snap["ambiguous"], snap["elapsed_ms"])
+            # 刷新周期只有几秒，每次都打日志会把日志刷满 —— 只在**结果真的变了**
+            # （或从正常掉进读不到）时记一条。elapsed_ms 不参与比较，它是耗时不是状态。
+            sig = (snap["ok"], snap["po_files"], snap["rel_entries"],
+                   snap["unmatched"], snap["ambiguous"])
+            if sig != last:
+                last = sig
+                if snap["ok"]:
+                    log.info("Moon+ 进度已刷新：%d 条位置记录，关联书库 %d 卷"
+                             "（未关联 %d，歧义 %d，耗时 %.0f ms）",
+                             snap["po_files"], snap["rel_entries"],
+                             snap["unmatched"], snap["ambiguous"], snap["elapsed_ms"])
+                else:
+                    log.warning("Moon+ 进度读取失败：%s（沿用上一次的数据）",
+                                snap["error"] or "未知原因")
         except Exception:                        # 后台线程绝不能把主服务带下去
             log.exception("Moon+ 进度刷新失败（沿用上一次的数据）")
         _worker["wake"].wait(MOON_TTL)
@@ -358,6 +407,12 @@ def stat_of(vols):
     返回 ``{"total","done","seen","percent","all"}``：
     ``done`` = 百分比 >= 阈值的卷数，``seen`` = 有记录的卷数，
     ``percent`` = 全部卷的平均（缺记录的卷按 0 计），``all`` = 整部读完。
+
+    ``all`` 的口径是**作品下每一卷都读完**，番外与不同版本同样计入（例如「书名
+    01..12」+「书名 Ver.β 01..03」要 15 卷全读完）。这是刻意的：它决定「已读完」
+    的入库资格，而清单页那张卡的副标题写的就是这本书的总卷数 —— 放宽成「正篇读完
+    就入库」会让卡片一边写着 15 卷、一边显示 12/12 卷，自己跟自己矛盾。真读完了
+    别版自然会入库，没读就别占着「已读完」这个名分。
     """
     if not enabled() or not vols:
         return None

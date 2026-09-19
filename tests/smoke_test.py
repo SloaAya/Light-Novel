@@ -395,8 +395,11 @@ _CACHE_COVER = raw_header_all("/cover/" + O.encode_path(REL), "Cache-Control")
 check("封面只发一个 Cache-Control 且带 max-age",
       lambda: (len(_CACHE_COVER) == 1 and "max-age" in _CACHE_COVER[0], "Cache-Control=%s" % _CACHE_COVER))
 _CACHE_BLANK = raw_header_all("/cover/__no_such_file__.epub", "Cache-Control")
-check("无封面占位图同样只发一个 Cache-Control",
-      lambda: (len(_CACHE_BLANK) == 1 and "max-age" in _CACHE_BLANK[0], "Cache-Control=%s" % _CACHE_BLANK))
+# 占位图必须 **no-store**：它是「这次没取到」的表达，不是一个结果。原先写成
+# public/max-age=86400，于是一次偶发失败（服务正重启、epub 被同步或杀毒占用）
+# 会让浏览器把白图钉住一整天，服务恢复了页面还是灰块。
+check("无封面占位图只发一个 Cache-Control 且明确不缓存",
+      lambda: (len(_CACHE_BLANK) == 1 and "no-store" in _CACHE_BLANK[0], "Cache-Control=%s" % _CACHE_BLANK))
 _CACHE_HTML = raw_header_all("/", "Cache-Control")
 check("HTML 页仍保持 no-cache（未过度放宽）",
       lambda: (len(_CACHE_HTML) == 1 and "no-cache" in _CACHE_HTML[0], "Cache-Control=%s" % _CACHE_HTML))
@@ -428,6 +431,40 @@ check("GET /zip 流式打包可解压且卷数一致",
 check("ZIP 响应头正确",
       lambda: (_h.get("Content-Type") == "application/zip" and "attachment" in (_h.get("Content-Disposition") or ""),
                "%s | %s" % (_h.get("Content-Type"), _h.get("Content-Disposition"))))
+# 有 Content-Length，下载端才能显示「已下 4.4 MB / 共 130 MB」而不是一根不知道
+# 尽头的进度条（手机浏览器实测：缺它时只写「继续下载中…」）。断言「声明的长度
+# 与实际发出的字节数一致」—— 预演与实际打包必须走同一套路径，差一字节就是断流。
+check("ZIP 响应带 Content-Length 且与实际字节数一致（否则下载端没有进度可比）",
+      lambda: (_h.get("Content-Length") == str(len(_b)),
+               "Content-Length=%s 实际=%d" % (_h.get("Content-Length"), len(_b))))
+# 断点续传：zip 的字节是确定的（同文件 + 同 mtime → 同字节），所以按偏移重发安全。
+# 用「前段 + 后段拼接 == 整包」来验 —— 这比只看状态码强得多：它同时证明了 ① Range
+# 被正确切分、② 两次生成的 zip 逐字节一致（否则拼出来的包根本解不开）。
+# 注意必须在 `_b` 被下面 404 用例覆盖**之前**取基准，所以这段排在这里。
+_zlen = len(_b)
+_half = _zlen // 2
+_s2, _h2, _b2 = http("/zip/" + O.encode_path(BOOK_REL),
+                     headers={"Range": "bytes=%d-" % _half})
+_s3, _h3, _b3 = http("/zip/" + O.encode_path(BOOK_REL),
+                     headers={"Range": "bytes=0-%d" % (_half - 1)})
+check("GET /zip Range -> 206 + Content-Range + Accept-Ranges，且两段拼接等于整包",
+      lambda: (_s2 == 206 and _h2.get("Accept-Ranges") == "bytes"
+               and (_h2.get("Content-Range") or "").startswith("bytes %d-" % _half)
+               and _h2.get("Content-Length") == str(_zlen - _half)
+               and _b3 + _b2 == _b,
+               "status=%s cr=%s len=%s 拼接一致=%s"
+               % (_s2, _h2.get("Content-Range"), _h2.get("Content-Length"),
+                  _b3 + _b2 == _b)))
+_s4, _h4, _b4 = http("/zip/" + O.encode_path(BOOK_REL),
+                     headers={"Range": "bytes=%d-" % (_zlen + 10)})
+check("GET /zip 越界 Range -> 416 + Content-Range: bytes */总长",
+      lambda: (_s4 == 416 and (_h4.get("Content-Range") or "").endswith("*/%d" % _zlen),
+               "status=%s cr=%s" % (_s4, _h4.get("Content-Range"))))
+_s5, _h5, _b5 = http("/zip/" + O.encode_path(BOOK_REL),
+                     headers={"Range": "bytes=0-9,20-29"})
+check("GET /zip 多段 Range -> 忽略并整包重发 200（RFC 允许）",
+      lambda: (_s5 == 200 and _b5 == _b, "status=%s len=%d" % (_s5, len(_b5))))
+
 _s, _h, _b = http("/zip/" + O.encode_path("%s/%s/__no_such_subdir__" % (CAT, BOOK)))
 check("GET /zip 空子目录 -> 404", lambda: (_s == 404, "status=%s" % _s))
 
@@ -943,8 +980,8 @@ section("O. 本轮两个缺陷的修复确认与边界说明")
 check("缺陷① 已修：同名响应头不再重复（封面单值 + max-age）",
       lambda: (len(_CACHE_COVER) == 1 and "max-age" in _CACHE_COVER[0],
                "封面 %s / 占位图 %s / HTML %s" % (_CACHE_COVER, _CACHE_BLANK, _CACHE_HTML)))
-check("缺陷① 未误伤：HTML 仍 no-cache、占位图仍长缓存",
-      lambda: ("no-cache" in _CACHE_HTML[0] and "max-age" in _CACHE_BLANK[0], ""))
+check("缺陷① 未误伤：HTML 仍 no-cache；占位图改为不缓存（失败响应不再被钉住）",
+      lambda: ("no-cache" in _CACHE_HTML[0] and "no-store" in _CACHE_BLANK[0], ""))
 check("缺陷② 已修：acquire_lock() 改为只读探测且不会终止目标进程",
       lambda: (S._pid_alive(os.getpid()) is True and S._pid_alive(_dead.pid) is False,
                "实测活进程=True / 已退出进程=False，全程无进程被终止"))
@@ -1818,8 +1855,11 @@ _rcheck("已读完列表带 data-total / readcnt / 空态模板（计数不被�
 
 
 def _mk_hero_ids():
-    """详情页的两个「原地改点」：状态行 id=finstate、按钮表单 class=mkbig。
-    访客页面两者都没有（那两段 HTML 本来就只在管理员分支里拼）。"""
+    """详情页只留「阅读状态」这一行；**不再**有 ``class=mkbig`` 的标记按钮。
+
+    标记这件事在目录页每张书卡的封面左上角就能做（悬停出现圆圈），详情页再来一个
+    大按钮是重复入口。这里同时断言它**不再出现**，免得哪天又被加回来。
+    """
     _reset_fin(_rp)
     lib = LIB.get_library(force=True)
     cat = "已完结" if "已完结" in lib else list(lib)[0]
@@ -1830,12 +1870,12 @@ def _mk_hero_ids():
     off = FEED.book_html(rel, 1, is_admin=False)
     _reset_fin(_rp)
     return ('<b id="finstate" style="color:#1a7f37">已读完</b>' in on
-            and 'class="mkbig"' in on
+            and "mkbig" not in on
             and "finstate" not in off and "mkbig" not in off,
-            "管理员详情页两个锚点齐全，访客页面都没有")
+            "管理员详情页有状态行、无标记按钮；访客页面两者都没有")
 
 
-_rcheck("详情页锚点：状态行 id=finstate + 按钮 form.mkbig（访客无）", _mk_hero_ids)
+_rcheck("详情页锚点：状态行 id=finstate（无标记按钮；访客两者都无）", _mk_hero_ids)
 
 
 def _mk_untouched():
@@ -1965,8 +2005,8 @@ if _r_lib_ok:
           lambda: (_st2 == 200 and _r_book in _b2 and '"/opds/read/toggle"' in _b2,
                    "status=%s" % _st2))
     _st3, _b3, _ = _http(_r_port, "/opds/book/" + _r_q)
-    check("HTTP 管理员详情页 → 显示「已读完」状态与取消按钮",
-          lambda: (_st3 == 200 and "阅读状态" in _b3 and "已读完（点击取消）" in _b3,
+    check("HTTP 管理员详情页 → 有「阅读状态」、无标记按钮（标记在目录页做）",
+          lambda: (_st3 == 200 and "阅读状态" in _b3 and "已读完（点击取消）" not in _b3,
                    "status=%s" % _st3))
     _cst, _, _ = _http(_r_port, "/opds/read/toggle", method="POST", body=_r_form,
                        headers={"Origin": "https://evil.example.com"})
@@ -3022,6 +3062,37 @@ def _u_read_invalidate():
 _ucheck("读取位置：缓存校验戳（mtime+大小）不一致时重读", _u_read_invalidate)
 
 
+def _u_read_incremental():
+    """增量重读：改一个 .po 只重读那一个，被删掉的文件其记录跟着消失。
+
+    这是刷新周期能设到 5 秒的前提 —— 全量重读要数秒，周期一小就等于让后台线程
+    一直泡在网盘读里；增量之后一轮通常只花一次目录 stat（约 7 ms）。
+    """
+    _u_isolate()
+    root = MOON.MOON_ROOT
+    for i in (1, 2, 3):
+        _u_write_po(root, "书A 0%d.epub.po" % i, "1779019601627*3@0#1:10.0%")
+    p1, m1 = MOON.read_positions()
+    _p2, m2 = MOON.read_positions()
+    ok_full = (len(p1) == 3 and m1["from_cache"] is False
+               and m1.get("changed") == 3 and m2["from_cache"] is True)
+    # 只改一个。内容故意写成**不等长**：那样即使文件系统只给秒级 mtime，
+    # 校验戳也一定看得出变化（等长内容 + 同秒 mtime 是测不出来的假通过）
+    _u_write_po(root, "书A 02.epub.po", "1779019601627*3@0#123456:80.0%")
+    p3, m3 = MOON.read_positions()
+    ok_inc = (m3["from_cache"] is False and m3.get("changed") == 1
+              and p3["书A 02"]["percent"] == 80.0
+              and p3["书A 01"]["percent"] == 10.0)                        # 其余沿用
+    os.remove(os.path.join(root, "Cache", "书A 03.epub.po"))              # 删一个
+    p4, _m4 = MOON.read_positions()
+    ok_del = set(p4) == {"书A 01", "书A 02"}
+    return (ok_full and ok_inc and ok_del,
+            "首次全量 3 个 → 命中缓存 → 改 1 个只重读 1 个 → 删文件记录同步消失")
+
+
+_ucheck("读取位置：增量重读（改一个只读一个，删文件同步摘记录）", _u_read_incremental)
+
+
 def _u_read_missing():
     _u_isolate()
     MOON.MOON_ROOT = os.path.join(_U_TMP, "根本不存在")
@@ -3112,6 +3183,62 @@ def _u_auto():
 
 
 _ucheck("自动判定：只有整部读完的作品入选（读一半的不能算）", _u_auto)
+
+
+def _u_every_volume_required():
+    """入库口径：**每一卷**读完才算，番外/别版同样计入。
+
+    这是刻意收紧的：清单页那张卡的副标题写的是这本书的总卷数，若「正篇读完」就
+    入库，卡片会一边写 15 卷、一边显示 12/12 卷，自己跟自己矛盾。
+    """
+    _u_isolate()
+    vols = [_s_vol("已完结/书D/01.epub", 1), _s_vol("已完结/书D/02.epub", 1),
+            _s_vol("已完结/书D/Ver.β 01.epub", 1)]
+    for v in vols:
+        v["title"] = v["rel"].rsplit("/", 1)[-1][:-5]
+    MOON._swap({"已完结/书D/01.epub": 100.0, "已完结/书D/02.epub": 100.0})
+    st = MOON.stat_of(vols)
+    ok_part = (st["all"] is False and st["done"] == 2 and st["total"] == 3
+               and MOON.auto_finished({"已完结": {"书D": vols}}) == {})
+    MOON._swap({"已完结/书D/01.epub": 100.0, "已完结/书D/02.epub": 100.0,
+                "已完结/书D/Ver.β 01.epub": 100.0})
+    ok_all = MOON.stat_of(vols)["all"] is True
+    return (ok_part and ok_all,
+            "3 卷里正篇 2 卷读完、别版没读 → 不入库；3 卷全读完 → 才入库")
+
+
+_ucheck("入库口径：每一卷都读完才进「已读完」（别版没读则不入库）", _u_every_volume_required)
+
+
+def _u_card_mark_auto():
+    """目录页：阅读器判定读完的书也要勾上，且不再缀「已读 x/y 卷」。
+
+    同一本书若在「已读完」页里有、在目录页却是空圈，两个页面就自相矛盾。
+    但那个勾必须是**不可点**的：它既不在 ``finished.json`` 里、也无法从 UI 取消，
+    做成按钮的话点下去只会往人工清单加一条而视觉毫无变化（自动判定仍在）。
+    """
+    _u_isolate()
+    lib = LIB.get_library(force=True)
+    pick = next(((c, b, v) for c in ("已完结", "未完结")
+                 for b, v in sorted(lib.get(c, {}).items()) if len(v) >= 2), None)
+    if not pick:
+        return True, "跳过（书库里没有 ≥2 卷的作品）"
+    cat, book, vols = pick
+    MOON._swap({v["rel"]: 100.0 for v in vols})                  # 整部读完
+    full = FEED.catalog_html(cat, 1, is_admin=True)
+    ok_done = ('class="mk on" type="button" disabled' in full
+               and "阅读器已判定全部读完" in full
+               and f'已读 {len(vols)}/{len(vols)} 卷' not in full)
+    MOON._swap({vols[0]["rel"]: 50.0})                           # 只读了一半
+    half = FEED.catalog_html(cat, 1, is_admin=True)
+    ok_half = ("阅读器已判定全部读完" not in half
+               and 'class="pnt"' not in half)
+    return (ok_done and ok_half,
+            "全读完 → 实心勾；读一半 → 空圈；两种情况副标题都不再写「已读 x/y 卷」")
+
+
+_ucheck("目录页书卡：阅读器判定读完自动勾上（不可点），并去掉重复的卷数文字",
+        _u_card_mark_auto)
 
 
 def _u_disabled_off():
@@ -3206,17 +3333,23 @@ _uhcheck("HTTP 分类页：封面右下角出现进度角标（百分比 + title
 
 
 def _u_card_badge_done():
+    """整部读完 → 角标变绿（pdone），且副标题**不再**重复写「已读 N/N 卷」。
+
+    那个数字恒等于副标题里已有的总卷数（「已完结 · 9 卷 · 已读 9/9 卷」），
+    右下角的绿色 100% 角标也已表达同一件事。只有没读完时这句才值得留。
+    """
     _u_isolate()
     lib = LIB.get_library()
     cat, book = "已完结", sorted(lib.get("已完结", {}))[0]
+    n = len(lib[cat][book])
     MOON._swap({v["rel"]: 100.0 for v in lib[cat][book]})
     st, body = _u_http("/opds/catalog/" + quote(cat), headers=_U_ADMIN)
     return (st == 200 and 'class="prog pdone"' in body
-            and f'已读 {len(lib[cat][book])}/{len(lib[cat][book])} 卷' in body,
-            "整部读完 → 角标加 pdone 类、副标题写「已读 N/N 卷」")
+            and f'已读 {n}/{n} 卷' not in body,
+            "整部读完 → 角标加 pdone 类，且不再重复写「已读 N/N 卷」")
 
 
-_uhcheck("HTTP 分类页：整部读完时角标变绿色（pdone）且副标题标出卷数", _u_card_badge_done)
+_uhcheck("HTTP 分类页：整部读完 → 角标变绿色，且不重复标注卷数", _u_card_badge_done)
 
 
 def _u_badge_vs_updbar():
