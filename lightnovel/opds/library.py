@@ -273,14 +273,47 @@ def _sniff_mime(blob):
     return "image/jpeg"
 
 
-def get_cover(rel):
-    """提取 epub 封面 -> (bytes, mime)；无封面返回 (None, None)。内存 + 磁盘缓存。"""
+def _shrink(blob, mime, max_w):
+    """把封面等比缩到 max_w 宽、转渐进式 JPEG。
+
+    Pillow 不可用或任何异常时**原样返回** —— 本项目运行时零第三方依赖，
+    压缩只是可选增强，绝不能因为缺 Pillow 就让封面挂掉。
+    """
+    if not max_w or not blob:
+        return blob, mime
+    try:
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(blob))
+        w, h = im.size
+        if not w or w <= max_w:          # 已经够小，别动
+            return blob, mime
+        im = im.convert("RGB")
+        im = im.resize((max_w, max(1, round(h * max_w / w))), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=82, optimize=True, progressive=True)
+        out = buf.getvalue()
+        if out and len(out) < len(blob):
+            return out, "image/jpeg"
+        return blob, mime
+    except Exception:
+        return blob, mime                # 降级：用原图
+
+
+def get_cover(rel, max_w=None):
+    """提取 epub 封面 -> (bytes, mime)；无封面返回 (None, None)。内存 + 磁盘缓存。
+
+    max_w：给定时，若封面比它宽就等比压缩（移动端首屏性能的关键）。
+    需要 Pillow；未安装时自动跳过压缩、照常返回原图。
+    """
     path = resolve_under(LIGHT_NOVEL_DIR, rel)
     if not path or not os.path.isfile(path):
         return None, None
     try:
         st = os.stat(path)
-        key = hashlib.md5(f"{rel}|{st.st_size}|{int(st.st_mtime)}".encode("utf-8")).hexdigest()
+        base = f"{rel}|{st.st_size}|{int(st.st_mtime)}"
+        # 不带 max_w 时沿用旧 key 格式，让已缓存的原图继续命中
+        key = hashlib.md5((base if not max_w else base + "|w%d" % max_w).encode("utf-8")).hexdigest()
     except OSError:
         return None, None
 
@@ -365,6 +398,7 @@ def get_cover(rel):
         return None, None
 
     if blob:
+        blob, mime = _shrink(blob, mime, max_w)
         try:
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
             tmp = cache_file + ".tmp"

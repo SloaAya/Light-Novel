@@ -130,7 +130,7 @@ def feed_root(is_admin=False):
     entries.append(nav_entry("urn:ln:recent", "最近更新", "/opds/recent", f"最近改动的 {RECENT_SIZE} 卷"))
     entries.append(nav_entry("urn:ln:all", "全部作品", "/opds/catalog/all", f"{n_books} 部作品 · {n_vols} 卷"))
     if is_admin:
-        n_fin = len(_finished_books())
+        n_fin = len(_finished_all())          # 与网页同一口径（人工 ∪ 阅读器判定）
         entries.append(nav_entry("urn:ln:read", "已读完", "/opds/read", f"已读完的 {n_fin} 部作品"))
     return _feed("urn:ln:root", SERVER_TITLE, entries, "/")
 
@@ -151,14 +151,43 @@ def _finished_books():
     return out
 
 
-def feed_finished(page=1):
-    """「已读完」导航型 feed：每条指向一部作品的详情 feed（管理员专有）。"""
+def _finished_all():
+    """「已读完」全量清单：人工标记 ∪ 阅读器自动判定，一部作品只出现一次。
+
+    为什么必须合并：``finished.json`` 可能是空的，而手机阅读器早就把整部书读完了。
+    首页那张卡若只数人工清单，就会写着「0 部作品」，点进去却是满满一屏 —— 卡片与
+    清单页自相矛盾。所以 **首页计数、清单页、OPDS feed 共用这一个口径**。
+
+    返回 ``[(key, 分类, 书名, [卷…], 统计或 None)]``；``None`` = 人工标记（可取消），
+    非 ``None`` 是阅读器判定（``moon.stat_of`` 的结果，带 percent 等字段）。
+    """
     items = _finished_books()
+    merged = [(key, cat, book, vols, None) for key, cat, book, vols in items]
+    auto = MOON.auto_finished() if MOON.enabled() else {}
+    if auto:
+        manual = {key for key, _c, _b, _v in items}
+        lib = get_library()
+        for key, st in sorted(auto.items()):
+            if key in manual:
+                continue
+            cat, book = key.split("/", 1)
+            vols = lib.get(cat, {}).get(book)
+            if vols:
+                merged.append((key, cat, book, vols, st))
+    return merged
+
+
+def feed_finished(page=1):
+    """「已读完」导航型 feed：每条指向一部作品的详情 feed（管理员专有）。
+
+    清单口径与网页一致：人工标记 ∪ 阅读器自动判定。
+    """
+    items = _finished_all()
     chunk, extra = _paginate(items, page, "/opds/read?page=1")
     body = "".join(
         nav_entry("urn:ln:book:" + quote(key), book, "/opds/book/" + encode_path(key),
                   f"{cat} · {len(vols)} 卷 · 已读完")
-        for key, cat, book, vols in chunk)
+        for key, cat, book, vols, _st in chunk)
     return _feed("urn:ln:read", f"{SERVER_TITLE} · 已读完", [],
                  "/opds/read?page=" + str(page), OPDS_NAV_TYPE, extra + body)
 
@@ -356,8 +385,10 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
 .card .ph img{width:100%;height:100%;object-fit:cover}
 .card .ph .badge{position:absolute;right:6px;top:6px;padding:2px 8px;border-radius:20px;
   background:rgba(15,20,26,.72);color:#fff;font-size:10px;font-weight:500;backdrop-filter:blur(6px)}
+/* 3 行而不是 2 行：本库最长书名 28 字，2 行（约 23 字）会把「想要确定真命天女之前，
+   可以先拿我试试哦。」这类书名截成半截。 */
 .card .t{margin-top:9px;font-size:13px;font-weight:500;line-height:1.35;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .card .s{margin-top:3px;font-size:11px;color:var(--muted)}
 .card .s .fin{color:#1a7f37;font-weight:500}
 .card .s .newt{color:var(--new);font-weight:500}
@@ -391,9 +422,10 @@ h2 .n{font-size:12px;font-weight:400;color:var(--muted);margin-left:2px}
   border:1px solid rgba(255,255,255,.55);background:rgba(15,20,26,.55);color:#fff;
   backdrop-filter:blur(6px);opacity:0;pointer-events:none;
   transition:opacity .14s ease,background .12s,transform .12s,border-color .12s}
-/* 显形条件合成一条规则：悬停整张卡 / 卡内有焦点（Tab 进来、或手点过）/ 按钮自身聚焦。
-   三者写在一起，是为了避免「几处各写一遍 → 某个出口忘了收回」造成圆圈残留。 */
-.card:hover .mk,.card:focus-within .mk,.mk:focus-visible{opacity:1;pointer-events:auto}
+/* 只在**鼠标悬停整张卡**、或**按钮自身被键盘聚焦**时显形。
+   刻意**不用** `.card:focus-within`：点卡片链接进详情页后按返回，浏览器会恢复那个链接
+   的焦点，`:focus-within` 会一直成立 → 圆圈在没悬停时常驻不散。 */
+.card:hover .mk,.mk:focus-visible{opacity:1;pointer-events:auto}
 .mk:hover{transform:scale(1.08);background:rgba(15,20,26,.75)}
 .mk.on{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
 .mk.on:hover{background:var(--accent2)}
@@ -527,7 +559,7 @@ footer{margin-top:48px;padding:24px 16px;text-align:center;color:var(--muted);fo
   .tab.on::after{display:none}
   /* 内容区 */
   .grid{grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:14px 10px}
-  .card .t{font-size:12px;line-height:1.3;-webkit-line-clamp:2}
+  .card .t{font-size:12px;line-height:1.3;-webkit-line-clamp:3}
   .card .ph .badge{font-size:10px;padding:2px 7px}
   .card .ph .upd{font-size:9px;padding:3px 6px 2px}
   .updbox{padding:12px 13px;margin-bottom:16px}
@@ -698,7 +730,8 @@ MARK_JS = """
      顺序由服务端重新算 —— 前端不必知道「哪本书该排到第几位」。 */
   function softReload(){
     if(!window.fetch){ location.reload(); return; }
-    fetch(location.href, {credentials: "same-origin", headers: {"Accept": "text/html"}})
+    fetch(location.href, {credentials: "same-origin", cache: "no-store",
+                          headers: {"Accept": "text/html"}})
       .then(function(r){ return r.text(); })
       .then(function(h){
         var src = new DOMParser().parseFromString(h, "text/html").querySelector("main");
@@ -744,6 +777,41 @@ MARK_JS = """
       f.submit();                          /* 只有「请求没到服务端」时重提交才是安全的 */
     });
   });
+
+  /* 首页那张卡的计数是服务端渲染的，两种情况下会停在旧值：
+     ① 从详情页标记完按「后退」回来 —— 浏览器直接用 bfcache 里的页面，不发新请求；
+     ② 页面一直开着，手机阅读器那边又读完一卷（服务端每 5 分钟才重算一次）。
+     所以在这三个时机各拉一次当前页，只把计数本身换掉：不重画 DOM，轮播动画、
+     滚动位置、分组展开状态都不受影响。页面上没有 #fincnt（列表页 / 详情页 / 访客
+     页面）时直接跳过，一个请求都不发。 */
+  function refreshFinCount(){
+    var cur = document.getElementById("fincnt");
+    if(!cur || !window.fetch){ return; }
+    /* cache:"no-store" 不能省：浏览器对「后退」导航会直接复用缓存里的 HTML
+       （实测 headed Edge：后退回来 #fincnt 还是旧值，而服务端已经是新值），
+       fetch 不给 no-store 也可能命中同一份缓存。 */
+    fetch(location.href, {credentials: "same-origin", cache: "no-store",
+                          headers: {"Accept": "text/html"}})
+      .then(function(r){ return r.text(); })
+      .then(function(h){
+        var src = new DOMParser().parseFromString(h, "text/html").getElementById("fincnt");
+        if(src){ cur.textContent = src.textContent; }
+      })
+      .catch(function(){});
+  }
+  /* 两种「看到的可能是旧页面」的进入方式都要刷新：
+     bfcache 恢复（persisted=true）、以及后退/前进导航（此时文档是新的，但内容来自
+     缓存，persisted 是 false）—— 后者正是「从详情页标记完按后退回首页」的场景。 */
+  window.addEventListener("pageshow", function(e){
+    var nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
+    if(e.persisted || (nav && nav.type === "back_forward")){ refreshFinCount(); }
+  });
+  document.addEventListener("visibilitychange", function(){
+    if(document.visibilityState === "visible"){ refreshFinCount(); }
+  });
+  setInterval(function(){
+    if(document.visibilityState === "visible"){ refreshFinCount(); }
+  }, 60000);
 })();
 """
 
@@ -989,7 +1057,7 @@ def _book_card(href, cover_rel, title, sub, badge=None, key=None, back="",
     return (
         '<div class="card%s">' % (" upd" if upd else "")
         + f'<a class="cardlink" href="{href}">'
-        f'<div class="ph"><img src="{_cover_url(cover_rel)}" alt="" loading="lazy">'
+        f'<div class="ph"><img src="{_cover_url(cover_rel)}" alt="" loading="lazy" decoding="async">'
         f"{badge_html}{upd_html}{prog_html}</div>"
         f'<div class="t">{html.escape(title)}</div>'
         f'<div class="s">{sub_html}</div></a>'
@@ -1056,52 +1124,219 @@ def _pager_html(page, nxt, prv):
     return f'<div class="pager">{prv_html}<span class="cur">第 {page} 页</span>{nxt_html}</div>'
 
 
+# ================= 二次元首页专用样式 =================
+# 只给首页下发（root_html 经 extra_css 注入），不影响其它页面。
+ANIME_HOME_CSS = """
+.an-hero{position:relative;overflow:hidden;border-radius:22px;padding:32px 30px 24px;
+  background:linear-gradient(135deg,#ffd3e6 0%,#e3c8ff 42%,#bfe0ff 100%);
+  border:1px solid rgba(255,255,255,.65);box-shadow:0 14px 40px rgba(190,140,255,.35);margin-bottom:30px}
+.an-hero::before,.an-hero::after{content:"";position:absolute;border-radius:50%;pointer-events:none;filter:blur(42px)}
+.an-hero::before{width:260px;height:260px;right:-60px;top:-70px;background:rgba(255,182,222,.55)}
+.an-hero::after{width:220px;height:220px;left:36%;bottom:-95px;background:rgba(150,200,255,.5)}
+.an-spark{position:absolute;color:#fff;pointer-events:none;text-shadow:0 0 8px rgba(255,255,255,.9);
+  animation:anTwinkle 3.2s ease-in-out infinite}
+@keyframes anTwinkle{0%,100%{opacity:.3;transform:scale(.8) rotate(0)}50%{opacity:1;transform:scale(1.15) rotate(18deg)}}
+.an-badge{display:inline-block;padding:6px 16px;border-radius:999px;background:rgba(255,255,255,.55);
+  border:1px solid rgba(255,255,255,.85);color:#c04a94;font-size:12.5px;font-weight:600;backdrop-filter:blur(6px);position:relative}
+.an-hero h1{font-size:33px;font-weight:700;margin:14px 0 8px;letter-spacing:.5px;position:relative;
+  background:linear-gradient(90deg,#ff6fae,#a06bff,#4d9ef0);-webkit-background-clip:text;background-clip:text;color:transparent}
+.an-sub{color:#6a4a75;font-size:14px;margin:0;position:relative;max-width:62ch}
+.an-tags{margin-top:18px;display:flex;flex-wrap:wrap;gap:10px;position:relative}
+.an-tag{padding:7px 15px;border-radius:999px;background:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.9);
+  font-size:12.5px;color:#a05fb0;font-weight:600;backdrop-filter:blur(4px);transition:transform .15s,background .15s}
+.an-tag:hover{transform:translateY(-2px) scale(1.04);background:rgba(255,255,255,.9)}
+
+.an-marquee{margin-top:24px;position:relative;overflow:hidden;border-radius:16px;
+  -webkit-mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent);
+  mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
+.an-track{display:flex;gap:14px;width:max-content;padding:4px 0;animation:anScroll 48s linear infinite}
+.an-marquee:hover .an-track{animation-play-state:paused}
+@keyframes anScroll{to{transform:translateX(-50%)}}
+.an-slide{position:relative;width:130px;flex-shrink:0;border-radius:14px;overflow:hidden;
+  background:rgba(255,255,255,.5);box-shadow:0 6px 16px rgba(160,110,220,.3);
+  transition:transform .16s,box-shadow .16s}
+.an-slide:hover{transform:translateY(-5px) rotate(-1deg);box-shadow:0 12px 26px rgba(160,110,220,.45)}
+.an-slide img{width:100%;aspect-ratio:2/3;object-fit:cover;display:block}
+/* 书名覆盖条必须放得下**完整书名**（本库最长 28 字）：130px 宽减去左右各 9px 内边距，
+   10.5px 字号约 10.6 字/行 → 3 行约 32 字。原先 2 行会把长书名截成半截。 */
+.an-slide .cap{position:absolute;left:0;right:0;bottom:0;padding:18px 9px 8px;font-size:10.5px;color:#fff;
+  background:linear-gradient(180deg,transparent,rgba(90,40,120,.86));line-height:1.25;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;
+  text-shadow:0 1px 3px rgba(40,10,60,.5)}
+
+/* 列数由**卡片数量**决定（服务端写 --ncats），不再让 auto-fit 自己算：
+   自动算出的列数随窗口宽度浮动，多出来的那张卡就会被挤到第二行。
+   （这段注释会随 <style> 下发给访客，别在这里写管理功能的名字。）
+   视口装不下时按文件末尾的断点降级成 2 列。 */
+.an-cats{display:grid;gap:18px;grid-template-columns:repeat(var(--ncats,4),minmax(0,1fr))}
+.an-cat{position:relative;overflow:hidden;min-width:0;padding:24px clamp(14px,1.4vw,24px);border-radius:20px;
+  border:1px solid rgba(255,255,255,.75);box-shadow:0 8px 26px rgba(160,120,230,.2);
+  transition:transform .16s,box-shadow .16s}
+.an-cat:hover{transform:translateY(-4px);box-shadow:0 14px 34px rgba(160,120,230,.34)}
+.an-cat.a{background:linear-gradient(135deg,#ffe3f0,#f3d8ff)}
+.an-cat.b{background:linear-gradient(135deg,#d6ecff,#d6f6ff)}
+.an-cat.c{background:linear-gradient(135deg,#d9fbe4,#d2f4ee)}
+.an-cat.d{background:linear-gradient(135deg,#efe2ff,#e0d8ff)}
+.an-cat.e{background:linear-gradient(135deg,#fff0dd,#ffe3d0)}
+.an-cat .ico{width:52px;height:52px;border-radius:16px;display:grid;place-items:center;font-size:24px;
+  background:rgba(255,255,255,.65);box-shadow:0 4px 10px rgba(150,100,200,.18);margin-bottom:14px}
+.an-cat .nm{font-size:clamp(15.5px,1.08vw,19px);font-weight:700;color:#5a3a6b}
+.an-cat .ds{font-size:clamp(11.5px,.84vw,12.5px);color:#8a6b95;margin-top:6px;line-height:1.5}
+.an-cat .go{margin-top:14px;font-size:13px;font-weight:600;color:#c04a94}
+
+.an-latest{display:flex;gap:14px;overflow-x:auto;padding:6px 2px 18px;scroll-snap-type:x mandatory;
+  -webkit-overflow-scrolling:touch}
+.an-latest::-webkit-scrollbar{height:8px}
+.an-latest::-webkit-scrollbar-thumb{background:#d8b8f0;border-radius:8px}
+.an-item{scroll-snap-align:start;flex:0 0 146px;position:relative;border-radius:16px;overflow:hidden;
+  background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow);
+  transition:transform .16s,box-shadow .16s}
+.an-item:hover{transform:translateY(-4px);box-shadow:0 10px 24px rgba(150,110,210,.32)}
+.an-item img{width:100%;aspect-ratio:2/3;object-fit:cover;display:block}
+/* 同上：3 行才装得下完整书名（146px 宽 - 左右各 10px 内边距，12px 字号约 10.5 字/行） */
+.an-item .t{padding:8px 10px 4px;font-size:12px;font-weight:600;line-height:1.3;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.an-item .s{padding:0 10px 10px;font-size:10.5px;color:var(--muted)}
+.an-item .up{position:absolute;left:8px;top:8px;padding:2px 8px;border-radius:12px;font-size:10px;
+  background:linear-gradient(135deg,#ff8fb8,#c77fff);color:#fff;font-weight:600;
+  box-shadow:0 2px 8px rgba(200,110,190,.5)}
+
+footer{margin-top:36px;padding:24px 20px;text-align:center;font-size:12px;
+  background:linear-gradient(135deg,#ffd9ec,#d8ccff,#cfe6ff);color:#7a5a8b;
+  border-top:1px solid rgba(255,255,255,.7)}
+/* 分类导航的降级断点：880px 是「5 张卡一行」的最小可行宽度（每张 ≈160px，内容仍放得下），
+   再窄就整行平分 2 列 —— 绝不会出现「前 4 张一行、第 5 张孤零零一行」。 */
+@media (max-width:880px){.an-cats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:760px){
+  .an-hero{padding:26px 20px 20px}
+  .an-hero h1{font-size:26px}
+  /* 卡片宽度按「3 行放得下 28 字」反推：覆盖条有效宽度 = 卡片宽 - 左右内边距 */
+  .an-slide{width:126px}
+  .an-item{flex:0 0 148px}
+  .an-cats{gap:14px}
+}
+"""
+
+
+def _home_cover_rel(key, cat, book, lib):
+    vols = lib.get(cat, {}).get(book)
+    if not vols:
+        return None
+    pv = _primary_vol(vols, cat, book)
+    return pv["rel"] if pv else None
+
+
+def _home_covers(pend, lib, n):
+    """轮播封面集合：优先「最近有更新」的，不够就按字母序采样补齐，保证有内容可滚。"""
+    keys = sorted(pend, key=lambda k: pend[k].get("at") or "", reverse=True)
+    if len(keys) < n:
+        for cat, books in lib.items():
+            for book in books:
+                k = f"{cat}/{book}"
+                if k not in keys:
+                    keys.append(k)
+    out = []
+    for key in keys[:n]:
+        cat, book = key.split("/", 1)
+        rel = _home_cover_rel(key, cat, book, lib)
+        if rel:
+            out.append((key, cat, book, rel))
+    return out
+
+
 def root_html(is_admin=False):
     lib = get_library()
-    upd.observe()                       # 首页也顺手做一次检测，分类卡上就能带出「N 部有更新」
+    pend = upd.observe()                    # 「有更新」状态（含时间戳，排序用）
     ups = upd.counts()
     # 有更新的分类在副标题后追加一段；先在循环外拼好，避免把 f-string 的隐式拼接切开
     note = {c: (f' · <b style="color:var(--new)">{n} 部有更新</b>' if n else "")
             for c, n in ups.items()}
-    cats = "".join(
-        f'<a class="cat" href="/opds/catalog/{quote(cat)}">'
-        f'<div class="ico" style="background:{"#fff1e6" if cat == CATEGORY_DONE else "#e7f3ff"};'
-        f'color:{"#bc4c00" if cat == CATEGORY_DONE else "#0a66c2"}">'
-        f'{"&#10003;" if cat == CATEGORY_DONE else "&#128336;"}</div>'
-        f'<div class="nm">{html.escape(cat)}</div>'
-        f'<div class="ds">{len(books)} 部作品 · {sum(len(v) for v in books.values())} 卷'
-        f'{note.get(cat, "")}</div>'
-        f'<div class="go">进入浏览 →</div></a>'
+
+    # ---- 轮播图区域：最近更新的封面无缝滚动（悬停暂停）----
+    feat = _home_covers(pend, lib, 12)
+    one = "".join(
+        f'<a class="an-slide" href="/opds/book/{encode_path(key)}">'
+        f'<img src="{_cover_url(rel)}" alt="" loading="lazy" decoding="async">'
+        f'<div class="cap">{html.escape(book)}</div></a>'
+        for key, cat, book, rel in feat)
+    marquee = (f'<div class="an-marquee"><div class="an-track">{one}{one}</div></div>'
+               if one else "")
+
+    spark = ('<span class="an-spark" style="left:7%;top:12%;font-size:18px">✦</span>'
+             '<span class="an-spark" style="left:20%;top:72%;font-size:14px;animation-delay:.7s">✧</span>'
+             '<span class="an-spark" style="right:15%;top:24%;font-size:16px;animation-delay:1.2s">♡</span>'
+             '<span class="an-spark" style="right:34%;bottom:10%;font-size:20px;animation-delay:.4s">✦</span>')
+    hero = (
+        '<div class="an-hero">' + spark
+        + '<span class="an-badge">✿ 个人轻小说收藏 ✿</span>'
+        + f"<h1>{html.escape(SERVER_TITLE)}</h1>"
+        + '<p class="an-sub">手机可直接浏览、下载单卷或整本打包 · OPDS 阅读器可直接订阅</p>'
+        + '<div class="an-tags">'
+          '<span class="an-tag">📚 支持单卷下载</span>'
+          '<span class="an-tag">📦 整本 / 整组打包 ZIP</span>'
+          '<span class="an-tag">📱 OPDS 阅读器可直接订阅</span>'
+          "</div>"
+        + marquee
+        + "</div>")
+
+    # ---- 分类导航区：两部类 + 快捷入口，统一糖果色卡 ----
+    def _cat_card(href, cls, ico, nm, ds):
+        return (f'<a class="an-cat {cls}" href="{href}">'
+                f'<div class="ico">{ico}</div>'
+                f'<div class="nm">{html.escape(nm)}</div>'
+                f'<div class="ds">{ds}</div>'
+                f'<div class="go">进入浏览 →</div></a>')
+
+    cat_cards = "".join(
+        _cat_card("/opds/catalog/" + quote(cat),
+                  "a" if cat == CATEGORY_DONE else "b",
+                  "📖" if cat == CATEGORY_DONE else "🌙",
+                  cat,
+                  f'{len(books)} 部作品 · {sum(len(v) for v in books.values())} 卷{note.get(cat, "")}')
         for cat, books in lib.items())
-    quick = (
-        f'<a class="cat" href="/opds/recent"><div class="ico" style="background:#e7f3ff;color:#0a66c2">&#128336;</div>'
-        f'<div class="nm">最近更新</div><div class="ds">最近改动的 {RECENT_SIZE} 卷</div><div class="go">查看 →</div></a>'
-        f'<a class="cat" href="/opds/catalog/all"><div class="ico" style="background:#f0e7ff;color:#6639ba">&#128218;</div>'
-        f'<div class="nm">全部作品</div><div class="ds">不分分类浏览</div><div class="go">查看 →</div></a>'
-    )
-    quick_label = "最近更新 · 全部作品"
+    # 卡片顺序固定：全部作品 → 已完结 → 未完结 → 已读完 → 最近更新。
+    # 色卡跟着卡走（.a 粉 / .b 蓝 / .c 绿 / .d 紫 / .e 橙），不随位置换颜色。
+    cards = [_cat_card("/opds/catalog/all", "d", "📚", "全部作品", "不分分类浏览"),
+             cat_cards]
     if is_admin:                       # 管理员才多这张卡（与顶栏 tab 同一开关）
-        n_fin = len(_finished_books())
-        quick += (
-            f'<a class="cat" href="/opds/read"><div class="ico" style="background:#dafbe1;color:#1a7f37">&#10003;</div>'
-            f'<div class="nm">已读完</div><div class="ds">已标记 {n_fin} 部作品</div><div class="go">查看 →</div></a>')
-        quick_label = "最近更新 · 全部作品 · 已读完"
-    body = (
-        '<div class="hero-home">'
-        f"<h1>{html.escape(SERVER_TITLE)}</h1>"
-        f'<p class="sub">个人轻小说收藏 · 手机可直接浏览、下载单卷或整本打包</p>'
-        f'<div class="tips">'
-        f'<span class="tip">&#128214; 支持单卷下载</span>'
-        f'<span class="tip">&#128230; 整本 / 整组打包 ZIP</span>'
-        f'<span class="tip">&#128241; OPDS 阅读器可直接订阅</span>'
-        f"</div>"
-        "</div>"
-        f"<h2>分类浏览</h2>"
-        f'<div class="cats">{cats}</div>'
-        f"<h2>快速入口 <span class=\"n\">{quick_label}</span></h2>"
-        f'<div class="cats">{quick}</div>'
-    )
-    return _html_page(SERVER_TITLE, body, active="", is_admin=is_admin)
+        # 计数口径与清单页完全一致（人工标记 ∪ 阅读器判定）：只数人工清单的话，
+        # 明明读完了一堆书却显示「0 部作品」，点进去反倒有内容。
+        # id 供 MARK_JS 在「从缓存恢复 / 切回前台」时刷新这个数字。
+        n_fin = len(_finished_all())
+        cards.append(_cat_card("/opds/read", "e", "✅", "已读完",
+                               f'已读完 <span id="fincnt">{n_fin}</span> 部作品'))
+    cards.append(_cat_card("/opds/recent", "c", "⏰", "最近更新",
+                           f"最近改动的 {RECENT_SIZE} 卷"))
+    cards = "".join(cards)
+    # 列数写进 CSS 变量：访客 4 张、管理员 5 张。必须用真实张数，
+    # 否则 auto-fit 会把多出来的那张挤到第二行。
+    n_cats = len(lib) + 2 + (1 if is_admin else 0)
+
+    # ---- 最新更新列表：「有更新」的作品横向条；没有就退回轮播那批，保证不空 ----
+    latest_keys = sorted(pend, key=lambda k: pend[k].get("at") or "", reverse=True)
+    latest = []
+    for key in latest_keys[:10]:
+        cat, book = key.split("/", 1)
+        rel = _home_cover_rel(key, cat, book, lib)
+        if rel:
+            latest.append((key, cat, book, rel))
+    if not latest:
+        latest = feat[:10]
+    latest_html = "".join(
+        f'<a class="an-item" href="/opds/book/{encode_path(key)}">'
+        f'<span class="up">NEW</span>'
+        f'<img src="{_cover_url(rel)}" alt="" loading="lazy" decoding="async">'
+        f'<div class="t">{html.escape(book)}</div>'
+        f'<div class="s">{html.escape(cat)}</div></a>'
+        for key, cat, book, rel in latest)
+
+    body = (hero
+            + "<h2>✿ 分类导航</h2>"
+            + f'<div class="an-cats" style="--ncats:{n_cats}">{cards}</div>'
+            + "<h2>✦ 最新更新</h2>"
+            + (f'<div class="an-latest">{latest_html}</div>' if latest_html
+               else '<div class="empty">最近没有新卷入库。</div>'))
+    return _html_page(SERVER_TITLE, body, active="", extra_css=ANIME_HOME_CSS, is_admin=is_admin)
 
 
 def _upd_bar(pend, back, is_admin):
@@ -1292,7 +1527,7 @@ def _upd_box(new_vols, cat, book, entry):
         where = f"{sub} · " if sub else ""
         rows.append(
             f'<a class="vol" href="/dl/{encode_path(v["rel"])}">'
-            f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy"></div>'
+            f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy" decoding="async"></div>'
             f'<div class="meta"><div class="t">{html.escape(v["title"])}</div>'
             f'<div class="s"><span class="vnew">新</span>'
             f'<span class="sub2">{html.escape(where)}</span>{human_size(v["size"])}'
@@ -1349,7 +1584,7 @@ def _render_groups(groups, cat, book, page_chunk, new_rels=frozenset(), vis=Fals
         n_new = sum(1 for v in in_page if v["rel"] in new_rels)
         rows = "".join(
             f'<a class="vol" href="/dl/{encode_path(v["rel"])}">'
-            f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy"></div>'
+            f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy" decoding="async"></div>'
             f'<div class="meta"><div class="t">{html.escape(v["title"])}</div>'
             f'<div class="s">'
             + ('<span class="vnew">新</span>' if v["rel"] in new_rels else "")
@@ -1377,7 +1612,7 @@ def _render_groups(groups, cat, book, page_chunk, new_rels=frozenset(), vis=Fals
 def _vol_rows(items, vis=False):
     return "".join(
         f'<a class="vol" href="/dl/{encode_path(v["rel"])}">'
-        f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy"></div>'
+        f'<div class="ph"><img src="{_cover_url(v["rel"])}" alt="" loading="lazy" decoding="async"></div>'
         f'<div class="meta"><div class="t">{html.escape(title)}</div>'
         f'<div class="s">{_vol_prog(v["rel"], vis)}{html.escape(c)} · {human_size(v["size"])}</div></div>'
         f'<span class="dl">下载</span></a>'
@@ -1427,37 +1662,42 @@ def search_html(q, page=1, is_admin=False):
     return _html_page(f"搜索 · {SERVER_TITLE}", body, active="", is_admin=is_admin, back=url)
 
 
-# 自动判定栏一次最多渲染多少张卡（派生清单可能很长，超出只提示数量）
-_AUTO_MAX = 60
-
-
 def read_html(page=1):
     """「已读完」列表页（**仅管理员**：服务端在路由层就会把访客挡在外面，
     非管理员拿不到这个页面，也拿不到顶栏入口）。
 
-    分成两栏，**人工与自动严格分开**：
+    统一成**一条清单**，不再按来源分栏：
 
-    * **人工标记** —— 就是 ``.autosync/finished.json``，管理动作只有「取消标记」一个。
-      清单是人工维护的小状态，不做批量清空：误点一下只是少一条记录，
-      不需要「不可逆」的操作来增加风险。
-    * **Moon+ 自动判定** —— 由手机阅读器的位置数据派生（作品下所有卷都读完）。
+    * **人工标记** —— ``.autosync/finished.json`` 里的作品，卡片带 ✓ 可取消标记；
+    * **阅读器自动判定** —— 由手机阅读器的位置数据派生（作品下所有卷都读完）。
       **只读、不写清单**：``updates.observe()`` 有「出现新卷 → 自动从已读完剔除」的联动，
       自动判定若每轮写回 ``finished.json``，两边会互相拉扯（加回 → 删 → 又加回）。
 
-    两栏重叠时只在人工栏出现（人工结论优先），页头会点明重叠了多少部。
+    同一部作品两边都命中时只出现一次（人工优先，仍带 ✓）。判定栏不再单列。
     """
-    items = _finished_books()
-    chunk, extra = _paginate(items, page, "/opds/read?page=1")
+    merged = _finished_all()      # 人工在前、仅阅读器判定的在后；顺序稳定便于翻页与定位
+    total = len(merged)
+    chunk, extra = _paginate(merged, page, "/opds/read?page=1")
     back = "/opds/read?page=" + str(page)
-    cards = "".join(
-        _book_card("/opds/book/" + encode_path(key),
-                   _primary_vol(vols, cat, book)["rel"], book,
-                   f"{cat} · {len(vols)} 卷", badge=f"{len(vols)} 卷",
-                   key=key, back=back, finished=True, fin_note="已读完",
-                   readlist=True)
-        for key, cat, book, vols in chunk)
-    total = len(items)
-    empty_html = ('<div class="empty">还没有标记任何作品。<br>'
+    rows = []
+    for key, cat, book, vols, st in chunk:
+        card_kw = dict(
+            href="/opds/book/" + encode_path(key),
+            cover_rel=_primary_vol(vols, cat, book)["rel"],
+            title=book,
+            sub=f"{cat} · {len(vols)} 卷",
+            badge=f"{len(vols)} 卷",
+        )
+        if st is None:                      # 人工标记：带 ✓，可取消
+            rows.append(_book_card(**card_kw, key=key, back=back,
+                                   finished=True, fin_note="已读完", readlist=True))
+        else:                               # 仅阅读器判定：显示进度，无 ✓
+            rows.append(_book_card(**card_kw,
+                                   prog=(int(round(st["percent"])), True),
+                                   pnote=f'{len(vols)}/{len(vols)} 卷'))
+    cards = "".join(rows)
+
+    empty_html = ('<div class="empty">还没有已读完的作品。<br>'
                   '去「已完结 / 未完结」把鼠标移到封面上，点左上角出现的 &#9675; 即可标记为已读完。'
                   '<br><span style="font-size:12px">（触屏设备没有悬停，圆圈会一直显示，直接点即可）</span></div>')
     if total:
@@ -1468,36 +1708,6 @@ def read_html(page=1):
     else:
         listing = empty_html
 
-    # ---- 自动判定栏（派生视图，无任何写操作）----
-    manual_keys = {key for key, _c, _b, _v in items}
-    auto = MOON.auto_finished() if MOON.enabled() else {}
-    overlap = len(set(auto) & manual_keys)
-    auto_only = [(k, v) for k, v in sorted(auto.items()) if k not in manual_keys]
-    lib = get_library()
-    auto_rows = []
-    for key, st in auto_only[:_AUTO_MAX]:
-        cat, book = key.split("/", 1)
-        vols = lib.get(cat, {}).get(book)
-        if not vols:
-            continue
-        auto_rows.append(_book_card(
-            "/opds/book/" + encode_path(key),
-            _primary_vol(vols, cat, book)["rel"], book,
-            f"{cat} · {len(vols)} 卷", badge=f"{len(vols)} 卷",
-            prog=(int(round(st["percent"])), True),
-            pnote=f'{len(vols)}/{len(vols)} 卷'))
-    more = len(auto_only) - len(auto_rows)
-    if auto_rows:
-        auto_block = (f'<div class="grid">{"".join(auto_rows)}</div>'
-                      + (f'<p class="sub">还有 {more} 部未列出…</p>' if more > 0 else ""))
-    else:
-        auto_block = ('<div class="empty">还没有作品被自动判定为读完。<br>'
-                      '<span style="font-size:12px">判定依据：手机阅读器（Moon+）里'
-                      '这部作品的每一卷进度都到 99% 以上。</span></div>')
-    auto_note = (f'（与人工标记重叠 {overlap} 部，已在上一栏显示）' if overlap else "")
-    if not MOON.enabled():
-        auto_note = "（未启用：设 LN_MOON_PROGRESS=0 可关闭）"
-
     body = (
         '<div class="crumb"><a href="/">首页</a><span>/</span><span>已读完</span></div>'
         '<div class="bar">'
@@ -1506,14 +1716,9 @@ def read_html(page=1):
         f'<span class="sub" id="readcnt" style="margin:0">{total} 部作品</span>'
         "</div>"
         f'<p class="sub">鼠标移上封面后，点左上角的 &#10003; 可取消标记。'
-        f'（这份清单只保存在本机 <code>.autosync/finished.json</code>，不同步到书库/仓库）</p>'
-        '<div class="sec-head"><h2>人工标记 <span class="n">%d 部</span></h2></div>' % total
+        f'（本机状态，不同步到书库/仓库）</p>'
         + listing
         + _pager_html(page, _next_link(extra), _prev_link(extra))
-        + '<div class="sec-head" style="margin-top:26px"><h2>阅读器自动判定 '
-          f'<span class="n">{len(auto_only)} 部</span></h2></div>'
-        + f'<p class="sub">由手机阅读器的阅读位置派生，<b>只读展示、不会写进上面的清单</b>。{auto_note}</p>'
-        + auto_block
     )
     return _html_page(f"已读完 · {SERVER_TITLE}", body, active="read", is_admin=True, back=back)
 
