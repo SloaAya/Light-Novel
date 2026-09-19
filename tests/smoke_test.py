@@ -153,11 +153,11 @@ class _Agg:
 
 from lightnovel import paths as P                                      # noqa: E402
 from lightnovel.opds import library as OL, feeds as OF, server as OS    # noqa: E402
-from lightnovel.sync import gitops as SG, mirror as SM, monitor as SN   # noqa: E402
+from lightnovel.sync import catalog as SC, mirror as SM, monitor as SN   # noqa: E402
 import lightnovel.tunnel_setup as T                                    # noqa: E402
 
 O = _Agg(OL, OF, OS, P)      # 对应原 opds_server.py
-S = _Agg(SG, SM, SN, P)      # 对应原 sync_lightnovel.py
+S = _Agg(SC, SM, SN, P)      # 对应原 sync_lightnovel.py
 
 # 会话签名密钥一开始就隔离到临时目录：E 节的 HTTP 用例会真的走一遍 _role()，
 # 不先指一下就会在真实 .autosync/ 里生成一把密钥（测试不该有这种副作用）。
@@ -184,9 +184,16 @@ check("已删除 sync_lightnovel.git_commit_push", lambda: (not hasattr(S, "git_
 check("已删除 sync_lightnovel.mirror_dir", lambda: (not hasattr(S, "mirror_dir"), ""))
 check("已删除 setup_named_tunnel 的 json 导入",
       lambda: ("import json" not in open("lightnovel/tunnel_setup.py", encoding="utf-8").read(), ""))
-check("保留 sync_lightnovel.smart_copy（种子复制）", lambda: (callable(S.smart_copy), ""))
-check("保留 sync_lightnovel.auth_url（PAT 链路）", lambda: (callable(S.auth_url), ""))
-check("保留 ENABLE_SEED_COPY 开关", lambda: (S.ENABLE_SEED_COPY is False, "value=%r" % S.ENABLE_SEED_COPY))
+check("已删除 sync_lightnovel.smart_copy（种子复制，源目录早已不存在）",
+      lambda: (not hasattr(S, "smart_copy"), ""))
+check("已删除整条 Git 链路（auth_url / push_with_retry / git_commit / run_git 等）",
+      lambda: (not any(hasattr(S, n) for n in
+                       ("auth_url", "push_with_retry", "git_commit", "remove_remote_extras",
+                        "run_git", "ensure_repo", "ensure_remote", "classify_push_error",
+                        "_push_backoff", "get_unpushed_commits")), ""))
+check("已删除 ENABLE_SEED_COPY 开关与种子路径常量",
+      lambda: (not any(hasattr(S, n) for n in
+                       ("ENABLE_SEED_COPY", "SOURCE_DIR", "BOOK_NAME", "TARGET_SUBDIR")), ""))
 check("保留 opds_server.print_qr", lambda: (callable(O.print_qr), ""))
 check("setup_logging 能写日志文件", lambda: (_log_ok, S.LOG_FILE))
 
@@ -456,46 +463,20 @@ httpd.shutdown()
 httpd.server_close()
 info("HTTP 测试服务器已关闭", "端口 %d" % PORT)
 
-# ============================== F. sync 推送分类与工具 ==============================
-section("F. 推送错误分类与退避（lightnovel.sync.gitops）")
-eq("classify auth", S.classify_push_error("", "Authentication failed for 'https://x'"), "auth")
-eq("classify nonfastforward", S.classify_push_error("", "! [rejected] main -> main (non-fast-forward)"), "nonfastforward")
-eq("classify nonfastforward(fetch first)",
-   S.classify_push_error("Updates were rejected because the tip of your current branch is behind", ""), "nonfastforward")
-eq("classify transient(rpc failed)", S.classify_push_error("error: RPC failed; curl 55 Send failure", ""), "transient")
-eq("classify transient(early eof)",
-   S.classify_push_error("", "fatal: the remote end hung up unexpectedly\nfatal: early EOF"), "transient")
-eq("classify fatal", S.classify_push_error("", "fatal: not a git repository"), "fatal")
-
-_orig_sleep = time.sleep
-
-
-def probe_backoff():
-    calls = []
-    time.sleep = lambda s: calls.append(s)
-    try:
-        S._push_backoff(1, 3)
-        a = list(calls)
-        calls.clear()
-        S._push_backoff(3, 3)
-        b = list(calls)
-        calls.clear()
-        S._push_backoff(4, 5)
-        c = list(calls)
-        return a, b, c
-    finally:
-        time.sleep = _orig_sleep
-
-
-_bk = probe_backoff()
-truthy("_push_backoff 指数退避（首 5s / 第 4 次 40s）", _bk[0] == [5] and _bk[2] == [40], "%s" % (_bk,))
-truthy("_push_backoff 末次不等待", _bk[1] == [], "%s" % (_bk[1],))
-
-eq("auth_url 空 token 原样返回", S.auth_url("https://x/y.git"), "https://x/y.git")
-truthy("git_available 为真", S.git_available())
-_rc, _out, _ = S.run_git(["--version"], check=False)
-check("run_git --version", lambda: (_rc == 0 and "git version" in _out, _out.strip()))
-check("run_git 坏参数走非 0 分支", lambda: (S.run_git(["--no-such-flag-xyz"], check=False)[0] != 0, ""))
+# ============================== F. 同步链路（只剩 F 盘镜像） ==============================
+section("F. 同步链路只保留 F 盘镜像（Git 相关已整体移除）")
+check("lightnovel/sync/gitops.py 已删除",
+      lambda: (not os.path.exists(os.path.join(ROOT, "lightnovel", "sync", "gitops.py")), ""))
+check("lightnovel/sync/catalog.py 存在（原 gitops 的非 Git 部分）",
+      lambda: (os.path.isfile(os.path.join(ROOT, "lightnovel", "sync", "catalog.py")), ""))
+check("F 盘镜像与目录监控的关键函数都在",
+      lambda: (all(callable(getattr(S, n, None)) for n in
+                   ("sync_to_f", "plan_mirror", "apply_mirror", "mirror_query", "perform_sync",
+                    "snapshot_dir", "detect_changes", "write_mirror_dashboard",
+                    "_pid_alive", "lock_path", "acquire_lock", "release_lock",
+                    "setup_logging", "scan_tree", "scan_dirs", "regenerate_readme")), ""))
+check("_pid_alive / lock_path 仍在（service、launcher、ui 都在依赖它们）",
+      lambda: (callable(S._pid_alive) and callable(S.lock_path), ""))
 
 # ============================== G. plan_mirror 差异与冲突 ==============================
 section("G. plan_mirror 差异计划与三类冲突检测")
@@ -853,7 +834,9 @@ check("sync --once 在册（原 run_once.bat 已移除，该能力由本子命�
       lambda: ("--once" in _o, ""))
 check("sync 全部模式选项在册",
       lambda: (all(f in _o for f in ("--mirror-status", "--mirror-dry-run", "--mirror-no-delete",
-                                     "--opds-only", "--opds-port", "--monitor-only", "--init", "--status")), ""))
+                                     "--opds-only", "--opds-port", "--once")), ""))
+check("Git 时代的 sync 选项确实已移除（--init / --status / --monitor-only）",
+      lambda: (not any(f in _o for f in ("--init", "--status", "--monitor-only")), ""))
 _rc, _o = run_cli(["-m", "lightnovel", "tunnel-setup", "--help"])
 check("lightnovel tunnel-setup --help", lambda: (_rc == 0 and "--hostname" in _o, "rc=%s" % _rc))
 
@@ -895,10 +878,13 @@ check("stop_opds 仍按 8080 + cloudflared 停止",
 # 这条以前断言的是 run_monitor.bat（已移除）；无窗口需求现在由图形面板承载。
 check("run_panel 用 pythonw 无窗口启动",
       lambda: ("pythonw" in open(os.path.join(_LAU, "run_panel.bat"), encoding="utf-8").read(), ""))
-_wf = open(".github/workflows/OneDriveSync.yml", encoding="utf-8").read()
-check("OneDrive workflow 保持停用（本次未擅自恢复）", lambda: ("if: false" in _wf, ""))
-check("OneDrive workflow 骨架完整",
-      lambda: (all(k in _wf for k in ("name:", "on:", "jobs:", "runs-on:", "steps:")), ""))
+# OneDriveSync.yml（云端 rclone 同步）随「同步只保留 F 盘镜像」一并删除：
+# 它本就被 `if: false` 停用，而且方向是「云盘 → git」，与本地镜像职责重叠。
+check("已删除 .github/workflows/OneDriveSync.yml（云端 rclone 同步）",
+      lambda: (not os.path.exists(os.path.join(ROOT, ".github", "workflows", "OneDriveSync.yml")), ""))
+check(".github/workflows 下已无 workflow 残留",
+      lambda: (not os.path.isdir(os.path.join(ROOT, ".github", "workflows"))
+               or not os.listdir(os.path.join(ROOT, ".github", "workflows")), ""))
 
 # 隧道健康：只判断「cloudflared 进程在不在」是不够的 —— 实测 QUIC 被线路丢包时，
 # cloudflared 会一直活着却零连接（公网 530/502），且它只在 QUIC 上重试、不会自己
@@ -1152,14 +1138,26 @@ def _grid_probe():
         return ok, "时间列=%d 正文列=%d（级别列宽=%d）" % (t_time, t_msg, widest)
     finally:
         root.destroy()
+        import gc
+        gc.collect()          # 在主线程立刻回收 Tk 对象，避免解释器退出阶段 Tcl_AsyncDelete
 
 
 _tkcheck("像素制表位自洽：正文列 = 行首留白 + 时间列宽 + 间距 + 最宽级别名 + 间距",
          _grid_probe)
 
 
+_PANEL_PROBE_CACHE = {}
+
+
 def _panel_probe():
-    """真建一个面板：断言 Text 的制表位/挂起缩进与 grid_tabs 一致，所有标签同款。"""
+    """真建一个面板：断言 Text 的制表位/挂起缩进与 grid_tabs 一致，所有标签同款。
+
+    结果缓存：下面两条断言吃同一份探测结果。Tk 实例建得越少越好 —— 多个 Tk 共存时，
+    解释器退出阶段容易抛 Tcl_AsyncDelete（异步处理器被错误的线程删除），
+    而 ui.py 内部确实会起子进程读取线程。
+    """
+    if "r" in _PANEL_PROBE_CACHE:
+        return _PANEL_PROBE_CACHE["r"]
     from tkinter import font as _tkf
     p = UI.Panel()
     try:
@@ -1173,10 +1171,14 @@ def _panel_probe():
         size_log = int(p._log_fonts[0].actual("size"))
         ok = (tabs == [t_time, t_msg] and l1_all == {UI.COL_GUTTER}
               and l2_all == {t_msg} and fam_log == fam_ui and size_log == UI.LOG_FONT_SIZE)
-        return ok, "tabs=%s lmargin1=%s lmargin2=%s 字族=%r(=UI) 字号=%d" % (
-            tabs, sorted(l1_all), sorted(l2_all), fam_log, size_log)
+        result = (ok, "tabs=%s lmargin1=%s lmargin2=%s 字族=%r(=UI) 字号=%d" % (
+            tabs, sorted(l1_all), sorted(l2_all), fam_log, size_log))
+        _PANEL_PROBE_CACHE["r"] = result
+        return result
     finally:
         p.destroy()
+        import gc
+        gc.collect()          # 同上：立刻回收，别留到解释器退出
 
 
 _tkcheck("真实面板：Text 制表位/挂起缩进与 grid_tabs 一致，全部标签同款同列",
@@ -1592,13 +1594,15 @@ _rcheck("静息态不显示圆圈：opacity:0 + pointer-events:none（既不显�
 _rcheck("用 opacity 而不是 visibility 隐藏（visibility:hidden 会让按钮无法 Tab 聚焦）",
         lambda: ("visibility" not in _mkc["css"],
                  "整份 SITE_CSS 去注释后无 visibility 声明"))
-_rcheck("显形条件三条齐全：卡片悬停 / 卡内有焦点 / 按钮自身聚焦",
-        lambda: (all(t in _mkc["rev_sel"] for t in (":hover", ":focus-within", ":focus-visible"))
-                 and "opacity:1" in _mkc["rev"] and "pointer-events:auto" in _mkc["rev"],
-                 "选择器 = %s" % _mkc["rev_sel"].strip()))
-_rcheck("三条显形条件合成同一条规则（避免某处漏写导致「选中后收不回去」的残留）",
-        lambda: (_mkc["rev_sel"].count(",") == 2 and _mkc["rev_sel"].strip().startswith(".card:hover"),
-                 "一条规则覆盖三个出口"))
+_rcheck("显形条件两条齐备：卡片悬停 / 按钮自身聚焦",
+      lambda: (all(t in _mkc["rev_sel"] for t in (":hover", ":focus-visible"))
+               and "opacity:1" in _mkc["rev"] and "pointer-events:auto" in _mkc["rev"],
+               "选择器 = %s" % _mkc["rev_sel"].strip()))
+_rcheck("刻意不用 .card:focus-within（否则点卡片进详情页再返回时圆圈会常驻不散）",
+      lambda: (":focus-within" not in _mkc["rev_sel"]
+               and _mkc["rev_sel"].count(",") == 1
+               and _mkc["rev_sel"].strip().startswith(".card:hover"),
+               "一条规则覆盖两个出口，且不含 focus-within"))
 _rcheck("无残留：能设 opacity:1 的只有「显形」与「触屏兜底」两处，没有第三条把圆圈钉住",
         lambda: (_mkc["css"].count("opacity:1") == 2
                  and _mkc["css"].count("pointer-events:auto") == 2,
@@ -3258,22 +3262,28 @@ def _u_detail_volrow():
 _uhcheck("HTTP 详情页：分卷列表每行标出该卷进度（未读完/读完两种态）", _u_detail_volrow)
 
 
-def _u_read_two_columns():
+def _u_read_merged():
+    """人工清单为空时，**仅阅读器判定**的作品也要出现在同一条清单里。
+
+    页面的口径是「统一成一条清单，不再按来源分栏」（见 read_html 文档）：
+    分栏会让同一部作品的人工结论与自动结论各占一张卡。
+    """
     _u_isolate()
-    _reset_fin(os.path.join(_U_TMP, "finished_two.json"))   # 人工栏留空，专注自动栏
+    _reset_fin(os.path.join(_U_TMP, "finished_two.json"))   # 人工清单留空，专注自动判定
     cat, book, vols = _u_pick_book()
     if not book:
         return True, "跳过（书库里没有 ≥2 卷的作品）"
     MOON._swap({v["rel"]: 100.0 for v in vols})
     st, body = _u_http("/opds/read", headers=_U_ADMIN)
     key = f"{cat}/{book}"
-    return (st == 200 and "人工标记" in body and "阅读器自动判定" in body
-            and "只读展示" in body and O.encode_path(key) in body
-            and "还没有作品被自动判定为读完" not in body,
-            "两栏齐备，自动栏渲染出「%s」" % key)
+    # 别拿「还没有已读完的作品」当空态判据：那是空态模板的文案，有内容时它照样
+    # 躺在 <template id="readempty"> 里一起下发。总数一律看 data-total。
+    return (st == 200 and O.encode_path(key) in body
+            and 'data-total="1"' in body,
+            "合并清单里渲染出自动判定的「%s」（data-total=1）" % key)
 
 
-_uhcheck("HTTP 已读完页：拆成「人工标记」+「阅读器自动判定」两栏", _u_read_two_columns)
+_uhcheck("HTTP 已读完页：人工标记与阅读器判定合并成同一条清单", _u_read_merged)
 
 
 def _u_auto_readonly():
@@ -3296,20 +3306,23 @@ _uhcheck("自动判定是纯派生：命中作品但绝不写 finished.json", _u
 
 
 def _u_manual_wins():
-    """人工标过的作品只在人工栏出现，不重复出现在自动栏（人工结论优先）。"""
+    """人工标过的作品在同一清单里只出现一次（人工结论优先，卡片仍带 ✓）。
+
+    这里是「人工 ∪ 阅读器判定」重叠的最坏情况：两边都命中同一部作品。
+    合并去重后总数必须还是 1（页面用 data-total 记账，取消标记时要减 1）。
+    """
     _u_isolate()
     _reset_fin(os.path.join(_U_TMP, "finished_ov.json"))
     cat, book, vols = _u_pick_book()
     if not book:
         return True, "跳过（书库里没有 ≥2 卷的作品）"
     key = f"{cat}/{book}"
-    MOON._swap({v["rel"]: 100.0 for v in vols})
+    MOON._swap({v["rel"]: 100.0 for v in vols})     # 阅读器也判定它读完 → 两边都命中
     FIN.mark_finished(key, True)
     st, body = _u_http("/opds/read", headers=_U_ADMIN)
     FIN.mark_finished(key, False)
-    overlapped = "与人工标记重叠" in body
-    return (st == 200 and overlapped and "0 部" in body,
-            "重叠时只在人工栏出现，自动栏计数归零（页头点明重叠）")
+    return (st == 200 and 'data-total="1"' in body,
+            "两边都命中时只计 1 部（data-total=1），人工优先不重复")
 
 
 _uhcheck("已读完页：人工与自动重叠时不重复展示（人工优先）", _u_manual_wins)
