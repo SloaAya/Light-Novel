@@ -17,3 +17,6 @@ desktop.ini
 Desktop.ini
 [Tt]humbs.db
 .DS_Store
+
+# 书库本体（1774 个文件，与代码演进无关）：靠网盘镜像 + OPDS 服务分发，不进 git
+轻小说/
