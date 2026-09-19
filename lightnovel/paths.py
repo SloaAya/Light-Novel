@@ -32,6 +32,11 @@ LOG_DIR         = os.path.join(TARGET_DIR, ".autosync")
 LOG_FILE        = os.path.join(LOG_DIR, "sync.log")
 OPDS_LOG_FILE   = os.path.join(LOG_DIR, "opds.log")
 COVER_CACHE_DIR = os.path.join(LOG_DIR, "covers")
+# 封面缩略图最大宽度 —— 移动端性能的关键开关。
+# 实测：目录页 52 张封面原图平均 371 KB（合计 18.8 MB，4G 下约 9 秒）；
+# 压到 400px 宽的渐进式 JPEG 后约 20–30 KB/张（合计约 1.3 MB）。
+# 设为 0 可关闭压缩（保持原始封面）。需要 Pillow；没装时自动跳过、不影响服务。
+COVER_MAX_W = int(os.environ.get("LN_COVER_MAX_W", "400"))
 META_CACHE_FILE = os.path.join(LOG_DIR, "meta_cache.json")
 # 「已读完」清单：管理员标记过的作品集合（键 = 分类/书名）。运行时状态，不进仓库。
 FINISHED_FILE   = os.path.join(LOG_DIR, "finished.json")

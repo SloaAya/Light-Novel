@@ -1,25 +1,49 @@
 @echo off
 chcp 65001 >nul
+setlocal
 cd /d "%~dp0.."
-set "PY="
-where python >nul 2>&1 && set "PY=python"
-if not defined PY (where py >nul 2>&1 && set "PY=py")
-if not defined PY (echo ERROR: Python not found. Install Python 3.8+ and add to PATH. & pause & exit /b 1)
 
-rem ---- 可选：设置访问口令（口令不要写进仓库）----
-rem 两档身份：管理员能看到并用「已读完」功能；访客只能浏览/下载，看不到该入口。
-rem 都不设 = 免密：本机(127.0.0.1)算管理员，其余来源算访客（安全下限，但不是零配置就等于公开了书库）。
-rem set LN_OPDS_USER=ln
-rem set LN_OPDS_PASS=改成你自己的口令
-rem set LN_OPDS_GUEST_USER=guest
-rem set LN_OPDS_GUEST_PASS=改成访客口令
+rem =====================================================================
+rem  FOREground OPDS server - for watching the live log in this window.
+rem
+rem  This is the only intentionally foreground entry point: closing this
+rem  window or pressing Ctrl+C STOPS the service. That is the point - it
+rem  exists for debugging. For a detached, self-healing setup use
+rem  launchers\launch_online.bat instead (it starts "python -m lightnovel
+rem  launch" and hands everything to a watchdog daemon).
+rem
+rem  Interpreters are located by the shared helper _find_python.bat.
+rem
+rem  Optional overrides: set them as ENVIRONMENT variables, never in this
+rem  file - the launchers are part of the git repo and credentials put
+rem  here would be pushed to GitHub:
+rem      set LN_OPDS_USER=your_user
+rem      set LN_OPDS_PASS=your_password
+rem      set LN_OPDS_PORT=8080
+rem
+rem  ASCII only, on purpose: cmd parses .bat byte-wise and UTF-8 Chinese
+rem  text shifts the line boundaries, making cmd run comment fragments.
+rem =====================================================================
 
-rem ---- 可选：改端口（默认 8080）----
-rem set LN_OPDS_PORT=8080
+call "%~dp0_find_python.bat"
 
+if not defined RUN (
+    echo ERROR: no usable Python found.
+    echo.
+    echo   Fix it in either way:
+    echo     1^) install Python 3.8+ and tick "Add python.exe to PATH", or
+    echo     2^) tell these scripts where it is, once:
+    echo            setx LN_PYTHON "C:\path\to\python.exe"
+    echo        then run this file again.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo Using interpreter: %RUN% %RUNARGS%
+echo Services starts in the FOREGROUND - press Ctrl+C to stop it.
 echo.
-echo 启动 OPDS 书源服务，手机阅读器订阅后即可浏览并下载书库。
-echo 停止服务请按 Ctrl+C
-echo.
-"%PY%" -m lightnovel opds %*
+"%RUN%" %RUNARGS% opds %*
+set RC=%ERRORLEVEL%
 pause
+exit /b %RC%

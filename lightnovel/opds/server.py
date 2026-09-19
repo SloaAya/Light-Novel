@@ -5,6 +5,7 @@
 import argparse
 import base64
 import errno
+import hashlib
 import hmac
 import html
 import json
@@ -30,6 +31,7 @@ from ..paths import (
     BLANK_PNG,
     CF_CONFIG,
     COVER_CACHE_DIR,
+    COVER_MAX_W,
     EPUB_MIME,
     LIGHT_NOVEL_DIR,
     LOG_DIR,
@@ -348,7 +350,16 @@ class OPDSHandler(BaseHTTPRequestHandler):
 
             m = re.match(r"^/cover/(.+)$", path)
             if m:
-                self._serve_cover(m.group(1), head_only)
+                # 默认压到 COVER_MAX_W（移动端关键）；?w=N 指定宽度；?full=1 取原图
+                mw = COVER_MAX_W
+                if qs.get("full"):
+                    mw = None
+                elif qs.get("w"):
+                    try:
+                        mw = int(qs["w"][0]) or COVER_MAX_W
+                    except (ValueError, TypeError):
+                        mw = COVER_MAX_W
+                self._serve_cover(m.group(1), head_only, mw)
                 return
 
             m = re.match(r"^/zip/(.+)$", path)
@@ -556,13 +567,19 @@ class OPDSHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _serve_cover(self, enc_rel, head_only=False):
-        blob, mime = get_cover(enc_rel)
+    def _serve_cover(self, enc_rel, head_only=False, max_w=None):
+        blob, mime = get_cover(enc_rel, max_w)
         if not blob:
             self._send(200, BLANK_PNG, "image/png",
                        {"Cache-Control": "public, max-age=86400"}, head_only=head_only)
             return
-        self._send(200, blob, mime, {"Cache-Control": "public, max-age=604800"}, head_only=head_only)
+        cache = {"Cache-Control": "public, max-age=604800",
+                 "ETag": '"%s"' % hashlib.md5(blob).hexdigest()[:20]}
+        # 协商缓存：封面没变就回 304，省掉整张图的传输
+        if self.headers.get("If-None-Match") == cache["ETag"]:
+            self._send(304, b"", mime, cache, head_only=head_only)
+            return
+        self._send(200, blob, mime, cache, head_only=head_only)
 
     def _serve_zip(self, enc_rel, head_only=False):
         """把一部作品（或一个子目录组）的所有卷流式打包成 zip 下载。
@@ -729,10 +746,79 @@ def find_cloudflared():
     return None
 
 
-def start_named_tunnel(port, name=NAMED_TUNNEL_NAME, timeout=60, on_connected=None):
+def tunnel_protocol():
+    """cloudflared 连接边缘用的协议。
+
+    默认 **http2**（TCP 7844），而不是 cloudflared 自己的 ``auto``。原因：``auto``
+    先试 QUIC（UDP 7844），而部分宽带线路会把这条 UDP 流量丢掉 —— 症状是日志里
+    反复 ``Failed to dial a quic connection: timeout: no recent network activity``，
+    且它只在 QUIC 上重试、**不会自己退回 http2**，于是隧道始终零活动连接（公网
+    530/502），而进程一直活着、看起来一切正常。实测同一台机器上 ``--protocol http2``
+    几秒内就注册满连接；cloudflared 自己的 precheck 在这种网络下也会给出
+    ``suggested_protocol=http2``。
+
+    需要别的值时用环境变量 ``LN_TUNNEL_PROTOCOL`` 覆盖（auto / quic / http2）。
+    """
+    return (os.environ.get("LN_TUNNEL_PROTOCOL") or "").strip() or "http2"
+
+
+def tunnel_metrics_addr():
+    """cloudflared 的 metrics 监听地址 —— 守护靠它区分「进程活着」和「连接活着」。
+
+    cloudflared 在 ``--metrics`` 指定的端口上暴露 ``/ready``：**有活动连接返回
+    200，零连接返回 503**。这正是 QUIC 被丢包那类故障的判别点 —— 进程一直在、
+    却一条连接都注册不上，公网 530。端口固定（而不是让它随机选）守护才找得到；
+    要换端口用环境变量 ``LN_TUNNEL_METRICS_PORT``。
+    """
+    port = (os.environ.get("LN_TUNNEL_METRICS_PORT") or "").strip() or "20241"
+    return "127.0.0.1:" + port
+
+
+def tunnel_metrics_args():
+    """``--metrics`` 参数 —— **必须挂在 ``tunnel`` 这一层**。
+
+    实测（2026-09-18）：``tunnel run --metrics 127.0.0.1:20241 <name>`` 会被 cloudflared
+    拒绝 —— 它打印一段 usage 然后**以退出码 0 安静退出**，于是隧道永远起不来，日志里
+    只剩几行 flag 说明。写成 ``tunnel --metrics 127.0.0.1:20241 run ...`` 才生效。
+    坑在于 ``tunnel run --help`` 里照样会列出 ``--metrics``（继承的 flag 都会列出来），
+    只看 help 会以为它属于 ``run``。
+    """
+    return ["--metrics", tunnel_metrics_addr()]
+
+
+def tunnel_protocol_args():
+    """``--protocol`` 参数 —— 必须挂在 ``run`` 这一层（``tunnel --help`` 里没有它）。"""
+    return ["--protocol", tunnel_protocol()]
+
+
+def named_tunnel_argv(exe, name, config=None):
+    """named tunnel 的完整命令行。
+
+    单独抽成函数，是为了让测试能断言**参数顺序** —— 上面那个把 ``--metrics`` 放错
+    层级的坑，靠"函数返回个列表"这种断言是测不出来的。
+    """
+    return ([exe, "--config", config or CF_CONFIG, "tunnel"] + tunnel_metrics_args()
+            + ["run"] + tunnel_protocol_args() + [name])
+
+
+def quick_tunnel_argv(exe, port):
+    """快速隧道（trycloudflare）的完整命令行。
+
+    这里**不能**加 ``--protocol``：快速隧道走 ``tunnel --url`` 这条路径，而 ``--protocol``
+    只在 ``run`` 子命令下有效（``tunnel --help`` 里没有它，硬加会被拒。
+    """
+    return ([exe, "tunnel"] + tunnel_metrics_args()
+            + ["--url", "http://127.0.0.1:%d" % int(port), "--no-autoupdate"])
+
+
+def start_named_tunnel(port, name=None, timeout=60, on_connected=None):
     """拉起**固定域名**的 named tunnel -> (proc, public_url)。
     前提：已跑过 lightnovel.tunnel_setup 完成登录、建隧道、加 DNS 记录。
-    on_connected: 首次连接成功时的回调（只会触发一次）。"""
+    on_connected: 首次连接成功时的回调（只会触发一次）。
+
+    ``name`` 留空时**以 config.yml 里的 ``tunnel:`` 为准**（见
+    :func:`read_named_tunnel_name`），只有配置里读不到才退回 ``NAMED_TUNNEL_NAME``。
+    """
     exe = find_cloudflared()
     if not exe:
         log.error("未找到 cloudflared，无法启动 named tunnel。")
@@ -741,10 +827,11 @@ def start_named_tunnel(port, name=NAMED_TUNNEL_NAME, timeout=60, on_connected=No
     if not host:
         log.error("未在 %s 中找到 hostname，请先运行 lightnovel.tunnel_setup 完成配置。", CF_CONFIG)
         return None, None
+    tname = name or read_named_tunnel_name() or NAMED_TUNNEL_NAME
     sync_named_port(port)
     try:
         proc = subprocess.Popen(
-            [exe, "--config", CF_CONFIG, "tunnel", "run", name],
+            named_tunnel_argv(exe, tname),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -765,12 +852,42 @@ def start_named_tunnel(port, name=NAMED_TUNNEL_NAME, timeout=60, on_connected=No
                             on_connected()
                         except Exception:
                             pass
+                elif re.search(r"\b(ERR|WRN|FTL)\b|failed|error|cannot|no such",
+                               line, re.I):
+                    # cloudflared 的失败原因**必须**落到日志里：以前这里只认「已连接」
+                    # 那一行，别的输出全扔了 —— 于是隧道起不来时日志上一片安静，只能
+                    # 从浏览器那边看 Cloudflare Error 1033，无从排查。
+                    log.warning("cloudflared: %s", line.strip())
         except (ValueError, OSError):
             pass
 
     threading.Thread(target=reader, daemon=True, name="cf-named-reader").start()
     time.sleep(2)  # 给隧道一点建立时间
+    if proc.poll() is not None:
+        # 两秒内就退了：多半是名字 / 凭证 / 配置不对。别假装成功（之前这里无条件
+        # 返回 URL，调用方会打印「公网地址已就绪」，而实际域名侧是 Error 1033）。
+        log.error("named tunnel 启动后立刻退出（退出码 %s，隧道名 %s）——公网地址暂时不可用。"
+                  "常见原因：config.yml 里的 tunnel 名与 %s 下的凭证文件对不上。",
+                  proc.returncode, tname, os.path.dirname(CF_CONFIG))
+        return None, None
     return proc, "https://" + host + "/"
+
+
+def read_named_tunnel_name(config_path=None):
+    """从 cloudflared config.yml 读出 ``tunnel:`` 那一行的名字；读不到返回 ``None``。
+
+    为什么不能只用常量默认值：隧道是可以重建的（换名字 = 换凭证文件）。
+    名字对不上时 cloudflared 会去找 ``<name>.json``、找不到就秒退，域名侧表现为
+    Cloudflare **Error 1033**（域名挂在隧道上，但没有任何在线连接）。以配置为准最稳。
+    """
+    config_path = config_path or CF_CONFIG
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return None
+    m = re.search(r"^tunnel:\s*([^\s#]+)", txt, re.M)
+    return m.group(1).strip().strip("\"'") if m else None
 
 
 def read_named_hostname(config_path=None):
@@ -812,7 +929,7 @@ def start_cloudflared(port, timeout=60):
         return None, None
     try:
         proc = subprocess.Popen(
-            [exe, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
+            quick_tunnel_argv(exe, port),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -869,9 +986,10 @@ EXTERNET_NOTE = """
 ------------------------------------------------
 1) Cloudflare 固定域名隧道（named tunnel）—— 地址永久不变，需自备域名
    前提：有一个 DNS 托管在 Cloudflare 的域名（免费套餐即可）
-   配置：双击 setup_named_tunnel.bat（会开浏览器让你登录 Cloudflare 授权，
+   配置：python -m lightnovel tunnel-setup（会开浏览器让你登录 Cloudflare 授权，
         然后自动建隧道、写配置、加 CNAME 记录）
-   启动：python lightnovel.opds.server --tunnel named   或双击 run_named_tunnel.bat
+   启动：双击 launchers\\launch_online.bat（服务 + 隧道 + 守护进程一起，关窗口不掉线）
+        或 python -m lightnovel opds --tunnel named（前台运行，关窗口即停）
    结果：https://你填的域名/  永久固定，重启不变
    没有域名？换方案 2，或去注册一个（.top/.xyz 一年十几块）。
 
@@ -900,20 +1018,6 @@ EXTERNET_NOTE = """
 
 
 # ---------------------------- CLI ----------------------------
-def _hide_console():
-    """隐藏本进程的控制台窗口（Windows）。无控制台（如 VBS 后台启动）时为无操作。"""
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)   # SW_HIDE
-            log.info("服务运行正常，控制台窗口已自动隐藏（停止服务请运行 stop_opds.bat）。")
-    except Exception as exc:
-        log.warning("隐藏控制台窗口失败：%s", exc)
-
-
 def _ensure_logging():
     if not log.handlers:
         log.setLevel(logging.INFO)
@@ -926,10 +1030,12 @@ def _ensure_logging():
         log.addHandler(sh)
 
 
-def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False,
-                hide_window=False):
+def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False):
     """打印订阅信息并以**阻塞**方式运行服务（供 CLI 和 lightnovel.sync 复用）。
-    hide_window=True 时，named tunnel 连接成功后自动隐藏控制台窗口（服务继续后台运行）。"""
+
+    前台阻塞运行 = 关掉这个窗口就等于停服务；要后台常驻＋断线自愈请走
+    ``lightnovel.launcher``（launchers\\launch_online.bat）。
+    """
     os.makedirs(COVER_CACHE_DIR, exist_ok=True)
     lib = get_library(force=True)
     n_books = sum(len(b) for b in lib.values())
@@ -965,10 +1071,7 @@ def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False,
     cf_proc = None
     pub = public_url.rstrip("/") + "/" if public_url else ""
     if tunnel == "named":
-        def _on_tunnel_up():
-            if hide_window:
-                threading.Timer(3, _hide_console).start()   # 留 3 秒看清启动信息
-        cf_proc, url = start_named_tunnel(port, on_connected=_on_tunnel_up)
+        cf_proc, url = start_named_tunnel(port)
         if url:
             pub = url
             print(f"  固定公网地址：   {pub}")
@@ -991,10 +1094,8 @@ def run_service(port=PORT, bind=BIND, public_url="", tunnel=None, no_qr=False,
             print("  （未安装 segno/qrcode，跳过二维码，手动输入地址即可）")
     print(f"\n  书源地址： {subscribe}")
     print(f"  书库规模： {n_books} 部作品 / {n_vols} 卷")
-    if hide_window and tunnel == "named":
-        print("  停止服务： 运行 stop_opds.bat（隧道连通后本窗口自动隐藏）")
-    else:
-        print("  停止服务： Ctrl+C")
+    print("  停止服务： Ctrl+C（这是前台运行）")
+    print("  想要后台常驻＋断线自愈： launchers\\launch_online.bat（停止用 stop_opds.bat）")
     print("=" * 62 + "\n")
 
     try:
@@ -1014,9 +1115,6 @@ def main():
                     help="公网隧道：cloudflared=临时域名；named=固定域名（需先跑 lightnovel.tunnel_setup）")
     ap.add_argument("--public-url", default="", help="已知的公网地址，仅用于打印订阅地址/二维码")
     ap.add_argument("--no-qr", action="store_true", help="不打印二维码")
-    ap.add_argument("--hide-window", action="store_true",
-                    help="named tunnel 连接成功后自动隐藏控制台窗口（配合 run_named_tunnel.bat；"
-                         "停止服务用 stop_opds.bat）")
     ap.add_argument("--help-internet", action="store_true", help="打印外网接入方案说明后退出")
     args = ap.parse_args()
 
@@ -1026,8 +1124,7 @@ def main():
         print(EXTERNET_NOTE)
         return
 
-    run_service(args.port, args.bind, args.public_url, args.tunnel, args.no_qr,
-                hide_window=args.hide_window)
+    run_service(args.port, args.bind, args.public_url, args.tunnel, args.no_qr)
 
 
 if __name__ == "__main__":

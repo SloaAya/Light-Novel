@@ -2,13 +2,36 @@
 
 > 审计时间：2026-09-14 · 范围：`D:\Light-Novel` 下全部可执行代码（只读分析，未修改任何文件）
 >
+> **2026-09-18 后续变更（本页其余内容仍是 09-14 的快照）**：
+> 启动器体系换代，下面 5 个脚本**已移除**：前 4 个是旧一代入口，能力改由 CLI 子命令直接承载；
+> 第 5 个 `run_named_tunnel.bat` 与之不同 —— 它改写成转发壳后与 `launch_online.bat` 行为零差异，
+> 作为独立入口纯属重复，故一并删除（避免"到底该双击哪个"的歧义）。
+>
+> | 已移除 | 替代路径 |
+> | --- | --- |
+> | `run_services.bat`（书源 + 目录监控） | `launch_online.bat` 起书源与隧道；监控用面板按钮或 `python -m lightnovel sync` |
+> | `run_monitor.bat`（无窗口跑监控） | 同上（面板「启动目录监控」） |
+> | `run_once.bat`（同步一次） | `python -m lightnovel sync --once` |
+> | `setup_named_tunnel.bat`（隧道向导） | `python -m lightnovel tunnel-setup` |
+> | `run_named_tunnel.bat`（固定域名隧道） | 直接双击 `launch_online.bat`（调用与 `%*` 参数透传完全相同） |
+>
+> 同时移除 `opds --hide-window` 开关、以及 `lightnovel/opds/server.py` 中只服务于它的
+> `_hide_console()`（保留的启动器全部是 detached，没有窗口可隐藏；图形面板那份同名函数
+> 在 `lightnovel/ui.py` 内，仍在使用）。保留下来的入口统一改由
+> `launchers/_find_python.bat` 探测解释器。当前保留 **5 个入口**，职责互不重叠：
+> `launch_online.bat`（守护进程 + 服务 + 隧道，30s 自愈）、`restart_opds.bat`（只热重启服务，
+> 保留守护与隧道，公网地址不变）、`run_opds.bat`（前台调试，关窗口即停）、
+> `run_panel.bat`（图形面板）、`stop_opds.bat`（停止器，先停守护再停服务）。
+> 下文 A-1 / A-2 引用的 `run_opds.bat` 行号已随重写变化
+> （可选环境变量说明仍在文件头，只是形态改为英文注释）。
+>
 > | 文件 | 行数 | 角色 |
 > | --- | --- | --- |
 > | `opds_server.py` | 1964 | OPDS 书源服务（手机端订阅 / 下载） |
 > | `sync_lightnovel.py` | 1555 | GitHub 同步 + F 盘镜像 + 实时监控 |
 > | `setup_named_tunnel.py` | 218 | Cloudflare 固定域名隧道配置向导 |
-> | `run_monitor.bat` / `run_once.bat` / `run_opds.bat` | 8 / 8 / 21 | 启动器 |
-> | `run_named_tunnel.bat` / `setup_named_tunnel.bat` / `stop_opds.bat` | 23 / 22 / 18 | 启动器 / 停止器 |
+> | `run_monitor.bat` / `run_once.bat` / `run_opds.bat` | 8 / 8 / 21 | 启动器（前两个已移除） |
+> | `run_named_tunnel.bat` / `setup_named_tunnel.bat` / `stop_opds.bat` | 23 / 22 / 18 | 启动器 / 停止器（前两个已移除） |
 > | `.github/workflows/OneDriveSync.yml` | 41 | 云端 rclone 同步（当前停用） |
 
 ---
@@ -160,14 +183,14 @@
 | 4 | 独立运行兜底：导入 `opds_server` 失败时自建常量与 `find_cloudflared()` |
 | 5 | CLI：`--name` `--port` `--hostname`；域名格式校验 + 失败时打印手动添加 CNAME 的指引 |
 
-### 4. BAT 启动器（6 个）
+### 4. BAT 启动器（09-14 快照：当时 6 个，其中 5 个已于 09-18 移除 —— 见文首变更说明）
 
 | 文件 | 已启用功能 |
 | --- | --- |
 | `run_monitor.bat` | 优先 `pythonw`（无窗口后台）启动 `sync_lightnovel.py`，`start` 脱离当前窗口 |
 | `run_once.bat` | `python` / `py` 兜底探测，执行 `--once` |
 | `run_opds.bat` | 启动 `opds_server.py`，`%*` 透传命令行参数，`pause` 便于看报错 |
-| `run_named_tunnel.bat` | `opds_server.py --tunnel named --no-qr --hide-window`（固定域名 + 不打印二维码 + 连上后自动隐藏窗口） |
+| `run_named_tunnel.bat` | ~~`opds_server.py --tunnel named --no-qr --hide-window`~~（固定域名 + 不打印二维码 + 连上后自动隐藏窗口）—— **09-18 移除**：`--hide-window` 下线后它被改写成 `launch_online.bat` 的一行转发壳，与后者完全重复 |
 | `setup_named_tunnel.bat` | 前置条件说明 + `pause` + 调用向导 |
 | `stop_opds.bat` | `netstat -ano \| findstr :8080 \| findstr LISTENING` 取 PID → `taskkill /F`；再 `taskkill /IM cloudflared.exe /F` |
 
@@ -187,7 +210,7 @@
 | --- | --- | --- | --- | --- |
 | A-1 | `run_opds.bat:10-11` | `set LN_OPDS_USER=ln`<br>`set LN_OPDS_PASS=改成你自己的口令` | 去掉 `rem` | **无**。唯一注意：`run_opds.bat` 本身在 Git 仓库里，明文口令会随同步推到 GitHub（文件内注释已警告「不要提交」）。更稳妥的做法是在系统环境变量里设，别写进 bat |
 | A-2 | `run_opds.bat:14` | `set LN_OPDS_PORT=8080` | 去掉 `rem` | **无**。覆盖 OPDS 默认端口，与 `opds_server.py` 的 `LN_OPDS_PORT` 读取逻辑天然对接 |
-| A-3 | `run_named_tunnel.bat:13-15` | `set LN_OPDS_PORT=8080`<br>`set LN_OPDS_USER=your_user`<br>`set LN_OPDS_PASS=your_password` | 去掉 `rem` | **无**，同上。这是固定域名（公网暴露）场景，**强烈建议**启用口令 |
+| A-3 | ~~`run_named_tunnel.bat:13-15`~~（该文件 09-18 已移除） | `set LN_OPDS_PORT=8080`<br>`set LN_OPDS_USER=your_user`<br>`set LN_OPDS_PASS=your_password` | 去掉 `rem` | **本条已失效**。固定域名场景要口令，请按 A-1 改用**系统环境变量**（`launch_online.bat` 起的服务会继承） |
 
 ### B 类 — 被开关 / 条件停用，逻辑完整但需前置条件
 
@@ -228,7 +251,7 @@
 
 1. **注释掉的只有 1 行 Python 代码**（`sync_lightnovel.py:104`）。整个项目里真正「被注释但完整」的代码极少，更多的停用是**开关式**（`ENABLE_SEED_COPY`、`PAT_TOKEN`、`if: false`）—— 这也是为什么把三类分开列。
 2. **真正「取消注释后可能影响稳定性」的只有 B-1 与 B-6**：B-1 会退回 HTTPS 大体积推送（历史上被重置过），B-6 会引入抢分支 + 误删风险。其余 A / C 类恢复均为零风险。
-3. `run_opds.bat` / `run_named_tunnel.bat` 里的口令选项**建议改用系统环境变量**，避免随仓库外泄。
+3. `run_opds.bat` 里的口令选项**建议改用系统环境变量**，避免随仓库外泄（`run_named_tunnel.bat` 已于 09-18 移除，同一提示随文件消失）。
 4. `stop_opds.bat` 按端口 8080 强杀进程，注释已说明「恰好占用 8080 的其他程序也会被杀」—— 若改过 `LN_OPDS_PORT`，此脚本会失效。
 5. `.github/workflows/OneDriveSync.yml` 虽已停用，但文件仍在仓库中，`secrets.RCLONE_CONFIG` 的引用依然存在（未使用，无泄露，但值得清理或归档）。
 

@@ -818,9 +818,11 @@ check("python -m lightnovel --help 列出全部子命令",
       lambda: (_rc == 0 and all(c in _o for c in ("ui", "opds", "sync", "mirror", "tunnel-setup")),
                "rc=%s" % _rc))
 _rc, _o = run_cli(["-m", "lightnovel", "opds", "--help"])
-check("lightnovel opds --help", lambda: (_rc == 0 and "--tunnel" in _o and "--hide-window" in _o, "rc=%s" % _rc))
-check("bat(run_named_tunnel) 的 flag 全部在册",
-      lambda: (all(f in _o for f in ("--tunnel", "--no-qr", "--hide-window")), "查 --tunnel/--no-qr/--hide-window"))
+check("lightnovel opds --help", lambda: (_rc == 0 and "--tunnel" in _o and "--bind" in _o, "rc=%s" % _rc))
+# --hide-window 随旧启动器一并移除：它只在「前台跑 + 连上后隐藏控制台」这一种用法下
+# 有意义，而保留下来启动器全部是 detached（无窗口可隐藏）。
+check("启动器用到的 flag 全部在册",
+      lambda: (all(f in _o for f in ("--tunnel", "--no-qr")), "查 --tunnel/--no-qr"))
 check("lightnovel opds 全部选项在册",
       lambda: (all(f in _o for f in ("--port", "--bind", "--public-url", "--no-qr", "--help-internet")), ""))
 _rc, _o = run_cli(["-m", "lightnovel", "opds", "--tunnel", "bogus"])
@@ -830,7 +832,8 @@ check("lightnovel opds --help-internet 打印方案说明",
       lambda: (_rc == 0 and "Cloudflare" in _o and "Tailscale" in _o, "rc=%s %d 字节" % (_rc, len(_o))))
 _rc, _o = run_cli(["-m", "lightnovel", "sync", "--help"])
 check("lightnovel sync --help", lambda: (_rc == 0 and "--mirror-f" in _o and "--opds" in _o, "rc=%s" % _rc))
-check("bat(run_once) 的 --once 在册", lambda: ("--once" in _o, ""))
+check("sync --once 在册（原 run_once.bat 已移除，该能力由本子命令承载）",
+      lambda: ("--once" in _o, ""))
 check("sync 全部模式选项在册",
       lambda: (all(f in _o for f in ("--mirror-status", "--mirror-dry-run", "--mirror-no-delete",
                                      "--opds-only", "--opds-port", "--monitor-only", "--init", "--status")), ""))
@@ -840,8 +843,14 @@ check("lightnovel tunnel-setup --help", lambda: (_rc == 0 and "--hostname" in _o
 # ============================== M. bat 与 workflow 完整性 ==============================
 section("M. bat 启动器与 workflow 完整性")
 _LAU = os.path.join(ROOT, "launchers")
-_bats = ["run_monitor.bat", "run_once.bat", "run_opds.bat", "run_named_tunnel.bat",
-         "setup_named_tunnel.bat", "stop_opds.bat"]
+# 2026-09-18：旧一代启动器 run_services / run_monitor / run_once / setup_named_tunnel
+# 已移除 —— 它们的能力由 CLI 子命令直接承载（sync / sync --once / tunnel-setup），
+# 图形面板仍由 run_panel.bat 提供。同日又移除 run_named_tunnel.bat：它被改写成
+# `call launch_online.bat %*` 后与后者行为零差异，同一个动作有两个入口只会让人猜
+# 哪个才是对的。保留的每个入口都必须真的走到 lightnovel 包；stop_opds.bat 是纯
+# cmd 停止器，不在此列。5 个入口职责互不重叠：起全套 / 热重启 / 前台调试 / 面板 / 停。
+_bats = ["launch_online.bat", "restart_opds.bat",
+         "run_opds.bat", "run_panel.bat", "stop_opds.bat"]
 _bl = []
 for b in _bats:
     _p = os.path.join(_LAU, b)
@@ -851,16 +860,64 @@ for b in _bats:
     _t = open(_p, encoding="utf-8").read()
     if b != "stop_opds.bat" and "lightnovel" not in _t:
         _bl.append("%s 未走 python -m lightnovel" % b)
-check("launchers/ 下 6 个启动器齐全且都指向 lightnovel 包", lambda: (not _bl, "问题=%s" % _bl))
+check("launchers/ 下 5 个入口齐全且都指向 lightnovel 包", lambda: (not _bl, "问题=%s" % _bl))
+check("旧一代启动器与重复的转发壳均已移除（能力改由 CLI / launch_online 承载）",
+      lambda: (all(not os.path.exists(os.path.join(_LAU, b))
+                   for b in ("run_services.bat", "run_monitor.bat", "run_once.bat",
+                             "setup_named_tunnel.bat", "run_named_tunnel.bat")), ""))
+check("_find_python.bat 纯 ASCII 且不执行 setlocal（变量要活着传回调用者）",
+      lambda: (all(ord(c) < 128 for c in open(os.path.join(_LAU, "_find_python.bat"),
+                                              encoding="utf-8").read())
+                   # 只看**命令行**：注释里解释"为什么不能用 setlocal"是正常的
+                   and not any(ln.strip().lower().startswith("setlocal")
+                               for ln in open(os.path.join(_LAU, "_find_python.bat"),
+                                              encoding="utf-8")), ""))
 check("stop_opds 仍按 8080 + cloudflared 停止",
       lambda: (all(k in open(os.path.join(_LAU, "stop_opds.bat"), encoding="utf-8").read()
                    for k in ("8080", "cloudflared.exe", "taskkill")), ""))
-check("run_monitor 用 pythonw 无窗口启动",
-      lambda: ("pythonw" in open(os.path.join(_LAU, "run_monitor.bat"), encoding="utf-8").read(), ""))
+# 这条以前断言的是 run_monitor.bat（已移除）；无窗口需求现在由图形面板承载。
+check("run_panel 用 pythonw 无窗口启动",
+      lambda: ("pythonw" in open(os.path.join(_LAU, "run_panel.bat"), encoding="utf-8").read(), ""))
 _wf = open(".github/workflows/OneDriveSync.yml", encoding="utf-8").read()
 check("OneDrive workflow 保持停用（本次未擅自恢复）", lambda: ("if: false" in _wf, ""))
 check("OneDrive workflow 骨架完整",
       lambda: (all(k in _wf for k in ("name:", "on:", "jobs:", "runs-on:", "steps:")), ""))
+
+# 隧道健康：只判断「cloudflared 进程在不在」是不够的 —— 实测 QUIC 被线路丢包时，
+# cloudflared 会一直活着却零连接（公网 530/502），且它只在 QUIC 上重试、不会自己
+# 退回 http2。所以启动参数要钉死 http2 并暴露 metrics，守护据此把「进程活着」和
+# 「连接活着」分开判；探测不到 metrics 时（刚启动）必须算「未知」而不是「故障」，
+# 否则守护会把自己刚拉起的隧道立刻杀掉。
+from lightnovel.opds import server as _S      # noqa: E402
+from lightnovel import service as _SV         # noqa: E402
+from lightnovel import launcher as _L         # noqa: E402
+
+_nargv = _S.named_tunnel_argv("cloudflared.exe", "ln-opds2")
+_qargv = _S.quick_tunnel_argv("cloudflared.exe", 8080)
+check("隧道协议默认 http2（auto 只在 QUIC 上重试，线路丢包时不回退）",
+      lambda: (_S.tunnel_protocol() == "http2", "protocol=%s" % _S.tunnel_protocol()))
+check("--metrics 挂在 tunnel 层（放 run 后面会被 cloudflared 拒绝并静默退出）",
+      lambda: (_nargv.index("--metrics") < _nargv.index("run"),
+               "--metrics@%d run@%d" % (_nargv.index("--metrics"), _nargv.index("run"))))
+check("--protocol 挂在 run 层（tunnel 层没有这个 flag）",
+      lambda: (_nargv.index("--protocol") > _nargv.index("run"),
+               "--protocol@%d run@%d" % (_nargv.index("--protocol"), _nargv.index("run"))))
+check("named 隧道带 http2+metrics；快速隧道带 metrics 且不加 --protocol",
+      lambda: (("--metrics" in _nargv and "http2" in _nargv
+                and "--metrics" in _qargv and "--protocol" not in _qargv),
+               "named=%s ｜ quick=%s" % (_nargv, _qargv)))
+check("隧道 metrics 用回环固定端口（守护要能自己找到）",
+      lambda: (_S.tunnel_metrics_addr().startswith("127.0.0.1:"), _S.tunnel_metrics_addr()))
+check("隧道健康探测返回 True/False/None 三态，不抛异常",
+      lambda: (_SV.tunnel_ready(timeout=0.5) in (True, False, None),
+               "value=%r" % _SV.tunnel_ready(timeout=0.5)))
+_st = _L.check_once(8080, "named")
+check("巡检结果区分「进程活着」与「连接活着」",
+      lambda: ({"cf", "tunnel_ok", "tunnel_broken"} <= set(_st)
+               and _st["tunnel_broken"] is (_st["tunnel_ok"] is False), str(sorted(_st))))
+check("重建时能清掉「连不上边缘」的旧隧道（否则 spawn 会把它复用回来，重建空转）",
+      lambda: (callable(_SV.kill_cloudflared) and "drop_tunnel" in
+               _L.rebuild.__code__.co_varnames, "params=%s" % (_L.rebuild.__code__.co_varnames[:4],)))
 
 # ============================== N. 真实书库只读巡检 ==============================
 section("N. 真实书库只读巡检（运行时无回归）")
@@ -1732,7 +1789,7 @@ def _mk_read_meta():
     return ('data-total="1"' in one and 'id="readcnt"' in one
             and '<template id="readempty">' in one and "1 部作品" in one
             and '<template id="readempty">' not in zero
-            and "还没有标记任何作品" in zero,
+            and "还没有已读完的作品" in zero,
             "有作品时发模板+计数；空清单直接渲染空态")
 
 
@@ -2516,7 +2573,7 @@ _t_srv = None
 _t_port = 0
 if SESS is not None:
     _t_reset()
-    SRV.AUTH_USER, SRV.AUTH_PASS = "ran", "147258"
+    SRV.AUTH_USER, SRV.AUTH_PASS = "test-admin", "test-pass-1"
     SRV.AUTH_GUEST_USER, SRV.AUTH_GUEST_PASS = "", ""
     try:
         _t_srv = SRV.make_server(port=0, bind="0.0.0.0")
@@ -2572,13 +2629,13 @@ if _t_srv is not None:
     _t_rd, _, _, _ = _t_http("/opds/read")
     check("T3 未登录访问管理页 → 403（不给内容，也不给入口）",
           lambda: (_t_rd == 403, "status=%s" % _t_rd))
-    _t_x, _, _, _ = _t_http("/opds/login", "POST", urlencode({"user": "ran", "pass": "147258"}),
+    _t_x, _, _, _ = _t_http("/opds/login", "POST", urlencode({"user": "test-admin", "pass": "test-pass-1"}),
                             {"Origin": "https://evil.example.com"})
     check("T4 跨站登录 → 403（CSRF 兜底）", lambda: (_t_x == 403, "status=%s" % _t_x))
 
     SESS.login_throttle.clear()
     _t_w, _t_wb, _t_wck, _ = _t_http("/opds/login", "POST",
-                                     urlencode({"user": "ran", "pass": "nope", "back": "/"}),
+                                     urlencode({"user": "test-admin", "pass": "nope", "back": "/"}),
                                      {"Origin": _T_ORIGIN})
     check("T5 口令错 → 401 + 登录页文案，且**不下发** cookie",
           lambda: (_t_w == 401 and not _t_wck and "不对" in _t_wb,
@@ -2586,7 +2643,7 @@ if _t_srv is not None:
 
     SESS.login_throttle.clear()
     _t_ok, _, _t_ck, _t_loc = _t_http("/opds/login", "POST",
-                                      urlencode({"user": "ran", "pass": "147258", "back": "/"}),
+                                      urlencode({"user": "test-admin", "pass": "test-pass-1", "back": "/"}),
                                       {"Origin": _T_ORIGIN})
     _t_tok = _t_token_of(_t_ck)
     check("T6 口令对 → 303 跳回 back，并下发 HttpOnly + SameSite=Lax 的签名 cookie",
@@ -2623,7 +2680,7 @@ if _t_srv is not None:
 
     SESS.login_throttle.clear()
     _t_or, _, _, _t_orloc = _t_http("/opds/login", "POST",
-                                    urlencode({"user": "ran", "pass": "147258",
+                                    urlencode({"user": "test-admin", "pass": "test-pass-1",
                                                "back": "//evil.example.com/x"}),
                                     {"Origin": _T_ORIGIN})
     check("T12 登录的 back 指向外站 → 回落到本站路径（堵开放重定向）",
@@ -2632,14 +2689,14 @@ if _t_srv is not None:
 
     SESS.login_throttle.clear()
     _t_ss, _, _t_sck, _ = _t_http("/opds/login", "POST",
-                                  urlencode({"user": "ran", "pass": "147258", "back": "/"}),
+                                  urlencode({"user": "test-admin", "pass": "test-pass-1", "back": "/"}),
                                   {"Origin": _T_ORIGIN, "X-Forwarded-Proto": "https"})
     check("T13 走 HTTPS（隧道）登录 → cookie 带 Secure",
           lambda: (_t_ss == 303 and "Secure" in _t_sck and SESS.verify(_t_token_of(_t_sck)),
                    "cookie=%s" % _t_sck))
 
     SESS.login_throttle.clear()
-    _t_codes = [_t_http("/opds/login", "POST", urlencode({"user": "ran", "pass": "bad"}),
+    _t_codes = [_t_http("/opds/login", "POST", urlencode({"user": "test-admin", "pass": "bad"}),
                         {"Origin": _T_ORIGIN})[0] for _ in range(9)]
     _t_lockg, _t_lockb, _, _ = _t_http("/opds/login")
     check("T14 连错口令触发节流：第 9 次起 429，登录页给出还要等多久",
@@ -2648,7 +2705,7 @@ if _t_srv is not None:
                    "前 8 次=%s 第 9 次=%s" % (_t_codes[:8], _t_codes[8])))
     SESS.login_throttle.clear()
     _t_after, _, _t_ack, _ = _t_http("/opds/login", "POST",
-                                     urlencode({"user": "ran", "pass": "147258"}),
+                                     urlencode({"user": "test-admin", "pass": "test-pass-1"}),
                                      {"Origin": _T_ORIGIN})
     check("T15 节流解除后能正常登录（不会把自己永久锁在外面）",
           lambda: (_t_after == 303 and SESS.verify(_t_token_of(_t_ack)), "status=%s" % _t_after))
@@ -2736,7 +2793,7 @@ def _t_readlist_http():
     finally:
         FEED.get_library = orig
     return (st1 == 200 and card_href in b1 and 'data-total="1"' in b1
-            and st2 == 200 and card_href not in b2 and "还没有标记任何作品" in b2,
+            and st2 == 200 and card_href not in b2 and "还没有已读完的作品" in b2,
             "列表 %s → %s" % ("有该书" if card_href in b1 else "无",
                               "仍有该书" if card_href in b2 else "已自动移除"))
 
@@ -3069,14 +3126,14 @@ _u_srv = None
 _u_port = 0
 _u_saved_auth = (SRV.AUTH_USER, SRV.AUTH_PASS)
 try:
-    SRV.AUTH_USER, SRV.AUTH_PASS = "ran", "147258"
+    SRV.AUTH_USER, SRV.AUTH_PASS = "test-admin", "test-pass-1"
     _u_srv = SRV.make_server(port=0, bind="127.0.0.1")
     _u_port = _u_srv.server_address[1]
     threading.Thread(target=_u_srv.serve_forever, daemon=True).start()
 except Exception:                                         # noqa: BLE001
     _u_srv = None
 
-_U_ADMIN = {"Authorization": "Basic " + base64.b64encode(b"ran:147258").decode()}
+_U_ADMIN = {"Authorization": "Basic " + base64.b64encode(b"test-admin:test-pass-1").decode()}
 
 
 def _u_http(path, headers=None):

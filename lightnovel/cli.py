@@ -21,12 +21,19 @@ USAGE = """Light-Novel 书库工具
 子命令：
   ui            启动图形控制面板（不带子命令时默认执行）
   opds          OPDS 书源服务（手机阅读器订阅）
+  launch        启动在线服务 + 隧道，并交给后台守护进程常驻（关窗口也照跑）
+  launch-status 查看守护进程 / 服务 / 隧道的状态
+  restart       重启 OPDS 服务（后台常驻，不含守护）
+  stop          停止守护进程与 OPDS 服务
   sync          GitHub 同步 / 目录监控
   mirror        D 盘 → F 盘网盘镜像
   tunnel-setup  Cloudflare 固定域名隧道配置向导
 
 示例：
   python -m lightnovel ui
+  python -m lightnovel launch
+  python -m lightnovel launch-status
+  python -m lightnovel restart --port 8080
   python -m lightnovel opds --port 8080 --tunnel named
   python -m lightnovel sync --once
   python -m lightnovel mirror --status
@@ -38,7 +45,8 @@ USAGE = """Light-Novel 书库工具
 
 # 子命令 -> (模块路径, 是否转发到该模块的 main)
 _COMMANDS = ("ui", "opds", "sync", "sync-lightnovel", "opds-server",
-             "mirror", "tunnel-setup", "tunnel", "tunnel-setup-wizard")
+             "mirror", "tunnel-setup", "tunnel", "tunnel-setup-wizard",
+             "restart", "stop", "opds-stop", "launch", "launch-status")
 
 
 def _pipe_utf8():
@@ -98,6 +106,23 @@ def _dispatch(cmd, argv):
         from . import tunnel_setup as mod
         sys.argv = ["lightnovel tunnel-setup"] + argv
         return mod.main()
+
+    if cmd == "restart":
+        from . import service as mod
+        return mod.main_restart(argv)
+
+    if cmd == "launch":
+        from . import launcher as mod
+        return mod.main_launch(argv)
+
+    if cmd == "launch-status":
+        from . import launcher as mod
+        return mod.main_status(argv)
+
+    if cmd in ("stop", "opds-stop"):
+        # 走 launcher：它会**先停守护进程再停服务**，否则守护下一次巡检会把服务又拉起来
+        from . import launcher as mod
+        return mod.main_stop(argv)
 
     print("未知子命令：%s\n" % cmd, file=sys.stderr)
     print(USAGE)

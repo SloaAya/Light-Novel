@@ -16,7 +16,7 @@
 
 完成后启动服务：
     python -m lightnovel opds --tunnel named
-或直接双击 launchers\\run_named_tunnel.bat
+或直接双击 launchers\\launch_online.bat
 
 用法：
     python -m lightnovel tunnel-setup                # 交互式引导
@@ -186,7 +186,7 @@ def main():
     print("")
     print("  启动服务（固定域名）：")
     print("     python -m lightnovel opds --tunnel named")
-    print("  或双击 launchers\run_named_tunnel.bat")
+    print("  或双击 launchers\\launch_online.bat")
     print("")
     print("  手机阅读器里填：https://" + hostname + "/")
     print("  （DNS 首次生效可能需要几十秒到几分钟）")
