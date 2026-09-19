@@ -283,7 +283,24 @@ check("book_html 非法路径返回 None", lambda: (O.book_html("../x", 1) is No
 check("recent_html", lambda: ("最近更新" in O.recent_html(1), ""))
 check("search_html 命中", lambda: (BOOK[:4] in O.search_html(BOOK[:4], 1), ""))
 check("search_html 空查询提示", lambda: ("输入书名或卷名开始搜索" in O.search_html("", 1), ""))
-check("index_html 兼容旧名 == root_html", lambda: (O.index_html() == O.root_html(), ""))
+def _no_marquee(h):
+    """剔除轮播区再比较：轮播是全库随机抽样，两次渲染必然不同。"""
+    return re.sub(r'<div class="an-marquee">.*?</div></div>', "", h, flags=re.S)
+
+
+check("index_html 是 root_html 的兼容别名（除随机轮播外完全一致）",
+      lambda: (_no_marquee(O.index_html()) == _no_marquee(O.root_html()), ""))
+
+# 首页「最新更新」必须能出现**整本新入库**的作品 —— updates.pending 的设计是
+# 「只报已有作品补的新卷」，新作品故意不报（防批量导入时刷屏），早先直接拿它
+# 渲染这个区块，导致新加的书在首页永远看不到。改按 mtime 排序后两类都能覆盖。
+_newest_book = max(((b, max(v["mtime"] for v in vs))
+                    for _c, bs in lib.items() for b, vs in bs.items() if vs),
+                   key=lambda t: t[1])[0]
+check("首页「最新更新」含 mtime 最新的作品（新入库的书也看得到）",
+      lambda: (_newest_book in O.root_html(), _newest_book))
+check("首页轮播随机抽样（两次渲染不同）",
+      lambda: (O.root_html() != O.root_html(), ""))
 truthy("_primary_vol 选出主卷封面", O._primary_vol(VOLS, CAT, BOOK) is not None)
 truthy("_group_vols_by_subdir 返回分组", len(O._group_vols_by_subdir(VOLS, CAT, BOOK)) >= 1)
 

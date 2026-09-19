@@ -4,7 +4,9 @@
 
 import hashlib
 import html
+import random
 import re
+import time
 
 from datetime import datetime
 from urllib.parse import quote
@@ -1226,17 +1228,20 @@ def _home_cover_rel(key, cat, book, lib):
     return pv["rel"] if pv else None
 
 
-def _home_covers(pend, lib, n):
-    """轮播封面集合：优先「最近有更新」的，不够就按字母序采样补齐，保证有内容可滚。"""
-    keys = sorted(pend, key=lambda k: pend[k].get("at") or "", reverse=True)
-    if len(keys) < n:
-        for cat, books in lib.items():
-            for book in books:
-                k = f"{cat}/{book}"
-                if k not in keys:
-                    keys.append(k)
+def _home_covers(lib, n):
+    """轮播封面集合：**从全库随机抽样**，每次刷新换一批。
+
+    为什么从「最近更新优先」改成随机：排最前的永远是同样那几部，其余作品没有
+    露脸机会；而「最近更新」在下面那条横向列表里已经完整呈现，轮播重复它没有
+    信息增量。页面对外是 ``Cache-Control: no-cache``，所以刷新即换样。
+    """
+    keys = []
+    for cat, books in lib.items():
+        keys.extend(f"{cat}/{book}" for book in books)
+    if not keys:
+        return []
     out = []
-    for key in keys[:n]:
+    for key in random.sample(keys, min(n, len(keys))):
         cat, book = key.split("/", 1)
         rel = _home_cover_rel(key, cat, book, lib)
         if rel:
@@ -1252,8 +1257,8 @@ def root_html(is_admin=False):
     note = {c: (f' · <b style="color:var(--new)">{n} 部有更新</b>' if n else "")
             for c, n in ups.items()}
 
-    # ---- 轮播图区域：最近更新的封面无缝滚动（悬停暂停）----
-    feat = _home_covers(pend, lib, 12)
+    # ---- 轮播图区域：全库随机抽样，无缝滚动（悬停暂停）----
+    feat = _home_covers(lib, 12)
     one = "".join(
         f'<a class="an-slide" href="/opds/book/{encode_path(key)}">'
         f'<img src="{_cover_url(rel)}" alt="" loading="lazy" decoding="async">'
@@ -1312,19 +1317,32 @@ def root_html(is_admin=False):
     # 否则 auto-fit 会把多出来的那张挤到第二行。
     n_cats = len(lib) + 2 + (1 if is_admin else 0)
 
-    # ---- 最新更新列表：「有更新」的作品横向条；没有就退回轮播那批，保证不空 ----
-    latest_keys = sorted(pend, key=lambda k: pend[k].get("at") or "", reverse=True)
+    # ---- 最新更新列表：按「该作品最新一卷的改动时间」倒序 ----
+    # 为什么不用 updates.pending：它的设计是「只报已有作品补的新卷」，**整本新入库
+    # 的作品故意不报**（防批量导入时刷屏）—— 于是新加的书在首页永远看不到，而人对
+    # 「最新更新」的直觉就是「最近入库或改动的东西」。改按 mtime 排序后两种情形都
+    # 覆盖：新书 mtime 最新，补了新卷的书同样会冒到前面。索引自带 30 秒缓存，
+    # 不需要再加刷新机制（新增/删除目录会改分类目录的 mtime，重扫即可看到）。
+    newest = {}
+    for cat, books in lib.items():
+        for book, vols in books.items():
+            if vols:
+                newest[f"{cat}/{book}"] = max(v["mtime"] for v in vols)
     latest = []
-    for key in latest_keys[:10]:
+    for key in sorted(newest, key=lambda k: newest[k], reverse=True)[:10]:
         cat, book = key.split("/", 1)
         rel = _home_cover_rel(key, cat, book, lib)
         if rel:
             latest.append((key, cat, book, rel))
-    if not latest:
-        latest = feat[:10]
+    # NEW 角标按「最近 48 小时内有改动」判定。原先是无条件打的 —— 那时列表本身
+    # 就是「有未读新卷」的集合；现在列表含全部作品，无条件打就没有信息量了。
+    # 不用 7 天：本库大量作品的 mtime 都落在最近几天（批量规整文件名、从网盘
+    # 或仓库同步过来都会刷新 mtime），窗口一宽整列全是 NEW，等于没标。
+    fresh_after = time.time() - 48 * 3600
+    badge = '<span class="up">NEW</span>'   # 单独取出：3.8 的 f-string 不支持内嵌同类引号
     latest_html = "".join(
         f'<a class="an-item" href="/opds/book/{encode_path(key)}">'
-        f'<span class="up">NEW</span>'
+        f'{badge if newest.get(key, 0) >= fresh_after else ""}'
         f'<img src="{_cover_url(rel)}" alt="" loading="lazy" decoding="async">'
         f'<div class="t">{html.escape(book)}</div>'
         f'<div class="s">{html.escape(cat)}</div></a>'
